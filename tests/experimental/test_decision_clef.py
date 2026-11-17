@@ -14,6 +14,7 @@
 
 import copy
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -29,10 +30,12 @@ from examples.decisions.clef_typed_decisions import (
     DataCollatorForClef,
     build_model,
     clef_decision_config,
+    load_backbone,
     prepare_split,
 )
 from examples.decisions.clef_typed_decisions import main as clef_main
 from transformers import (
+    AutoConfig,
     AutoModel,
     AutoModelForCausalLM,
     AutoModelForDecision,
@@ -113,6 +116,18 @@ def tiny_clef(tokenizer, decision_config, backbone="qwen2", head_type="joint"):
     if decision_config is not None:
         model.decision_config = decision_config
     return model
+
+
+def tiny_encoder(tokenizer, kind):
+    """A tiny BERT (`bert`), BERT reranker (`bert-reranker`) or ModernBERT (`modernbert`) with the tokenizer's vocabulary."""
+    from transformers import BertForSequenceClassification, BertModel, ModernBertModel
+
+    set_seed(0)
+    sizes = {"vocab_size": len(tokenizer) + 2, "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2}
+    if kind == "modernbert":
+        return ModernBertModel(ModernBertConfig(**sizes, num_attention_heads=2, pad_token_id=tokenizer.pad_token_id))
+    config = BertConfig(**sizes, num_attention_heads=2)
+    return BertForSequenceClassification(config) if kind == "bert-reranker" else BertModel(config)
 
 
 def encoder_tokenizer(tokenizer):
@@ -442,9 +457,12 @@ class TestClefTraining(TrlTestCase):
             "urgency": "score",
         }
 
-    def run_main(self, tokenizer, mode, training_kwargs=None, **model_kwargs):
-        """Run the script's `main` on a tiny local backbone and dataset; returns the trainer and the arguments."""
-        backbone = AutoModelForCausalLM.from_pretrained(MODEL_ID)
+    def run_main(self, tokenizer, mode, training_kwargs=None, backbone=None, script_kwargs=None, **model_kwargs):
+        """
+        Run the script's `main` on a tiny local backbone (the causal LM of `MODEL_ID` by default) and dataset; returns
+        the trainer, the model `build_model` builds with the same seed, and the backbone.
+        """
+        backbone = backbone if backbone is not None else AutoModelForCausalLM.from_pretrained(MODEL_ID)
         backbone.save_pretrained(f"{self.tmp_dir}/backbone")
         tokenizer.save_pretrained(f"{self.tmp_dir}/backbone")
         rows = [make_row(index) for index in range(12)] + [LONG_ROW]
@@ -464,6 +482,7 @@ class TestClefTraining(TrlTestCase):
             max_length=400,
             truncation="skip",
             permute_fields=True,
+            **(script_kwargs or {}),
         )
         training_args = dict(
             output_dir=f"{self.tmp_dir}/out",
@@ -484,6 +503,150 @@ class TestClefTraining(TrlTestCase):
         set_seed(training_args.seed)
         initial = build_model(script_args, model_args, {"dtype": "float32", "revision": None})
         return trainer, initial, backbone
+
+    def check_saved_model(self, trainer, tokenizer, **expected):
+        """The saved output reloads with the expected config and exactly the logits of the trained model."""
+        model = trainer.model
+        reloaded = AutoModelForDecision.from_pretrained(f"{self.tmp_dir}/out")
+        assert isinstance(reloaded, ClefForDecision)
+        for key, value in expected.items():
+            assert getattr(reloaded.config, key) == value, key
+        assert reloaded.decision_config == model.decision_config
+        collator = DataCollatorForClef(tokenizer, model.decision_config)
+        batch = collator([make_row(index) for index in range(3)])
+        assert max_logit_difference(reloaded, model, batch) == 0.0
+        return reloaded
+
+    @pytest.mark.parametrize("kind", ["bert", "bert-reranker", "modernbert"])
+    def test_main_on_an_encoder_checkpoint(self, tokenizer, kind, capsys):
+        # BERT has a causal LM class but is an encoder; ModernBERT has none; a reranker registers only its classifier
+        tokenizer = encoder_tokenizer(tokenizer)
+        backbone = tiny_encoder(tokenizer, kind)
+        trainer, initial, _ = self.run_main(tokenizer, "full", backbone=backbone)
+        assert trainer.state.global_step == 5
+        model_type = "modernbert" if kind == "modernbert" else "bert"
+        assert (
+            f"Clef setup: bidirectional backbone ({model_type}), global_pooling=first, prompt_style=plain, "
+            "head_type=joint" in capsys.readouterr().out
+        )
+        assert type(trainer.model.model).__name__ == ("ModernBertModel" if kind == "modernbert" else "BertModel")
+        assert hasattr(trainer.model, "lm_head") == (kind != "modernbert")
+        reloaded = self.check_saved_model(
+            trainer, tokenizer, global_pooling="first", prompt_style="plain", head_type="joint"
+        )
+        # The plain prompt, between [CLS] and [SEP]
+        ((inputs, _),) = reloaded.decision_config.prepare_inputs(make_row(0), tokenizer)
+        assert (
+            inputs["input_ids"][0, 0] == tokenizer.cls_token_id
+            and inputs["input_ids"][0, -1] == tokenizer.sep_token_id
+        )
+        # The new model starts from the encoder's weights (the reranker's unwrapped `base_model`)
+        expected = backbone.base_model.state_dict()
+        built = initial.model.state_dict()
+        assert set(built) == set(expected)
+        for name, value in built.items():
+            assert torch.equal(value, expected[name]), name
+
+    def test_unwrappable_reranker_raises(self, tokenizer, monkeypatch):
+        from examples.decisions import clef_typed_decisions
+
+        tokenizer = encoder_tokenizer(tokenizer)
+        tiny_encoder(tokenizer, "bert-reranker").save_pretrained(f"{self.tmp_dir}/reranker")
+        config = AutoConfig.from_pretrained(f"{self.tmp_dir}/reranker")
+
+        class Opaque(torch.nn.Module):
+            base_model = property(lambda self: self)
+
+        monkeypatch.setattr(
+            clef_typed_decisions.AutoModelForSequenceClassification, "from_pretrained", lambda *a, **k: Opaque()
+        )
+        with pytest.raises(ValueError, match="cannot be unwrapped"):
+            load_backbone(f"{self.tmp_dir}/reranker", config, {})
+
+    @pytest.mark.parametrize("backbone_kind", ["qwen2", "modernbert"])
+    def test_main_with_the_cosine_head(self, tokenizer, backbone_kind, capsys):
+        backbone = None
+        if backbone_kind != "qwen2":
+            tokenizer = encoder_tokenizer(tokenizer)
+            backbone = tiny_encoder(tokenizer, backbone_kind)
+        script_kwargs = {"head_type": "cosine", "cosine_width": 8, "cosine_initial_scale": 5.0}
+        trainer, _, _ = self.run_main(tokenizer, "full", backbone=backbone, script_kwargs=script_kwargs)
+        assert trainer.state.global_step == 5
+        assert "head_type=cosine" in capsys.readouterr().out
+        assert not hasattr(trainer.model, "lm_head")
+        assert trainer.model.cosine_head.question_projection.out_features == 8
+        self.check_saved_model(trainer, tokenizer, head_type="cosine", cosine_width=8, cosine_initial_scale=5.0)
+
+    def test_head_mode_trains_the_cosine_head_only(self, tokenizer):
+        set_seed(0)
+        trainer, initial, backbone = self.run_main(tokenizer, "head", script_kwargs={"head_type": "cosine"})
+        model = trainer.model
+        trainable = {name.split(".")[0] for name, parameter in model.named_parameters() if parameter.requires_grad}
+        assert trainable == {"cosine_head"}
+        initial_parameters = dict(initial.named_parameters())
+        assert any(
+            not torch.equal(parameter, initial_parameters[name])
+            for name, parameter in model.named_parameters()
+            if name.startswith("cosine_head.")
+        )
+        loaded = backbone.base_model.state_dict()
+        for name, value in model.model.state_dict().items():
+            torch.testing.assert_close(value.float(), loaded[name].float())
+        self.check_saved_model(trainer, tokenizer, head_type="cosine")
+
+    @require_peft
+    def test_lora_mode_with_the_cosine_head(self, tokenizer):
+        lora = {"use_peft": True, "lora_r": 4, "lora_target_modules": ["q_proj", "v_proj"]}
+        trainer, initial, backbone = self.run_main(tokenizer, "lora", script_kwargs={"head_type": "cosine"}, **lora)
+        model = trainer.model
+        assert type(model.model).__name__ == "Qwen2Model"  # merged
+        # The merged backbone differs from the loaded one only where adapters sit
+        loaded = backbone.base_model.state_dict()
+        for name, value in model.model.state_dict().items():
+            same = torch.equal(value.float(), loaded[name].float())
+            assert same == (not name.endswith(("q_proj.weight", "v_proj.weight"))), name
+        initial_parameters = dict(initial.named_parameters())
+        assert any(
+            not torch.equal(parameter, initial_parameters[name])
+            for name, parameter in model.named_parameters()
+            if name.startswith("cosine_head.")
+        )
+        self.check_saved_model(trainer, tokenizer, head_type="cosine")
+        assert (Path(self.tmp_dir) / "out" / "adapter" / "adapter_model.safetensors").exists()
+
+    @pytest.mark.parametrize(
+        "backbone_kind, settings",
+        [
+            ("qwen2", {"global_pooling": "first", "prompt_style": "plain"}),
+            ("modernbert", {"global_pooling": "last", "prompt_style": "chatml"}),
+            ("modernbert", {"global_pooling": "last"}),
+        ],
+    )
+    def test_explicit_pooling_and_prompt_style_win(self, tokenizer, backbone_kind, settings, capsys):
+        backbone = None
+        if backbone_kind != "qwen2":
+            tokenizer = encoder_tokenizer(tokenizer)
+            backbone = tiny_encoder(tokenizer, backbone_kind)
+        trainer, _, _ = self.run_main(tokenizer, "full", backbone=backbone, script_kwargs=settings)
+        defaults = (
+            {"global_pooling": "last", "prompt_style": "chatml"}
+            if backbone_kind == "qwen2"
+            else {"global_pooling": "first", "prompt_style": "plain"}
+        )
+        expected = {**defaults, **settings}
+        out = capsys.readouterr().out
+        assert f"global_pooling={expected['global_pooling']}, prompt_style={expected['prompt_style']}" in out
+        self.check_saved_model(trainer, tokenizer, **expected)
+
+    def test_checkpoint_head_settings_cannot_change(self, tokenizer, decision_config):
+        tiny_clef(tokenizer, decision_config).save_pretrained(f"{self.tmp_dir}/clef")
+        model_args = ClefModelArguments(model_name_or_path=f"{self.tmp_dir}/clef", dtype="float32")
+        script_args = ClefScriptArguments(head_type="cosine")
+        with pytest.raises(ValueError, match="cannot change"):
+            build_model(script_args, model_args, {"dtype": "float32"})
+        # The settings it already has are fine
+        model = build_model(ClefScriptArguments(head_type="joint"), model_args, {"dtype": "float32"})
+        assert model.config.head_type == "joint"
 
     def test_main_builds_plain_backbone_and_reports(self, tokenizer, decision_config, capsys):
         # A local causal LM becomes the backbone of a new head; the build report counts skipped records

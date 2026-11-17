@@ -23,6 +23,12 @@
 """
 Train a Clef decision model on typed decisions: one prompt per record, every question answered jointly.
 
+`model_name_or_path` is a Clef checkpoint, loaded as it is, or a backbone for a new head: a causal LM (KLM-1.6, Qwen)
+reads its last token with the ChatML prompt; a bidirectional encoder (BERT, ModernBERT, or a reranker, unwrapped to
+its base model) reads its first token with the plain prompt between [CLS] and [SEP]. `global_pooling` and
+`prompt_style` override that choice; `head_type: cosine` (with `cosine_width`, `cosine_initial_scale`) selects the
+small cosine head instead of the joint one. The resolved setup is printed at start-up.
+
 python examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
 
 torchrun --nproc_per_node=2 \
@@ -39,8 +45,17 @@ from typing import Any
 
 import torch
 from datasets import Features, Sequence, Value, load_dataset
-from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForDecision, AutoTokenizer, set_seed
-from transformers.decision import Question, parse_questions
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoModelForDecision,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    set_seed,
+)
+from transformers.decision import Question
+from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES, MODEL_FOR_MASKED_LM_MAPPING_NAMES
 from transformers.utils import cached_file
 
 from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config
@@ -154,12 +169,16 @@ class DataCollatorForClef(DataCollatorForDecision):
                     f"Question {name!r} is nullable; Clef has no coverage output, so it cannot be trained"
                 )
                 return self._skip("nullable question", error)
+        # The request is rendered (and its questions validated) once, then the targets are read for its questions
         try:
-            parse_questions(requested, self.decision_config)
+            prompts = self.decision_config.prepare_inputs(request, self.tokenizer)
+            if len(prompts) != 1:
+                raise ValueError(f"The template renders {len(prompts)} prompts; Clef needs all questions in one")
         except ValueError as error:
             return self._skip("invalid request", error)
+        inputs, questions = prompts[0]
         try:
-            inputs, questions, targets = self.prepare_request(example)
+            targets = self.prepare_targets(example, questions)
         except ValueError as error:
             return self._skip("unusable targets", error)
         for question in questions:
@@ -267,7 +286,30 @@ class ClefScriptArguments(ScriptArguments):
     max_eval_samples: int | None = field(default=None, metadata={"help": "Limit evaluation records."})
 
     mode: str = field(default="full", metadata={"help": "Train head, lora, or full model."})
-    head_type: str = field(default="joint", metadata={"help": "Decision head: joint."})
+    head_type: str | None = field(
+        default=None,
+        metadata={
+            "help": "Decision head of a new model: joint (the default) or cosine. A Clef checkpoint keeps its own head."
+        },
+    )
+    global_pooling: str | None = field(
+        default=None,
+        metadata={
+            "help": "Token of a new model's global state: last or first. Defaults to the backbone's attention: last for "
+            "causal backbones, first for bidirectional ones (encoders)."
+        },
+    )
+    prompt_style: str | None = field(
+        default=None,
+        metadata={
+            "help": "Template of a new model: chatml or plain. Defaults to chatml for causal backbones and plain "
+            "(between [CLS] and [SEP]) for bidirectional ones."
+        },
+    )
+    cosine_width: int | None = field(default=None, metadata={"help": "Width of the cosine head's projections."})
+    cosine_initial_scale: float | None = field(
+        default=None, metadata={"help": "Initial temperature of the cosine head."}
+    )
     head_hidden_size: int | None = field(
         default=None, metadata={"help": "Width of the head. Defaults to the config's."}
     )
@@ -288,13 +330,52 @@ class ClefScriptArguments(ScriptArguments):
 @dataclass
 class ClefModelArguments(ModelConfig):
     model_name_or_path: str = field(
-        default="MinimaLabs/KLM-1.6", metadata={"help": "Clef checkpoint, or a causal LM to use as the backbone."}
+        default="MinimaLabs/KLM-1.6",
+        metadata={"help": "Clef checkpoint, or a causal LM or an encoder to use as the backbone of a new head."},
     )
     lora_task_type: str = field(default="FEATURE_EXTRACTION", metadata={"help": "PEFT task type for the backbone."})
 
 
+def is_causal(config) -> bool:
+    """
+    Whether a backbone attends causally: a model type with a causal language modeling class that is not a masked
+    language model (BERT and RoBERTa have both and are encoders), or a config marked as a decoder.
+    """
+    model_type = config.model_type
+    is_decoder_type = (
+        model_type in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES and model_type not in MODEL_FOR_MASKED_LM_MAPPING_NAMES
+    )
+    return is_decoder_type or bool(getattr(config, "is_decoder", False))
+
+
+def load_backbone(name, config, model_kwargs):
+    """
+    The backbone of a new head, and the table its `lm_head` starts from (`None` without one): the base model of a
+    causal LM with its output embeddings, or a bidirectional encoder with its input embeddings. A checkpoint that only
+    registers a sequence classification class (a reranker) is loaded as that and unwrapped to its `base_model`.
+    """
+    if is_causal(config):
+        causal_lm = AutoModelForCausalLM.from_pretrained(name, **model_kwargs)
+        return causal_lm.base_model, causal_lm.get_output_embeddings().weight
+    architectures = config.architectures or []
+    if architectures and all(architecture.endswith("ForSequenceClassification") for architecture in architectures):
+        classifier = AutoModelForSequenceClassification.from_pretrained(name, **model_kwargs)
+        backbone = classifier.base_model
+        if backbone is classifier or not hasattr(backbone, "get_input_embeddings"):
+            raise ValueError(
+                f"{name} registers only {architectures}, whose base model cannot be unwrapped into a backbone"
+            )
+    else:
+        backbone = AutoModel.from_pretrained(name, **model_kwargs)
+    return backbone, backbone.get_input_embeddings().weight
+
+
 def build_model(script_args, model_args, model_kwargs):
-    """A Clef checkpoint is loaded as it is; any other model becomes the backbone of a new head."""
+    """
+    A Clef checkpoint is loaded as it is; any other model becomes the backbone of a new head. A causal backbone reads
+    its last token with the ChatML prompt, a bidirectional one (an encoder) its first with the plain prompt, unless
+    `global_pooling` or `prompt_style` say otherwise.
+    """
     from transformers import ClefConfig, ClefForDecision
 
     name, revision = model_args.model_name_or_path, model_args.model_revision
@@ -303,20 +384,26 @@ def build_model(script_args, model_args, model_kwargs):
         for key in ("label_smoothing", "brier_weight", "ordinal_weight")
         if getattr(script_args, key) is not None
     }
+    head_settings = {
+        key: getattr(script_args, key)
+        for key in ("head_type", "global_pooling", "prompt_style", "cosine_width", "cosine_initial_scale")
+        if getattr(script_args, key) is not None
+    }
+    config = AutoConfig.from_pretrained(name, revision=revision)
     is_checkpoint = (
-        AutoConfig.from_pretrained(name, revision=revision).model_type == "clef"
+        config.model_type == "clef"
         or cached_file(name, "joint_head_config.json", revision=revision, _raise_exceptions_for_missing_entries=False)
         is not None
     )
     if is_checkpoint:
         model = AutoModelForDecision.from_pretrained(name, **model_kwargs)
+        changed = {key: value for key, value in head_settings.items() if getattr(model.config, key) != value}
+        if changed:
+            raise ValueError(f"{name} is a Clef checkpoint; its head settings cannot change ({changed})")
         for key, value in losses.items():
             setattr(model.config, key, value)
     else:
-        if script_args.head_type != "joint":
-            raise ValueError(f"head_type {script_args.head_type!r} is not available; this build has only 'joint'")
-        causal_lm = AutoModelForCausalLM.from_pretrained(name, **model_kwargs)
-        backbone = causal_lm.base_model
+        backbone, embeddings = load_backbone(name, config, model_kwargs)
         sizes = {
             key: getattr(script_args, f"head_{value}")
             for key, value in {
@@ -329,18 +416,37 @@ def build_model(script_args, model_args, model_kwargs):
             if getattr(script_args, f"head_{value}") is not None
         }
         text_config = backbone.config
-        config = ClefConfig(text_config=text_config, backbone_hidden_size=text_config.hidden_size, **sizes, **losses)
+        causal = is_causal(text_config)
+        defaults = {"global_pooling": "last" if causal else "first", "prompt_style": "chatml" if causal else "plain"}
+        config = ClefConfig(
+            text_config=text_config,
+            backbone_hidden_size=text_config.hidden_size,
+            **sizes,
+            **losses,
+            **{**defaults, **head_settings},
+        )
         model = ClefForDecision(config)
         model.model.load_state_dict(backbone.state_dict())
-        with torch.no_grad():
-            model.lm_head.weight.copy_(causal_lm.get_output_embeddings().weight)
         # The head stays in float32; the backbone keeps the dtype it was loaded in
-        model.model.to(causal_lm.dtype)
-        model.lm_head.to(causal_lm.dtype)
-        del causal_lm, backbone
+        model.model.to(backbone.dtype)
+        if hasattr(model, "lm_head"):  # the cosine head, and encoders without a causal LM class, have none
+            with torch.no_grad():
+                model.lm_head.weight.copy_(embeddings)
+            model.lm_head.to(backbone.dtype)
+        del backbone, embeddings
     if model.decision_config.chat_template is None:
         model.decision_config = clef_decision_config()
     return model
+
+
+def describe(model) -> str:
+    """The resolved setup of a Clef model: the attention of its backbone, its pooling, prompt style and head."""
+    config = model.config
+    attention = "causal" if is_causal(config.text_config) else "bidirectional"
+    return (
+        f"Clef setup: {attention} backbone ({config.text_config.model_type}), global_pooling={config.global_pooling}, "
+        f"prompt_style={config.prompt_style}, head_type={config.head_type}"
+    )
 
 
 def prepare_split(dataset, collator, training_args, desc):
@@ -390,6 +496,8 @@ def main(script_args, training_args, model_args):
     if model_args.attn_implementation is not None:
         model_kwargs["attn_implementation"] = model_args.attn_implementation
     model = build_model(script_args, model_args, model_kwargs)
+    if training_args.process_index == 0:
+        print(describe(model))
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, revision=model_args.model_revision)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

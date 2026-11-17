@@ -86,15 +86,14 @@ python examples/decisions/clef_typed_decisions.py --config examples/decisions/cl
 The configuration trains the head at `head_learning_rate` (`3e-4`, the backbone at `1e-4`), evaluates with
 `compute_calibration_metrics` and keeps the checkpoint with the best `eval_selection_score`.
 
-`mode` selects head-only, LoRA, or full training. LoRA puts adapters on the backbone and trains the head in full; the output is the merged native checkpoint, with the adapter alone in `adapter/`. A Clef checkpoint is loaded as it is; any other causal LM becomes the
-backbone of a new head. Each row holds `state`, `questions` and the targets of all of its questions, either `targets`
+`mode` selects head-only, LoRA, or full training. LoRA puts adapters on the backbone and trains the head in full; the output is the merged native checkpoint, with the adapter alone in `adapter/`. A Clef checkpoint is loaded as it is; any other model becomes the
+backbone of a new head. A causal LM reads its last token with Clef's ChatML prompt; a bidirectional encoder (BERT, ModernBERT, or a reranker, unwrapped to its base model) reads its first token with the plain prompt between `[CLS]` and `[SEP]`. `global_pooling` (`last` or `first`) and `prompt_style` (`chatml` or `plain`) override that choice, and `head_type: cosine` (with `cosine_width` and `cosine_initial_scale`) selects the small cosine head; the script prints the resolved setup at start-up. Each row holds `state`, `questions` and the targets of all of its questions, either `targets`
 (per question `target_index`, `target_probs`, `p_true` or `score`) or `gold` / `answers` (per question a label or
 probabilities), through `DataCollatorForDecision.prepare_request`. The example collator `DataCollatorForClef` returns
 one row of `labels` and `option_mask` per question, with the questions of all records of a batch one after the other.
-Nullable questions raise: Clef has no coverage output. A prompt longer than `max_length` raises, or with
-`truncation: skip` is dropped and counted in the build report the script prints (rows, questions, skipped with the
-reasons, truncated). With `permute_fields`, each training batch re-renders its prompts with the questions in a new
-random order, each keeping its target; evaluation never does. The model does not support activation checkpointing. The collator returns `rows_per_example`, so the
+Nullable questions raise: Clef has no coverage output. A prompt longer than `max_length`, an invalid request, a nullable question or unusable targets raise, or with
+`truncation: skip` the record is dropped and counted in the build report the script prints (rows, questions, skipped by reason, truncated). With `permute_fields`, each training batch re-renders its prompts with the questions in a new
+random order, each keeping its target; evaluation never does. Activation checkpointing (`gradient_checkpointing: true`) covers the backbone and the head. The collator returns `rows_per_example`, so the
 example also runs on several processes:
 
 ```bash

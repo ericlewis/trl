@@ -207,8 +207,13 @@ class DataCollatorForDecision(DataCollatorMixin):
                 "renders all questions in one prompt"
             )
         inputs, questions = prompts[0]
-        names = [question.name for question in questions]
+        return inputs, questions, self.prepare_targets(example, questions)
 
+    def prepare_targets(self, example: dict[str, Any], questions: list) -> list[tuple[float, ...]]:
+        """The null-first target of each of `questions` (in template order) from the targets of `example`, see
+        [`~experimental.decision.DataCollatorForDecision.prepare_request`]. Raises `ValueError` when they are unusable.
+        """
+        names = [question.name for question in questions]
         if example.get("targets") is not None:
             rows, convert = _json_value(example["targets"]), lambda row, question: row
             source = "targets"
@@ -231,4 +236,4 @@ class DataCollatorForDecision(DataCollatorMixin):
                 targets.append(normalize_target(convert(rows[question.name], question), question))
             except ValueError as error:
                 raise ValueError(f"Question {question.name!r}: {error}") from error
-        return inputs, questions, targets
+        return targets
