@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
@@ -100,6 +101,61 @@ def normalize_target(row: Mapping[str, Any], question: Question) -> tuple[float,
     return tuple(probs)
 
 
+def _gold_key(label: Any, question: Question) -> str | None:
+    """The option of `question` that a gold label names, or `None` if it names none."""
+    if question.type == "noul":
+        if isinstance(label, bool):
+            label = "true" if label else "false"
+        label = label.strip().lower() if isinstance(label, str) else None
+    elif question.type == "score":
+        if isinstance(label, str) and label.strip().lstrip("+-").isdigit():
+            label = int(label)
+        label = str(label) if type(label) is int else None
+    elif not isinstance(label, str):
+        label = None
+    return label if label in question.options else None
+
+
+def target_from_gold(gold: Any, question: Question) -> dict[str, list[float]]:
+    """Turn the gold answer of one question into a `{"target_probs": [...]}` row, null probability first (zero).
+
+    `gold` is a bare label, or a dict with `label` and/or `probabilities` (for a noul question, `noul` is also accepted
+    as the probability of true). Probabilities take each option's value (missing or negative counts as zero), fill the
+    missing side of a noul as `1 - p`, and are normalized to sum to one. Without probabilities, a label that names an
+    option gives a one-hot target. Labels are normalized per type: noul takes booleans and "true"/"false", score takes
+    an integer level or its string. Probabilities follow `question.options`.
+    """
+    options = list(question.options)
+    row = gold if isinstance(gold, Mapping) else {"label": gold}
+    probabilities = row.get("probabilities")
+    if probabilities is None and question.type == "noul" and row.get("noul") is not None:
+        probabilities = {"true": row["noul"]}
+    if probabilities is not None:
+        if not isinstance(probabilities, Mapping):
+            raise ValueError("probabilities must map options to numbers")
+        supplied = {}
+        for key, value in probabilities.items():
+            value = _finite(value, f"probability of {key!r}")
+            option = _gold_key(key, question)
+            if option is not None:
+                supplied[option] = max(value, 0.0)
+        if question.type == "noul" and len(supplied) == 1:
+            (known,) = supplied
+            other = "false" if known == "true" else "true"
+            supplied[other] = max(1.0 - supplied[known], 0.0)
+        total = sum(supplied.values())
+        if total > 0:
+            return {"target_probs": [0.0] + [supplied.get(option, 0.0) / total for option in options]}
+    option = _gold_key(row.get("label"), question)
+    if option is None:
+        raise ValueError("gold has no usable label or probabilities")
+    return {"target_probs": [0.0] + [1.0 if key == option else 0.0 for key in options]}
+
+
+def _json_value(value: Any) -> Any:
+    return json.loads(value) if isinstance(value, str) else value
+
+
 @dataclass
 class DataCollatorForDecision(DataCollatorMixin):
     """Base for example collators that adapt Transformers decision inputs to a model's forward signature.
@@ -131,3 +187,48 @@ class DataCollatorForDecision(DataCollatorMixin):
         inputs, questions = prompts[0]
         question = questions[0]
         return inputs, question, normalize_target(example, question)
+
+    def prepare_request(self, example: dict[str, Any]):
+        """Return native inputs of the single prompt, its questions in template order, and one null-first target each.
+
+        The template must render all questions in one prompt. Targets come from `example["targets"]`, a mapping of
+        question name to a row for `normalize_target`, or from `example["gold"]` / `example["answers"]`, a mapping of
+        question name to a gold answer for [`~experimental.decision.data_collator.target_from_gold`]. Either may be a
+        JSON string.
+        """
+        if "request" in example:
+            request = example["request"]
+        else:
+            request = {"state": example["state"], "questions": _json_value(example["questions"])}
+        prompts = self.decision_config.prepare_inputs(request, self.tokenizer)
+        if len(prompts) != 1:
+            raise ValueError(
+                f"The template renders {len(prompts)} prompts for this row; prepare_request needs a template that "
+                "renders all questions in one prompt"
+            )
+        inputs, questions = prompts[0]
+        names = [question.name for question in questions]
+
+        if example.get("targets") is not None:
+            rows, convert = _json_value(example["targets"]), lambda row, question: row
+            source = "targets"
+        else:
+            source = next((key for key in ("gold", "answers") if example.get(key) is not None), None)
+            if source is None:
+                raise ValueError("A row needs `targets`, `gold` or `answers` with one entry per question")
+            rows, convert = _json_value(example[source]), target_from_gold
+        if not isinstance(rows, Mapping):
+            raise ValueError(f"`{source}` must map question names to targets")
+        unknown = [name for name in rows if name not in names]
+        if unknown:
+            raise ValueError(f"`{source}` names unknown questions {unknown}; the questions are {names}")
+
+        targets = []
+        for question in questions:
+            if question.name not in rows:
+                raise ValueError(f"`{source}` has no entry for question {question.name!r}")
+            try:
+                targets.append(normalize_target(convert(rows[question.name], question), question))
+            except ValueError as error:
+                raise ValueError(f"Question {question.name!r}: {error}") from error
+        return inputs, questions, targets

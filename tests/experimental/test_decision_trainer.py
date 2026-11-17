@@ -36,10 +36,13 @@ from transformers import (
     default_data_collator,
     set_seed,
 )
+from transformers.decision import DecisionConfig as TransformersDecisionConfig
 from transformers.loss.loss_utils import LOSS_MAPPING
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+from transformers.models.clef.configuration_clef import CLEF_TEMPLATE
 
 from trl.experimental.decision import DataCollatorForDecision, DecisionConfig, DecisionTrainer
+from trl.experimental.decision.data_collator import target_from_gold
 
 from ..testing_utils import TrlTestCase, require_peft
 
@@ -687,3 +690,127 @@ class TestDecisionTrainerJev(TrlTestCase):
         np.testing.assert_allclose(
             np.where(prediction.predictions == -100, 0, prediction.predictions).sum(-1), 1, atol=1e-6
         )
+
+
+THREE_QUESTIONS = {
+    "refund": {"type": "noul", "instructions": "Does the customer want a refund?"},
+    "team": {"type": "choice", "instructions": "Which team?", "criteria": {"zeta": None, "alpha": None}},
+    "urgency": {"type": "score", "instructions": "How urgent?", "criteria": ["Can wait", "This week", "Today"]},
+}
+THREE_TARGETS = {
+    "refund": {"p_true": 0.75},
+    "team": {"target_index": 0},
+    "urgency": {"score": 1},
+}
+
+
+class TestDataCollatorForDecisionRequests(TrlTestCase):
+    @staticmethod
+    def make_collator(tokenizer, per_question=False):
+        config = (
+            TransformersDecisionConfig()
+            if per_question
+            else TransformersDecisionConfig(
+                noul_options=["true", "false"], sort_choices=True, chat_template=CLEF_TEMPLATE
+            )
+        )
+        return DataCollatorForDecision(tokenizer, config)
+
+    def test_prepare_request_returns_one_target_per_question(self, tokenizer):
+        collator = self.make_collator(tokenizer)
+        inputs, questions, targets = collator.prepare_request(
+            {"state": "s", "questions": THREE_QUESTIONS, "targets": THREE_TARGETS}
+        )
+        assert "input_ids" in inputs
+        assert [question.name for question in questions] == ["refund", "team", "urgency"]
+        assert len(targets) == 3
+        assert [len(target) for target in targets] == [len(question.options) + 1 for question in questions]
+        assert targets[0] == pytest.approx((0, 0.75, 0.25))
+        assert targets[2] == pytest.approx((0, 0, 1, 0))
+
+    def test_targets_follow_template_option_order(self, tokenizer):
+        collator = self.make_collator(tokenizer)
+        _, questions, targets = collator.prepare_request(
+            {"state": "s", "questions": THREE_QUESTIONS, "targets": {**THREE_TARGETS, "team": {"target_index": 0}}}
+        )
+        assert questions[1].options == ["alpha", "zeta"]
+        # target_index counts in template order, so index 0 is "alpha"
+        assert targets[1] == (0.0, 1.0, 0.0)
+        # gold names the key, so the mass follows "zeta" to the second slot
+        _, _, targets = collator.prepare_request(
+            {"state": "s", "questions": THREE_QUESTIONS, "gold": {"refund": True, "team": "zeta", "urgency": 2}}
+        )
+        assert targets[1] == (0.0, 0.0, 1.0)
+        assert targets[0] == (0.0, 1.0, 0.0)
+        assert targets[2] == (0.0, 0.0, 0.0, 1.0)
+
+    def test_gold_label_and_probabilities(self, tokenizer):
+        collator = self.make_collator(tokenizer)
+        _, questions, _ = collator.prepare_request(
+            {"state": "s", "questions": THREE_QUESTIONS, "targets": THREE_TARGETS}
+        )
+        refund, team, urgency = questions
+        assert target_from_gold("b", team.__class__("c", "choice", None, ["a", "b"], ["A", "B"], [None, None])) == {
+            "target_probs": [0.0, 0.0, 1.0]
+        }
+        assert target_from_gold({"noul": 0.75}, refund) == {"target_probs": [0.0, 0.75, 0.25]}
+        assert target_from_gold({"label": "false"}, refund) == {"target_probs": [0.0, 0.0, 1.0]}
+        assert target_from_gold(False, refund) == {"target_probs": [0.0, 0.0, 1.0]}
+        assert target_from_gold({"probabilities": {"zeta": 3, "alpha": 1}}, team) == {
+            "target_probs": [0.0, 0.25, 0.75]
+        }
+        assert target_from_gold({"probabilities": {"zeta": 1, "alpha": -5}}, team) == {"target_probs": [0.0, 0.0, 1.0]}
+        assert target_from_gold("1", urgency) == {"target_probs": [0.0, 0.0, 1.0, 0.0]}
+        assert target_from_gold(2, urgency) == {"target_probs": [0.0, 0.0, 0.0, 1.0]}
+        with pytest.raises(ValueError, match="no usable label or probabilities"):
+            target_from_gold("missing", team)
+        with pytest.raises(ValueError, match="finite"):
+            target_from_gold({"probabilities": {"alpha": float("nan")}}, team)
+        # JSON-encoded gold works the same as a dict
+        _, _, targets = collator.prepare_request(
+            {
+                "state": "s",
+                "questions": THREE_QUESTIONS,
+                "gold": json.dumps({"refund": {"noul": 0.75}, "team": "alpha", "urgency": 0}),
+            }
+        )
+        assert targets[0] == pytest.approx((0, 0.75, 0.25))
+
+    def test_missing_target_names_the_question(self, tokenizer):
+        collator = self.make_collator(tokenizer)
+        with pytest.raises(ValueError, match="'urgency'"):
+            collator.prepare_request(
+                {
+                    "state": "s",
+                    "questions": THREE_QUESTIONS,
+                    "targets": {"refund": THREE_TARGETS["refund"], "team": THREE_TARGETS["team"]},
+                }
+            )
+
+    def test_unknown_target_name_raises(self, tokenizer):
+        collator = self.make_collator(tokenizer)
+        with pytest.raises(ValueError, match="'colour'"):
+            collator.prepare_request(
+                {
+                    "state": "s",
+                    "questions": THREE_QUESTIONS,
+                    "targets": {**THREE_TARGETS, "colour": {"target_index": 0}},
+                }
+            )
+
+    def test_single_question_rows_still_work(self, tokenizer):
+        collator = self.make_collator(tokenizer, per_question=True)
+        question = {"type": "choice", "instructions": "Which team?", "criteria": {"zeta": None, "alpha": None}}
+        inputs, parsed, target = collator.prepare_example(
+            {"state": "s", "questions": {"team": question}, "target_index": 1}
+        )
+        assert parsed.name == "team" and parsed.options == ["zeta", "alpha"]
+        assert target == (0.0, 0.0, 1.0)
+        assert "input_ids" in inputs
+        with pytest.raises(ValueError, match="exactly one decision question"):
+            collator.prepare_example({"state": "s", "questions": THREE_QUESTIONS, "target_index": 0})
+
+    def test_per_question_prompt_template_is_rejected(self, tokenizer):
+        collator = self.make_collator(tokenizer, per_question=True)
+        with pytest.raises(ValueError, match="one prompt"):
+            collator.prepare_request({"state": "s", "questions": THREE_QUESTIONS, "targets": THREE_TARGETS})

@@ -45,6 +45,12 @@ Requests use Transformers' `state` / `questions` schema, with one question per t
 | `p_true` | Probability of true for a `noul` question. |
 | `score` | Numeric score, interpolated between rubric levels. |
 
+A row with several questions rendered into one prompt (a template that reads `questions`, such as Clef's) goes through
+`prepare_request`, which returns the inputs, the questions in template order and one target per question. Targets come
+from `targets` (`{question_name: {"target_index" | "target_probs" | "p_true" | "score": ...}}`), or from `gold` /
+`answers`, where each entry is a bare label or `{"label", "probabilities", "noul"}`. `target_from_gold` turns the latter
+into `target_probs` in the question's option order. A template that renders one prompt per question is rejected.
+
 Choice questions use a `criteria` mapping and may set `allow_null=True`. Score questions use a `criteria` list and
 may supply numeric `values`. The [Jeva example collator](https://github.com/huggingface/trl/blob/main/examples/decisions/jeva_banking77.py)
 uses Transformers' template to prepare separate state and option spans. It subclasses `DataCollatorForDecision`,
@@ -116,3 +122,4 @@ answers = decide(request)
 
 [[autodoc]] experimental.decision.DataCollatorForDecision
     - prepare_example
+    - prepare_request
