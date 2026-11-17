@@ -20,6 +20,7 @@ import os
 from collections import defaultdict
 from collections.abc import Callable
 from copy import deepcopy
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -92,6 +93,33 @@ def _to_model_layout(model: PreTrainedModel, state_dict: dict[str, torch.Tensor]
     return converted
 
 
+def pack_rows(rows: torch.Tensor, rows_per_example: torch.Tensor, max_rows: int, fill: float) -> torch.Tensor:
+    """
+    Pack `rows` (`(num_rows, ...)`), whose first `rows_per_example[0]` rows belong to the first record, the next
+    `rows_per_example[1]` to the second and so on, into `(num_records, max_rows, ...)`. The slots after the rows of a
+    record hold `fill`.
+    """
+    if int(rows_per_example.sum()) != rows.shape[0]:
+        raise ValueError(
+            f"rows_per_example adds up to {int(rows_per_example.sum())} rows, but the batch has {rows.shape[0]}"
+        )
+    if rows_per_example.numel() and int(rows_per_example.max()) > max_rows:
+        raise ValueError(f"A record has more than {max_rows} rows")
+    records = torch.arange(len(rows_per_example), device=rows.device)
+    record = torch.repeat_interleave(records, rows_per_example.to(rows.device))
+    starts = rows_per_example.to(rows.device).cumsum(0) - rows_per_example.to(rows.device)
+    position = torch.arange(rows.shape[0], device=rows.device) - starts[record]
+    packed = rows.new_full((len(rows_per_example), max_rows, *rows.shape[1:]), fill)
+    packed[record, position] = rows
+    return packed
+
+
+def unpack_rows(packed: torch.Tensor, rows_per_example: torch.Tensor) -> torch.Tensor:
+    """The rows packed by [`pack_rows`], in record order then row order."""
+    slots = torch.arange(packed.shape[1], device=packed.device)
+    return packed[slots[None, :] < rows_per_example.to(packed.device)[:, None]]
+
+
 class DecisionTrainer(_BaseTrainer):
     """
     Trainer for models that return a supervised decision loss.
@@ -106,7 +134,9 @@ class DecisionTrainer(_BaseTrainer):
         args ([`experimental.decision.DecisionConfig`], *optional*):
             Training configuration.
         data_collator (`Callable`, *optional*):
-            Collator producing the model's forward inputs and `labels`.
+            Collator producing the model's forward inputs and `labels`. It may add `is_choice` (which rows count for
+            choice accuracy) and `rows_per_example` (the number of consecutive rows of each record, when a record has
+            several rows); neither is passed to the model.
         train_dataset (`Dataset` or `IterableDataset`, *optional*):
             Dataset of model inputs or raw requests prepared by the collator.
         eval_dataset (`Dataset` or `IterableDataset` or `dict`, *optional*):
@@ -115,7 +145,8 @@ class DecisionTrainer(_BaseTrainer):
             Encoder tokenizer. Loaded from the checkpoint when omitted.
         compute_metrics (`Callable`, *optional*):
             Receives predicted probabilities and labels. Nullable decisions include null in the first column. Padding
-            added during evaluation has value `-100`.
+            added during evaluation has value `-100`. With `rows_per_example`, each record has the same number of row
+            slots within an evaluation batch, in order; the slots it does not use are `-100` in every cell.
         callbacks (`list[TrainerCallback]`, *optional*):
             Callbacks passed to [`~transformers.Trainer`].
         optimizers (`tuple`, *optional*, defaults to `(None, None)`):
@@ -196,9 +227,9 @@ class DecisionTrainer(_BaseTrainer):
 
     def create_optimizer(self, model=None):
         """
-        Set up the optimizer. With `head_learning_rate`, the parameters outside the backbone (`base_model`) train at that
-        rate and the backbone, including any adapters inside it, at `learning_rate`; zero-dimensional parameters (scales,
-        gates) are never decayed. Otherwise this is [`~transformers.Trainer.create_optimizer`].
+        Set up the optimizer. With `head_learning_rate`, the parameters outside the backbone (`base_model`) train at
+        that rate and the backbone, including any adapters inside it, at `learning_rate`; zero-dimensional parameters
+        (scales, gates) are never decayed. Otherwise this is [`~transformers.Trainer.create_optimizer`].
         """
         if self.args.head_learning_rate is None or self.optimizer is not None:
             return super().create_optimizer(model)
@@ -266,7 +297,7 @@ class DecisionTrainer(_BaseTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         mode = "train" if self.model.training else "eval"
-        model_inputs = {key: value for key, value in inputs.items() if key != "is_choice"}
+        model_inputs = {key: value for key, value in inputs.items() if key not in {"is_choice", "rows_per_example"}}
         # Sharded encoders must execute the same number of option chunks on every rank.
         if self.accelerator.num_processes > 1 and inputs.get("option_chunk_size") is not None:
             count = inputs["option_input_ids"].new_tensor([inputs["option_input_ids"].shape[0]])
@@ -330,6 +361,11 @@ class DecisionTrainer(_BaseTrainer):
                 ],
                 1,
             )
+            rows_per_example = inputs.get("rows_per_example")
+            if rows_per_example is not None:
+                # One entry per record, summed over its rows: padded slots are zero in numerator and denominator
+                max_rows = int(rows_per_example.max()) if rows_per_example.numel() else 0
+                values = pack_rows(values, rows_per_example, max_rows, 0.0).sum(1)
             values = self._gather_for_metrics(values)
             for key, totals in zip(metrics, values.sum(0).tolist(), strict=True):
                 self._metrics[mode][key].append(totals)
@@ -367,7 +403,40 @@ class DecisionTrainer(_BaseTrainer):
         labels = inputs["labels"]
         if labels.ndim == 2:
             labels = labels.masked_fill(~mask, -100)
-        return loss.detach(), probabilities.masked_fill(~mask, -100).detach(), labels
+        probabilities = probabilities.masked_fill(~mask, -100).detach()
+        rows_per_example = inputs.get("rows_per_example")
+        if rows_per_example is not None:
+            probabilities, labels = self._pack_predictions(probabilities, labels, rows_per_example)
+        return loss.detach(), probabilities, labels
+
+    def _pack_predictions(self, probabilities, labels, rows_per_example):
+        """
+        Pack the rows of the batch by record, `(num_records, max_rows, num_options)`, with `-100` in padded slots and
+        cells, so that the evaluation gathers whole records across ranks and drops the padded records of the last
+        batch. `max_rows` and `num_options` are the largest of all ranks.
+        """
+        if "inputs" in (self.args.include_for_metrics or []):
+            raise ValueError("include_for_metrics=['inputs'] is not supported with rows_per_example")
+        max_rows = int(rows_per_example.max()) if rows_per_example.numel() else 0
+        sizes = torch.tensor([max_rows, probabilities.shape[-1]], device=probabilities.device)
+        if self.accelerator.num_processes > 1:
+            sizes = self.accelerator.gather(sizes[None]).amax(0)
+        max_rows, num_options = sizes.tolist()
+        probabilities = F.pad(probabilities, (0, num_options - probabilities.shape[-1]), value=-100)
+        if labels.ndim == 2:
+            labels = F.pad(labels, (0, num_options - labels.shape[-1]), value=-100)
+        probabilities = pack_rows(probabilities, rows_per_example, max_rows, -100)
+        labels = pack_rows(labels, rows_per_example, max_rows, -100)
+        # After gathering, the records are flattened back to rows (the padded slots stay, at `-100`), so that batches
+        # with different numbers of options concatenate
+        gather = self._gather_for_metrics if self.get_tp_size() > 1 else self.accelerator.gather_for_metrics
+        self.gather_function = partial(self._gather_record_rows, gather)
+        return probabilities, labels
+
+    @staticmethod
+    def _gather_record_rows(gather, tensor):
+        tensor = gather(tensor)
+        return tensor.flatten(0, 1) if tensor.ndim > 1 else tensor
 
     def log(self, logs, start_time=None):
         mode = "train" if self.model.training else "eval"

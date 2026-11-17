@@ -94,8 +94,13 @@ one row of `labels` and `option_mask` per question, with the questions of all re
 Nullable questions raise: Clef has no coverage output. A prompt longer than `max_length` raises, or with
 `truncation: skip` is dropped and counted in the build report the script prints (rows, questions, skipped with the
 reasons, truncated). With `permute_fields`, each training batch re-renders its prompts with the questions in a new
-random order, each keeping its target; evaluation never does. The model does not support activation checkpointing. The example is single-process for now: the number of questions
-per batch differs between ranks, so the script raises when it detects more than one process.
+random order, each keeping its target; evaluation never does. The model does not support activation checkpointing. The collator returns `rows_per_example`, so the
+example also runs on several processes:
+
+```bash
+torchrun --nproc_per_node=2 \
+    examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
+```
 
 ## JEV
 
@@ -110,6 +115,15 @@ probabilities, like the other collators. Nullable decisions are unsupported.
 Collators may return integer class labels or soft target distributions. Pass `option_mask` when padding candidate sets. With `allow_null`, target distributions contain null first and the model may return `coverage_logits`. Nullable decisions require a coverage output. `is_choice` can exclude binary and score rows from choice accuracy.
 
 The trainer logs candidate loss, choice and candidate accuracy, Brier score, and entropy. `loss` and `eval_loss` are the native training objective; the reported candidate cross-entropy can differ from it. Null and coverage metrics are logged when present; auxiliary loss is logged only when returned by the model. Metrics aggregate across ranks and accumulation steps, and evaluation removes padded examples. `compute_metrics` receives predicted probabilities and the original labels, with `-100` marking padded candidate columns.
+
+A collator whose records each produce several rows (such as one per question) returns `rows_per_example`, a
+`LongTensor` with the number of consecutive rows of each record, adding up to the number of rows. The trainer removes
+it before calling the model, and packs every per-row tensor it gathers across processes by record, so that each rank
+sends the same shape and the padding of the last evaluation batch is removed in records. `compute_metrics` then
+receives, per record, `max_rows` question slots in order (`max_rows` is the largest number of rows of a record in that
+evaluation batch, over all processes), flattened to `(num_slots, num_options)`: the slots a record does not use are
+`-100` in every cell, and dropping them gives the rows in record order, then row order. Without `rows_per_example`,
+predictions keep one row per example.
 
 `compute_calibration_metrics` can be passed as `compute_metrics` as it is. It reports, per question, `accuracy`, `kl`
 (from the target distribution), `brier`, `ece`, `mean_confidence`, `soft_nll`, `confidence_gap` (mean confidence minus

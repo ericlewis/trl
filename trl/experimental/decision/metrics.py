@@ -24,11 +24,11 @@ def compute_calibration_metrics(
     [`experimental.decision.DecisionTrainer`].
 
     Every real question counts once, whatever its number of options. `eval_pred.predictions` holds the predicted
-    probabilities of each question, `-100` in the cells of options it does not have. They are `(num_questions,
-    num_options)`, or `(num_records, max_questions, num_options)` when the collator returns `rows_per_example`, in which
-    case a question slot that is `-100` everywhere is padding and is ignored. `eval_pred.label_ids` holds, in the same
-    layout, the target distribution of each question (`-100` in padded cells), or the index of its right option (`-100`
-    for a question to ignore).
+    probabilities of each question, `-100` in the cells of options it does not have, as `(num_questions, num_options)`
+    or packed by record as `(num_records, max_questions, num_options)`. A question slot that is `-100` in every cell is
+    padding and is ignored: with `rows_per_example`, the trainer passes the slots of each record, flattened to rows.
+    `eval_pred.label_ids` holds, in the same layout, the target distribution of each question (`-100` in padded cells),
+    or the index of its right option (`-100` for a question to ignore).
 
     Args:
         eval_pred ([`~transformers.EvalPrediction`]):

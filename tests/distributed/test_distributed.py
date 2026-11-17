@@ -541,6 +541,39 @@ class TestDistributed(TrlTestCase):
         # fmt: on
 
 
+@pytest.mark.skipif(find_spec("transformers.models.clef") is None, reason="Requires Transformers #50058")
+class TestDecisionRecordRows(TrlTestCase):
+    """Two CPU processes evaluate records with different numbers of questions exactly like one process does."""
+
+    def run_processes(self, num_processes):
+        output_dir = os.path.join(self.tmp_dir, str(num_processes))
+        # fmt: off
+        command = [
+            "torchrun", "--standalone", "--nproc_per_node", str(num_processes),
+            "tests/distributed/data/decision_clef_ragged.py", output_dir,
+        ]
+        # fmt: on
+        # A hang in a collective fails the test instead of blocking it
+        result = subprocess.run(command, env=os.environ.copy(), cwd=ROOT, timeout=600)
+        assert result.returncode == 0
+        with open(os.path.join(output_dir, "metrics.json")) as f:
+            return json.load(f)
+
+    def test_clef_ragged_records(self):
+        single, double = self.run_processes(1), self.run_processes(2)
+        assert (single["num_processes"], double["num_processes"]) == (1, 2)
+        # 9 records holding 3 + 1 + 2 + 1 + 3 + 2 + 1 + 2 + 3 questions; the last batch of two processes is smaller
+        assert single["eval_questions"] == double["eval_questions"] == 18
+        for key in ("eval_accuracy", "eval_selection_score"):
+            assert double[key] == pytest.approx(single[key], abs=1e-6), key
+        # The other calibration metrics, and the trainer's own metrics, count every question once, too
+        names = ["kl", "brier", "ece", "mean_confidence", "soft_nll", "confidence_gap"]
+        names += ["candidate_loss", "choice_accuracy", "candidate_accuracy", "entropy"]
+        for name in names:
+            assert double[f"eval_{name}"] == pytest.approx(single[f"eval_{name}"], abs=1e-5), name
+        assert single["train_steps"] == double["train_steps"] == 3
+
+
 @require_torch_multi_accelerator
 class TestModelParallel:
     def test_fused_lm_head(self):

@@ -15,6 +15,7 @@
 import copy
 import json
 
+import numpy as np
 import pytest
 import torch
 from datasets import Dataset
@@ -42,7 +43,8 @@ from transformers import (
     set_seed,
 )
 
-from trl.experimental.decision import DecisionConfig, DecisionTrainer
+from trl.experimental.decision import DecisionConfig, DecisionTrainer, compute_calibration_metrics
+from trl.experimental.decision.decision_trainer import pack_rows, unpack_rows
 
 from ..testing_utils import TrlTestCase, require_peft
 
@@ -134,6 +136,7 @@ class TestDataCollatorForClef:
         assert batch["option_mask"].shape == (total, 3)
         assert batch["is_choice"].shape == (total,)
         assert batch["is_choice"].tolist() == [False, True, False, True, False, False]
+        assert batch["rows_per_example"].tolist() == [3, 1, 2]
         assert batch["num_options"].tolist() == [[2, 2, 3], [2, 0, 0], [3, 2, 0]]
         assert batch["question_type_ids"].shape == (3, 3)
         assert batch["question_type_ids"][1, 1:].tolist() == [0, 0]
@@ -158,7 +161,7 @@ class TestDataCollatorForClef:
         assert (batch["input_ids"][batch["attention_mask"] == 0] == tokenizer.pad_token_id).all()
         # The model accepts the batch as it is, and returns one row of logits per question
         model = tiny_clef(tokenizer, decision_config).eval()
-        inputs = {key: value for key, value in batch.items() if key != "is_choice"}
+        inputs = {key: value for key, value in batch.items() if key not in {"is_choice", "rows_per_example"}}
         output = model(**inputs)
         assert output.logits.shape == batch["labels"].shape
         assert torch.isfinite(output.loss)
@@ -296,7 +299,7 @@ def make_trainer(tmp_dir, tokenizer, decision_config, **kwargs):
 
 
 def max_logit_difference(first, second, batch):
-    inputs = {key: value for key, value in batch.items() if key not in {"is_choice", "labels"}}
+    inputs = {key: value for key, value in batch.items() if key not in {"is_choice", "labels", "rows_per_example"}}
     with torch.no_grad():
         return (first.eval()(**inputs).logits - second.eval()(**inputs).logits).abs().max().item()
 
@@ -452,11 +455,6 @@ class TestClefTraining(TrlTestCase):
         for name, value in reloaded.model.state_dict().items():
             torch.testing.assert_close(value.float(), merged[name].float())
 
-    def test_main_rejects_multiple_processes(self, tokenizer, monkeypatch):
-        monkeypatch.setattr(DecisionConfig, "world_size", property(lambda self: 2))
-        with pytest.raises(ValueError, match="single-process"):
-            self.run_main(tokenizer, "head")
-
 
 def lora_clef(tokenizer, decision_config):
     """The tiny Clef with LoRA adapters on its backbone and the head trained in full, as in the example's lora mode."""
@@ -585,3 +583,72 @@ class TestClefCheckpointRestore(TrlTestCase):
     @require_peft
     def test_resume_from_checkpoint_with_lora_backbone(self, tokenizer, decision_config):
         self.check_resume_loads_checkpoint(tokenizer, decision_config, lambda: lora_clef(tokenizer, decision_config))
+
+
+class TestRecordRows(TrlTestCase):
+    """`rows_per_example` makes the trainer gather whole records; on one process it changes no metric."""
+
+    def test_pack_unpack_round_trip(self):
+        rows_per_example = torch.tensor([3, 1, 2, 1])
+        rows = torch.arange(7 * 2 * 3, dtype=torch.float).reshape(7, 2, 3)
+        packed = pack_rows(rows, rows_per_example, 4, -100.0)
+        assert packed.shape == (4, 4, 2, 3)
+        assert torch.equal(unpack_rows(packed, rows_per_example), rows)
+        # Record 1 holds row 3, record 2 rows 4 and 5; every other slot is padding
+        assert torch.equal(packed[1, 0], rows[3]) and torch.equal(packed[2, :2], rows[4:6])
+        is_padding = torch.arange(4)[None, :] >= rows_per_example[:, None]
+        assert (packed[is_padding] == -100).all()
+        with pytest.raises(ValueError, match="adds up"):
+            pack_rows(rows[:6], rows_per_example, 4, 0.0)
+        with pytest.raises(ValueError, match="more than"):
+            pack_rows(rows, rows_per_example, 2, 0.0)
+
+    def test_padded_rows_contribute_nothing(self, tokenizer, decision_config):
+        collator = DataCollatorForClef(tokenizer, decision_config)
+        # Records with three, one and two questions, so batches hold different numbers of rows and options, and the
+        # last batch is smaller
+        names = [("refund", "team", "urgency"), ("team",), ("urgency", "refund"), ("refund",), ("team", "urgency")]
+        val = Dataset.from_list([collator.tokenize(make_row(index, names[index % 5])) for index in range(11)])
+
+        def without_rows(features):
+            batch = collator(features)
+            del batch["rows_per_example"]
+            return batch
+
+        # Both models are built first: a trainer adds the template's tokens to the tokenizer
+        models = {"records": tiny_clef(tokenizer, decision_config), "rows": tiny_clef(tokenizer, decision_config)}
+        # The reference evaluates all records in one batch: without `rows_per_example`, the trainer can only trim the
+        # padding of a last, smaller batch in records, from its rows
+        batch_sizes = {"records": 4, "rows": len(val)}
+        results = {}
+        for name, data_collator in (("records", collator), ("rows", without_rows)):
+            trainer, _, _ = make_trainer(
+                self.tmp_dir,
+                tokenizer,
+                decision_config,
+                model=models[name],
+                compute_metrics=compute_calibration_metrics,
+                per_device_eval_batch_size=batch_sizes[name],
+            )
+            trainer.data_collator = data_collator
+            assert (name == "records") == ("rows_per_example" in trainer.data_collator([val[0], val[1]]))
+            metrics = trainer.evaluate(val)
+            prediction = trainer.predict(val)
+            results[name] = metrics, prediction
+        (packed_metrics, packed), (row_metrics, rows) = results["records"], results["rows"]
+        # Every metric of the trainer and of `compute_calibration_metrics` is the same
+        # (but `eval_loss`, which Trainer averages over batches, weighting each by its number of records)
+        timings = ("runtime", "per_second", "preparation_time")
+        keys = {key for key in row_metrics if not key.endswith(timings) and key != "eval_loss"}
+        assert keys == {key for key in packed_metrics if key in keys} and len(keys) > 10
+        for key in keys:
+            assert packed_metrics[key] == pytest.approx(row_metrics[key], abs=1e-6), key
+        # The packed predictions are the rows, with padded question slots of -100 in between
+        total = sum(len(row["num_options"]) for row in val)
+        assert rows.predictions.shape[0] == total
+        assert packed.predictions.shape[0] > total
+        real = (packed.predictions != -100).any(-1)
+        assert real.sum() == total
+        np.testing.assert_allclose(packed.predictions[real], rows.predictions, atol=1e-6)
+        np.testing.assert_array_equal(packed.label_ids[real], rows.label_ids)
+        assert (packed.label_ids[~real] == -100).all()

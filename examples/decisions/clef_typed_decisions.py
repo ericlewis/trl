@@ -25,8 +25,8 @@ Train a Clef decision model on typed decisions: one prompt per record, every que
 
 python examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
 
-This example is single-process for now: the number of questions per batch differs between ranks, and the trainer does
-not yet gather per-question tensors across ranks.
+torchrun --nproc_per_node=2 \
+    examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
 """
 
 import json
@@ -72,7 +72,9 @@ class DataCollatorForClef(DataCollatorForDecision):
     For repeated training or evaluation, preprocess once with `dataset.map(collator.tokenize)`. The collator also
     accepts these prepared examples and only pads them when building batches. A batch holds the questions of all its
     records one after the other: `labels` and `option_mask` have one row per question, in record order then question
-    order.
+    order, and `rows_per_example` holds the number of questions of each record. With it, `DecisionTrainer` gathers
+    whole records across processes, and its evaluation predictions have `max_questions` slots per record (the most
+    questions of a record in the batch, over all processes), with the unused slots at `-100`.
 
     Args:
         tokenizer (`PreTrainedTokenizerBase`):
@@ -224,6 +226,7 @@ class DataCollatorForClef(DataCollatorForDecision):
             "labels": labels,
             "option_mask": option_mask,
             "is_choice": torch.tensor([choice for feature in features for choice in feature["is_choice"]]),
+            "rows_per_example": torch.tensor([len(feature["num_options"]) for feature in features]),
         }
 
 
@@ -352,11 +355,6 @@ def prepare_split(dataset, collator, training_args, desc):
 
 
 def main(script_args, training_args, model_args):
-    if training_args.world_size > 1:
-        raise ValueError(
-            "The Clef example is single-process for now: the questions of a batch differ between ranks, and the "
-            f"trainer does not yet gather them (world size {training_args.world_size}). Run it without torchrun."
-        )
     set_seed(training_args.seed)
     if script_args.mode not in {"head", "lora", "full"}:
         raise ValueError("mode must be head, lora, or full")

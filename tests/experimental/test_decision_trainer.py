@@ -1038,6 +1038,31 @@ class TestCalibrationMetrics:
         with pytest.raises(ValueError, match="finite"):
             compute_calibration_metrics(EvalPrediction(predictions, labels))
 
+    def test_calibration_metrics_packed_records(self):
+        from trl.experimental.decision.decision_trainer import pack_rows
+
+        rows = ragged_questions(count=12)
+        predictions, labels = padded(rows)
+        rows_per_example = torch.tensor([3, 1, 2, 1, 3, 2])
+        expected = naive_calibration_metrics(rows)
+
+        def pack(array):
+            return pack_rows(torch.from_numpy(array), rows_per_example, 4, -100).numpy()
+
+        packed = compute_calibration_metrics(EvalPrediction(pack(predictions), pack(labels)))
+        # Flattened back to rows, as `DecisionTrainer` passes them, the padded slots stay
+        flat = compute_calibration_metrics(
+            EvalPrediction(pack(predictions).reshape(-1, 4), pack(labels).reshape(-1, 4))
+        )
+        indices = np.array([int(np.argmax(target)) for _, target in rows])
+        hard = [(probabilities, np.eye(len(target))[np.argmax(target)]) for probabilities, target in rows]
+        from_indices = compute_calibration_metrics(EvalPrediction(pack(predictions), pack(indices)))
+        for key, value in expected.items():
+            assert packed[key] == pytest.approx(value, abs=1e-9), key
+            assert flat[key] == pytest.approx(value, abs=1e-9), key
+        for key, value in naive_calibration_metrics(hard).items():
+            assert from_indices[key] == pytest.approx(value, abs=1e-9), key
+
     def test_selection_score_weights(self):
         rows = ragged_questions()
         metrics = compute_calibration_metrics(EvalPrediction(*padded(rows)), kl_weight=0, brier_weight=0)
