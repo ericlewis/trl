@@ -40,8 +40,7 @@ from typing import Any
 import torch
 from datasets import Features, Sequence, Value, load_dataset
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForDecision, AutoTokenizer, set_seed
-from transformers.decision import DecisionConfig as TransformersDecisionConfig
-from transformers.decision import Question
+from transformers.decision import Question, parse_questions
 from transformers.utils import cached_file
 
 from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config
@@ -54,9 +53,10 @@ from trl.experimental.decision import (
 
 
 def clef_decision_config():
-    from transformers.models.clef.configuration_clef import CLEF_TEMPLATE
+    """Clef's decision config with its ChatML prompt: any number of options, since the head reads no label token."""
+    from transformers import ClefConfig
 
-    return TransformersDecisionConfig(noul_options=["true", "false"], sort_choices=True, chat_template=CLEF_TEMPLATE)
+    return ClefConfig.prompt_decision_config("chatml")
 
 
 @dataclass
@@ -84,8 +84,9 @@ class DataCollatorForClef(DataCollatorForDecision):
         max_length (`int`, *optional*, defaults to `2048`):
             Maximum number of tokens of a prompt.
         truncation (`str`, *optional*, defaults to `"error"`):
-            What to do with a record whose prompt is longer than `max_length`: reject it (`"error"`) or mark it
-            as skipped (`"skip"`). Prompts are never cut, since that would remove options or questions.
+            What to do with a record whose prompt is longer than `max_length`, or whose request or targets are
+            invalid: reject it (`"error"`) or mark it as skipped (`"skip"`) under a reason that does not depend on
+            the record. Prompts are never cut, since that would remove options or questions.
         permute_fields (`bool`, *optional*, defaults to `False`):
             Keep the request of each record and re-render it with its questions in a new random order every time it
             is batched. Only records tokenized by a collator with `permute_fields` are permuted, so evaluation uses
@@ -125,34 +126,55 @@ class DataCollatorForClef(DataCollatorForDecision):
             "is_choice": [question.type == "choice" for question in questions],
         }
 
+    def _skip(self, reason: str, error: Exception) -> dict[str, Any]:
+        """Raise `error`, or with `truncation="skip"` return a skipped record with the empty lists and `reason`."""
+        if self.truncation == "error":
+            raise error
+        empty = {key: [] for key in ("input_ids", "marks", "num_options", "question_type_ids", "labels", "is_choice")}
+        return {**empty, "skip": True, "reason": reason, **({"request": ""} if self.permute_fields else {})}
+
     def tokenize(self, example: dict[str, Any]) -> dict[str, Any]:
         """Render and tokenize one record with the native Transformers template.
 
         Returns `input_ids`, `marks`, `num_options`, `question_type_ids`, `labels` (the target distribution of each
         question over its options), `is_choice`, `skip` and `reason`, plus the `request` when `permute_fields`. A
-        record that is too long raises, or with `truncation="skip"` returns `skip=True` and the empty lists.
+        record that is too long, whose request is invalid, that asks a nullable question or whose targets cannot be
+        used raises, or with `truncation="skip"` returns `skip=True`, the empty lists and one of the reasons
+        `"longer than max_length (N tokens)"`, `"invalid request"`, `"nullable question"` and `"unusable targets"`.
         """
-        request = self._request(example)
-        for name, question in request["questions"].items():
+        try:
+            request = self._request(example)
+        except (ValueError, KeyError, TypeError) as error:  # not JSON, or no state or questions
+            return self._skip("invalid request", error)
+        # Before validation, which rejects the `allow_null` field
+        requested = request["questions"]
+        for name, question in requested.items() if isinstance(requested, dict) else ():
             if isinstance(question, dict) and question.get("allow_null"):
-                raise ValueError(
+                error = ValueError(
                     f"Question {name!r} is nullable; Clef has no coverage output, so it cannot be trained"
                 )
-        inputs, questions, targets = self.prepare_request(example)
+                return self._skip("nullable question", error)
+        try:
+            parse_questions(requested, self.decision_config)
+        except ValueError as error:
+            return self._skip("invalid request", error)
+        try:
+            inputs, questions, targets = self.prepare_request(example)
+        except ValueError as error:
+            return self._skip("unusable targets", error)
         for question in questions:
             if asdict(question).get("allow_null", False):
-                raise ValueError(f"Question {question.name!r} is nullable; Clef has no coverage output")
+                error = ValueError(f"Question {question.name!r} is nullable; Clef has no coverage output")
+                return self._skip("nullable question", error)
         if self.permute_fields and [question.name for question in questions] != list(request["questions"]):
             raise ValueError("permute_fields needs a template that renders the questions in the order of the request")
         length = inputs["input_ids"].shape[-1]
         if length > self.max_length:
-            reason = f"longer than max_length ({length} > {self.max_length} tokens)"
-            if self.truncation == "error":
-                raise ValueError(f"A record is {reason}; increase max_length or set truncation='skip'")
-            empty = {
-                key: [] for key in ("input_ids", "marks", "num_options", "question_type_ids", "labels", "is_choice")
-            }
-            return {**empty, "skip": True, "reason": reason, **({"request": ""} if self.permute_fields else {})}
+            error = ValueError(
+                f"A record is longer than max_length ({length} > {self.max_length} tokens); increase max_length or "
+                "set truncation='skip'"
+            )
+            return self._skip(f"longer than max_length ({self.max_length} tokens)", error)
         # The null column is dropped: Clef has no null output
         features = self._features(inputs, questions, [list(target[1:]) for target in targets])
         features |= {"skip": False, "reason": ""}
@@ -257,7 +279,9 @@ class ClefScriptArguments(ScriptArguments):
     brier_weight: float | None = field(default=None, metadata={"help": "Weight of the Brier score. Defaults to 0."})
     ordinal_weight: float | None = field(default=None, metadata={"help": "Weight of the ordinal term. Defaults to 0."})
     max_length: int = field(default=2048, metadata={"help": "Maximum prompt token length."})
-    truncation: str = field(default="error", metadata={"help": "Overlength policy: error or skip."})
+    truncation: str = field(
+        default="error", metadata={"help": "Over-length or invalid records: error, or skip and count them."}
+    )
     permute_fields: bool = field(default=False, metadata={"help": "Shuffle the question order of training prompts."})
 
 
@@ -366,8 +390,6 @@ def main(script_args, training_args, model_args):
     if model_args.attn_implementation is not None:
         model_kwargs["attn_implementation"] = model_args.attn_implementation
     model = build_model(script_args, model_args, model_kwargs)
-    if training_args.gradient_checkpointing and not model.supports_gradient_checkpointing:
-        raise ValueError(f"{type(model).__name__} does not support gradient checkpointing; set it to false")
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, revision=model_args.model_revision)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -376,7 +398,8 @@ def main(script_args, training_args, model_args):
         model.requires_grad_(True)
     else:
         model.model.requires_grad_(False)
-        model.lm_head.requires_grad_(False)
+        if hasattr(model, "lm_head"):  # the cosine head and encoders have none
+            model.lm_head.requires_grad_(False)
     lora_backbone = None
     if script_args.mode == "lora":
         peft_config = get_peft_config(model_args)

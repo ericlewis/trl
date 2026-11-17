@@ -23,7 +23,6 @@ weight_decay: 0.0
 max_grad_norm: 1.0
 lr_scheduler_type: cosine
 warmup_steps: 50
-# Clef does not support activation checkpointing
 gradient_checkpointing: false
 logging_steps: 10
 eval_strategy: steps

@@ -29,6 +29,7 @@ from examples.decisions.clef_typed_decisions import (
     DataCollatorForClef,
     build_model,
     clef_decision_config,
+    prepare_split,
 )
 from examples.decisions.clef_typed_decisions import main as clef_main
 from transformers import (
@@ -36,8 +37,10 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForDecision,
     AutoTokenizer,
+    BertConfig,
     ClefConfig,
     ClefForDecision,
+    ModernBertConfig,
     Qwen2Config,
     pipeline,
     set_seed,
@@ -80,16 +83,20 @@ def decision_config():
     return clef_decision_config()
 
 
-def tiny_clef(tokenizer, decision_config):
+def tiny_clef(tokenizer, decision_config, backbone="qwen2", head_type="joint"):
+    """
+    A tiny Clef on a tiny causal (`qwen2`) or bidirectional (`bert`, `modernbert`) backbone. Encoders read the first
+    token and keep the plain prompt of their decision config when `decision_config` is `None`.
+    """
     set_seed(0)
-    text_config = Qwen2Config(
-        vocab_size=len(tokenizer) + 2,
-        hidden_size=32,
-        intermediate_size=32,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-    )
+    sizes = {"vocab_size": len(tokenizer) + 2, "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2}
+    if backbone == "qwen2":
+        text_config = Qwen2Config(**sizes, num_attention_heads=2, num_key_value_heads=1)
+    elif backbone == "bert":
+        text_config = BertConfig(**sizes, num_attention_heads=2)
+    else:
+        text_config = ModernBertConfig(**sizes, num_attention_heads=2, pad_token_id=tokenizer.pad_token_id)
+    encoder = {} if backbone == "qwen2" else {"global_pooling": "first", "prompt_style": "plain"}
     config = ClefConfig(
         text_config=text_config,
         backbone_hidden_size=32,
@@ -98,10 +105,21 @@ def tiny_clef(tokenizer, decision_config):
         num_hidden_layers=1,
         num_evidence_layers=1,
         num_attention_heads=2,
+        head_type=head_type,
+        cosine_width=16,
+        **encoder,
     )
     model = ClefForDecision(config)
-    model.decision_config = decision_config
+    if decision_config is not None:
+        model.decision_config = decision_config
     return model
+
+
+def encoder_tokenizer(tokenizer):
+    """The tokenizer with a `[CLS]` and a `[SEP]`, which the plain prompt of encoders starts and ends with."""
+    tokenizer = copy.deepcopy(tokenizer)
+    tokenizer.add_special_tokens({"cls_token": "[CLS]", "sep_token": "[SEP]"})
+    return tokenizer
 
 
 def tokenized(collator, rows):
@@ -178,6 +196,52 @@ class TestDataCollatorForClef:
             collator([skipped])
         with pytest.raises(ValueError, match="truncation"):
             DataCollatorForClef(tokenizer, decision_config, truncation="truncate")
+
+    def test_invalid_records_error_or_are_skipped(self, tokenizer, decision_config):
+        nullable = {**QUESTIONS["team"], "allow_null": True}
+        invalid = [
+            ("invalid request", {"state": "s", "questions": {"team": {"type": "bogus"}}, "gold": {"team": "zeta"}}),
+            ("invalid request", {"state": "s", "questions": ["team"], "gold": {"team": "zeta"}}),
+            ("invalid request", {"state": "s", "gold": {"team": "zeta"}}),
+            ("nullable question", {"state": "s", "questions": {"team": nullable}, "gold": {"team": "zeta"}}),
+            ("unusable targets", {**make_row(0, names=("team",)), "gold": {"team": "omega"}}),
+            ("unusable targets", {**make_row(0, names=("team",)), "gold": {}}),
+        ]
+        strict = DataCollatorForClef(tokenizer, decision_config)
+        skipping = DataCollatorForClef(tokenizer, decision_config, truncation="skip")
+        for reason, row in invalid:
+            # A request as JSON too, as datasets store it
+            for example in (row, {key: json.dumps(value) for key, value in row.items()}):
+                with pytest.raises((ValueError, KeyError)):  # as before, when the record is not skipped
+                    strict.tokenize(example)
+                skipped = skipping.tokenize(example)
+                assert skipped["skip"] is True and skipped["reason"] == reason
+                assert skipped["input_ids"] == [] and skipped["labels"] == []
+        assert skipping.tokenize(make_row(0))["skip"] is False
+
+    def test_decision_config_takes_any_number_of_options(self, tokenizer, decision_config):
+        # Clef reads no label token: a record can have more options than there are letters
+        assert decision_config.labels == {"noul": None, "choice": None, "score": None}
+        collator = DataCollatorForClef(tokenizer, decision_config)
+        criteria = {f"option {index:02d}": None for index in range(29)}
+        row = {
+            "state": "s",
+            "questions": {"answer": {"type": "choice", "criteria": criteria}},
+            "gold": {"answer": "option 28"},
+        }
+        features = collator.tokenize(row)
+        assert features["num_options"] == [29]
+        assert features["labels"][0][28] == 1.0
+        output = tiny_clef(tokenizer, decision_config)(
+            **{k: v for k, v in collator([features]).items() if k not in {"is_choice", "rows_per_example"}}
+        )
+        assert output.logits.shape == (1, 29) and torch.isfinite(output.loss)
+
+    def test_skip_reasons_are_grouped(self, tokenizer, decision_config):
+        collator = DataCollatorForClef(tokenizer, decision_config, max_length=64, truncation="skip")
+        longer = {**LONG_ROW, "state": "word " * 300}
+        reasons = [collator.tokenize(row)["reason"] for row in (LONG_ROW, longer)]
+        assert reasons == ["longer than max_length (64 tokens)"] * 2
 
     def test_pad_falls_back_to_eos(self, tokenizer, decision_config):
         tokenizer.pad_token = None
@@ -305,17 +369,65 @@ def max_logit_difference(first, second, batch):
 
 
 class TestClefTraining(TrlTestCase):
-    def test_train_eval_save_reload(self, tokenizer, decision_config):
-        trainer, collator, val = make_trainer(self.tmp_dir, tokenizer, decision_config)
+    @pytest.mark.parametrize(
+        "backbone, head_type",
+        [
+            ("qwen2", "joint"),
+            ("bert", "joint"),
+            ("bert", "cosine"),
+            ("modernbert", "joint"),
+            ("modernbert", "cosine"),
+        ],
+    )
+    def test_train_eval_save_reload(self, tokenizer, decision_config, backbone, head_type):
+        model = None
+        if backbone != "qwen2":  # an encoder, on its plain prompt between [CLS] and [SEP]
+            tokenizer = encoder_tokenizer(tokenizer)
+            model = tiny_clef(tokenizer, None, backbone, head_type)
+            decision_config = model.decision_config
+            assert decision_config.chat_template != clef_decision_config().chat_template
+        elif head_type == "cosine":
+            model = tiny_clef(tokenizer, decision_config, head_type=head_type)
+        trainer, collator, val = make_trainer(self.tmp_dir, tokenizer, decision_config, model=model)
+        if backbone != "qwen2":
+            assert val[0]["input_ids"][0] == tokenizer.cls_token_id
+            assert val[0]["input_ids"][-1] == tokenizer.sep_token_id
         first = trainer.evaluate()["eval_loss"]
         trainer.train()
         trainer.save_model()
         assert trainer.evaluate()["eval_loss"] < first
         again = AutoModelForDecision.from_pretrained(self.tmp_dir).eval()
         assert isinstance(again, ClefForDecision)
-        assert again.decision_config.chat_template == decision_config.chat_template
+        assert (again.config.head_type, type(again.model)) == (head_type, type(trainer.model.model))
+        assert again.decision_config == decision_config
         batch = collator([val[i] for i in range(4)])
         assert max_logit_difference(again, trainer.model, batch) == 0.0
+
+    def test_build_report_counts_skipped_records_by_reason(self, tokenizer, decision_config, capsys):
+        invalid_request = {"state": "s", "questions": {"team": {"type": "bogus"}}, "gold": {"team": "zeta"}}
+        unusable_gold = {**make_row(0, names=("team",)), "gold": {"team": "omega"}}
+        longer = {**LONG_ROW, "state": "word " * 300}
+        rows = [make_row(index) for index in range(3)] + [LONG_ROW, longer, invalid_request, unusable_gold]
+        dataset = Dataset.from_list([{key: json.dumps(value) for key, value in row.items()} for row in rows])
+        args = DecisionConfig(output_dir=self.tmp_dir, use_cpu=True, report_to="none")
+        collator = DataCollatorForClef(tokenizer, decision_config, max_length=400, truncation="skip")
+        built, report = prepare_split(dataset, collator, args, "train")
+        assert len(built) == 3
+        assert report["rows"] == 7 and report["questions"] == 9
+        assert report["skipped"] == {
+            "longer than max_length (400 tokens)": 2,
+            "invalid request": 1,
+            "unusable targets": 1,
+        }
+        assert "Build report (train)" in capsys.readouterr().out
+        # With truncation="error", an invalid record stops the build
+        strict = DataCollatorForClef(tokenizer, decision_config, max_length=400)
+        for row in (invalid_request, unusable_gold):
+            records = Dataset.from_list(
+                [{key: json.dumps(value) for key, value in r.items()} for r in (make_row(0), row)]
+            )
+            with pytest.raises(ValueError):
+                prepare_split(records, strict, args, "train")
 
     def test_pipeline_on_saved_checkpoint(self, tokenizer, decision_config):
         model = tiny_clef(tokenizer, decision_config)
@@ -330,7 +442,7 @@ class TestClefTraining(TrlTestCase):
             "urgency": "score",
         }
 
-    def run_main(self, tokenizer, mode, **model_kwargs):
+    def run_main(self, tokenizer, mode, training_kwargs=None, **model_kwargs):
         """Run the script's `main` on a tiny local backbone and dataset; returns the trainer and the arguments."""
         backbone = AutoModelForCausalLM.from_pretrained(MODEL_ID)
         backbone.save_pretrained(f"{self.tmp_dir}/backbone")
@@ -353,7 +465,7 @@ class TestClefTraining(TrlTestCase):
             truncation="skip",
             permute_fields=True,
         )
-        training_args = DecisionConfig(
+        training_args = dict(
             output_dir=f"{self.tmp_dir}/out",
             use_cpu=True,
             bf16=False,
@@ -366,6 +478,7 @@ class TestClefTraining(TrlTestCase):
             save_strategy="no",
             report_to="none",
         )
+        training_args = DecisionConfig(**{**training_args, **(training_kwargs or {})})
         model_args = ClefModelArguments(model_name_or_path=f"{self.tmp_dir}/backbone", dtype="float32", **model_kwargs)
         trainer = clef_main(script_args, training_args, model_args)
         set_seed(training_args.seed)
@@ -391,6 +504,24 @@ class TestClefTraining(TrlTestCase):
         assert any(
             not torch.equal(parameter, dict(initial.scorer.named_parameters())[name])
             for name, parameter in saved.scorer.named_parameters()
+        )
+
+    @pytest.mark.parametrize("mode", ["full", pytest.param("lora", marks=require_peft)])
+    def test_main_trains_with_activation_checkpointing(self, tokenizer, mode, capsys):
+        lora = {"use_peft": True, "lora_r": 4, "lora_target_modules": ["q_proj", "v_proj"]} if mode == "lora" else {}
+        trainer, initial, _ = self.run_main(tokenizer, mode, training_kwargs={"gradient_checkpointing": True}, **lora)
+        assert trainer.state.global_step == 5
+        model = trainer.model
+        # The layers of the backbone and of the head were checkpointed
+        layers = [module for module in model.modules() if hasattr(module, "gradient_checkpointing")]
+        assert layers and all(module.gradient_checkpointing for module in layers)
+        assert any(name.startswith("encoder.") for name, module in model.named_modules() if module in layers)
+        assert all(np.isfinite(entry["loss"]) for entry in trainer.state.log_history if "loss" in entry)
+        initial_parameters = dict(initial.named_parameters())
+        assert any(
+            not torch.equal(parameter, initial_parameters[name])
+            for name, parameter in model.named_parameters()
+            if name.startswith("scorer.")
         )
 
     @require_peft
