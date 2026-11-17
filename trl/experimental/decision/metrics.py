@@ -28,7 +28,10 @@ def compute_calibration_metrics(
     or packed by record as `(num_records, max_questions, num_options)`. A question slot that is `-100` in every cell is
     padding and is ignored: with `rows_per_example`, the trainer passes the slots of each record, flattened to rows.
     `eval_pred.label_ids` holds, in the same layout, the target distribution of each question (`-100` in padded cells),
-    or the index of its right option (`-100` for a question to ignore).
+    or the index of its right option (`-100` for a question to ignore), or a pair `(distributions, indices)` of both,
+    as [`experimental.decision.DecisionTrainer`] passes them when the collator gives `hard_labels`. Correctness
+    (`accuracy`, and the metrics derived from it) is counted against the index when there is one, and otherwise against
+    the most probable option of the target (the first of a tie); the other metrics compare the distributions.
 
     Args:
         eval_pred ([`~transformers.EvalPrediction`]):
@@ -42,7 +45,7 @@ def compute_calibration_metrics(
 
     Returns:
         `dict[str, float]`: The means over the questions of:
-        - `accuracy`: whether the most probable option is the target's most probable option.
+        - `accuracy`: whether the most probable option is the gold label (see above).
         - `kl`: KL divergence from the target distribution to the predicted one.
         - `brier`: squared distance between the predicted and target distributions.
         - `ece`: expected calibration error of the confidence (the largest probability), over `bins` bins.
@@ -55,10 +58,16 @@ def compute_calibration_metrics(
         `ValueError`: When a real cell holds a non-finite probability or label, or there is no question.
     """
     predictions = np.asarray(eval_pred.predictions, dtype=np.float64)
-    labels = np.asarray(eval_pred.label_ids)
+    labels, hard_labels = eval_pred.label_ids, None
+    if isinstance(labels, (tuple, list)):
+        labels, hard_labels = labels
+        hard_labels = np.asarray(hard_labels).reshape(-1)
+    labels = np.asarray(labels)
     num_options = predictions.shape[-1]
     # Distributions have the shape of the predictions; option indices have one dimension less
     is_distribution = labels.shape == predictions.shape
+    if hard_labels is not None and not is_distribution:
+        raise ValueError("Gold label indices go with target distributions, not with label indices")
     predictions = predictions.reshape(-1, num_options)
     is_option = predictions != -100
     if is_distribution:
@@ -67,7 +76,14 @@ def compute_calibration_metrics(
     else:
         labels = labels.reshape(-1)
         keep = is_option.any(-1) & (labels != -100)
+    if hard_labels is not None and hard_labels.shape != keep.shape:
+        raise ValueError("There must be one gold label index per question slot")
     predictions, labels, is_option = predictions[keep], labels[keep], is_option[keep]
+    if hard_labels is not None:
+        hard_labels = hard_labels[keep].astype(np.int64)
+        valid = (hard_labels >= 0) & (hard_labels < num_options)
+        if not valid.all() or not is_option[np.arange(len(hard_labels)), hard_labels].all():
+            raise ValueError("A gold label is not an option of its question")
     if len(predictions) == 0:
         raise ValueError("There is no question to evaluate")
     if not np.isfinite(predictions[is_option]).all():
@@ -86,7 +102,7 @@ def compute_calibration_metrics(
 
     predicted = probabilities.argmax(-1)
     confidence = probabilities.max(-1)
-    correct = predicted == targets.argmax(-1)
+    correct = predicted == (targets.argmax(-1) if hard_labels is None else hard_labels)
     log_probabilities = np.log(np.maximum(probabilities, np.finfo(np.float64).tiny))
     soft_nll = -np.where(targets > 0, targets * log_probabilities, 0.0).sum(-1).mean()
     entropy = -np.where(targets > 0, targets * np.log(np.where(targets > 0, targets, 1.0)), 0.0).sum(-1).mean()

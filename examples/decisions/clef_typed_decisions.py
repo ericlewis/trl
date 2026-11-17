@@ -95,6 +95,18 @@ def common_prefix_length(first: list, second: list) -> int:
     )
 
 
+def decoded_state(state: Any) -> Any:
+    """`state` decoded when it is the JSON string of an object or an array, else `state` as it is."""
+    if isinstance(state, str):
+        try:
+            value = json.loads(state)
+        except ValueError:
+            return state
+        if isinstance(value, (dict, list)):
+            return value
+    return state
+
+
 class SchemaTooLongError(ValueError):
     """A prompt is longer than `max_length` even without its state, so cutting the state cannot make it fit."""
 
@@ -105,14 +117,17 @@ class DataCollatorForClef(DataCollatorForDecision):
     Batch records for Clef: one prompt per record, with all of its questions answered jointly.
 
     Each example contains a `request` (a dictionary or JSON string), or `state` and `questions`, plus the targets of
-    all questions: `targets` (a mapping of question name to `target_index`, `target_probs`, `p_true` or `score`), or
-    `gold` / `answers` (a mapping of question name to a gold label or probabilities). Nullable questions are not
-    supported, since Clef has no coverage output.
+    all questions. A `state` that is the JSON string of an object or an array (as datasets store it) is decoded, so that
+    the prompt renders the record; any other string is kept as it is. Targets are `targets` (a mapping of question
+    name to `target_index`, `target_probs`, `p_true` or `score`), or `gold` / `answers` (a mapping of question name to
+    a gold label or probabilities). Nullable questions are not supported, since Clef has no coverage output.
 
     For repeated training or evaluation, preprocess once with `dataset.map(collator.tokenize)`. The collator also
     accepts these prepared examples and only pads them when building batches. A batch holds the questions of all its
     records one after the other: `labels` and `option_mask` have one row per question, in record order then question
-    order, and `rows_per_example` holds the number of questions of each record. With it, `DecisionTrainer` gathers
+    order, `hard_labels` holds the gold label of each question (the option its `label` or `target_index` names, else
+    its target's first most probable option, which accuracy is counted against), and `rows_per_example` holds the
+    number of questions of each record. With it, `DecisionTrainer` gathers
     whole records across processes, and its evaluation predictions have `max_questions` slots per record (the most
     questions of a record in the batch, over all processes), with the unused slots at `-100`.
 
@@ -159,19 +174,26 @@ class DataCollatorForClef(DataCollatorForDecision):
 
     @staticmethod
     def _request(example: dict[str, Any]) -> dict[str, Any]:
+        """
+        The request of `example`, with its `questions` decoded and its `state` decoded when it is the JSON string of an
+        object or an array (as datasets store it), so that the template renders the record, as the CLM example does. A
+        state that is any other string is kept as it is.
+        """
         request = example["request"] if "request" in example else {k: example[k] for k in ("state", "questions")}
         request = json.loads(request) if isinstance(request, str) else dict(request)
         if isinstance(request["questions"], str):
             request["questions"] = json.loads(request["questions"])
+        request["state"] = decoded_state(request["state"])
         return request
 
-    def _features(self, input_ids, marks, questions, labels):
+    def _features(self, input_ids, marks, questions, labels, hard_labels):
         return {
             "input_ids": input_ids,
             "marks": marks,
             "num_options": [len(question.options) for question in questions],
             "question_type_ids": [Question.questions_types.index(question.type) for question in questions],
             "labels": labels,
+            "hard_labels": hard_labels,
             "is_choice": [question.type == "choice" for question in questions],
         }
 
@@ -182,7 +204,8 @@ class DataCollatorForClef(DataCollatorForDecision):
         """
         if self.truncation == "error":
             raise error
-        empty = {key: [] for key in ("input_ids", "marks", "num_options", "question_type_ids", "labels", "is_choice")}
+        keys = ("input_ids", "marks", "num_options", "question_type_ids", "labels", "hard_labels", "is_choice")
+        empty = {key: [] for key in keys}
         skipped = {**empty, "skip": True, "reason": reason, "truncated": False}
         return {**skipped, **({"request": ""} if self.permute_fields else {})}
 
@@ -264,7 +287,7 @@ class DataCollatorForClef(DataCollatorForDecision):
         except ValueError as error:
             return self._skip("invalid request", error)
         try:
-            targets = self.prepare_targets(example, questions)
+            targets, hard_labels = self.prepare_labeled_targets(example, questions)
         except ValueError as error:
             return self._skip("unusable targets", error)
         for question in questions:
@@ -286,7 +309,7 @@ class DataCollatorForClef(DataCollatorForDecision):
             except SchemaTooLongError as error:
                 return self._skip(f"schema longer than max_length ({self.max_length} tokens)", error)
         # The null column is dropped: Clef has no null output
-        features = self._features(input_ids, marks, questions, [list(target[1:]) for target in targets])
+        features = self._features(input_ids, marks, questions, [list(target[1:]) for target in targets], hard_labels)
         features |= {"skip": False, "reason": "", "truncated": truncated}
         if self.permute_fields:
             features["request"] = json.dumps(request)
@@ -325,19 +348,24 @@ class DataCollatorForClef(DataCollatorForDecision):
         if [question.name for question in questions] != [names[i] for i in order]:
             raise ValueError("The permuted prompt does not list the questions in the permuted order")
         labels = [feature["labels"][i] for i in order]
+        hard_labels = [feature["hard_labels"][i] for i in order]
         if [len(question.options) for question in questions] != [len(row) for row in labels]:
             raise ValueError("The options of a permuted question no longer match its labels")
         if len(input_ids) > self.max_length:
             if self.truncation != "state":
                 raise ValueError(f"A permuted prompt is longer than max_length ({self.max_length} tokens)")
             input_ids, marks = self._cut_state(permuted, input_ids, marks)
-        return {**feature, **self._features(input_ids, marks, questions, labels)}
+        return {**feature, **self._features(input_ids, marks, questions, labels, hard_labels)}
 
     def torch_call(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         if "input_ids" not in features[0]:
             features = [self.tokenize(example) for example in features]
         if any(feature.get("skip") for feature in features):
             raise ValueError("Skipped records must be filtered out before batching")
+        if any("hard_labels" not in feature for feature in features):
+            raise ValueError(
+                "Records tokenized without `hard_labels` (the gold label of each question); tokenize again"
+            )
         if self.permute_fields:
             features = [self._permute(feature) if feature.get("request") else feature for feature in features]
         pad_token_id = self.tokenizer.pad_token_id
@@ -361,6 +389,7 @@ class DataCollatorForClef(DataCollatorForDecision):
             "num_options": pad([feature["num_options"] for feature in features], 0),
             "question_type_ids": pad([feature["question_type_ids"] for feature in features], 0),
             "labels": labels,
+            "hard_labels": torch.tensor([label for feature in features for label in feature["hard_labels"]]),
             "option_mask": option_mask,
             "is_choice": torch.tensor([choice for feature in features for choice in feature["is_choice"]]),
             "rows_per_example": torch.tensor([len(feature["num_options"]) for feature in features]),
@@ -706,6 +735,12 @@ LOSS_SETTINGS = (
 )
 
 
+# The `from_pretrained` arguments a new head honours: the backbone is loaded with them, then the model is built afresh
+# around it with its dtype and attention implementation. Any other argument would be dropped, so it is refused.
+# `attn_implementation` is the backbone's, on both paths: Clef's own layers keep their default.
+NEW_HEAD_MODEL_KWARGS = frozenset({"revision", "dtype", "attn_implementation", "trust_remote_code"})
+
+
 def rlcd_schedule(script_args) -> RlcdScheduleCallback | None:
     """
     The callback that runs RLCD from `rlcd_start_epoch` with the noise scales `rlcd_sigmas`, or `None` when neither is
@@ -763,6 +798,11 @@ def build_model(script_args, model_args, model_kwargs):
         is not None
     )
     if is_checkpoint:
+        if isinstance(model_kwargs.get("attn_implementation"), str):  # the backbone's; Clef's head keeps its own
+            model_kwargs = {
+                **model_kwargs,
+                "attn_implementation": {"text_config": model_kwargs["attn_implementation"]},
+            }
         model, info = AutoModelForDecision.from_pretrained(name, output_loading_info=True, **model_kwargs)
         problems = loading_problems(info)
         if problems:
@@ -780,6 +820,13 @@ def build_model(script_args, model_args, model_kwargs):
             setattr(model.config, key, value)
         model.backbone_weights = "Clef checkpoint"
     else:
+        unsupported = sorted(set(model_kwargs) - NEW_HEAD_MODEL_KWARGS)
+        if unsupported:
+            raise ValueError(
+                f"model_init_kwargs {unsupported} cannot be honoured for a new head on {name}: its model is built "
+                f"afresh around the loaded backbone, which keeps only {sorted(NEW_HEAD_MODEL_KWARGS)}. Remove them, "
+                "or train from a Clef checkpoint, which is loaded with all of them."
+            )
         backbone, embeddings, weights = load_backbone(name, config, model_kwargs)
         sizes = {
             key: getattr(script_args, f"head_{value}")
@@ -793,6 +840,9 @@ def build_model(script_args, model_args, model_kwargs):
             if getattr(script_args, f"head_{value}") is not None
         }
         text_config = backbone.config
+        # The attention the backbone was loaded with (the one asked for, or the default it resolved to): building a
+        # config around `text_config` resets it
+        attention = text_config._attn_implementation
         causal = is_causal(text_config)
         defaults = {"global_pooling": "last" if causal else "first", "prompt_style": "chatml" if causal else "plain"}
         config = ClefConfig(
@@ -802,7 +852,8 @@ def build_model(script_args, model_args, model_kwargs):
             **losses,
             **{**defaults, **head_settings},
         )
-        model = ClefForDecision(config)
+        # Set on the backbone only: Clef's own layers keep their default (they do not support every kernel)
+        model = ClefForDecision._from_config(config, attn_implementation={"text_config": attention})
         model.model.load_state_dict(backbone.state_dict())
         # The head stays in float32; the backbone keeps the dtype it was loaded in
         model.model.to(backbone.dtype)
@@ -850,6 +901,7 @@ def prepare_split(dataset, collator, training_args, desc):
         "num_options": Sequence(Value("int32")),
         "question_type_ids": Sequence(Value("int32")),
         "labels": Sequence(Sequence(Value("float32"))),
+        "hard_labels": Sequence(Value("int32")),
         "is_choice": Sequence(Value("bool")),
         "skip": Value("bool"),
         "reason": Value("string"),

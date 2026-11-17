@@ -564,6 +564,8 @@ class TestDecisionRecordRows(TrlTestCase):
         assert (single["num_processes"], double["num_processes"]) == (1, 2)
         # 9 records holding 3 + 1 + 2 + 1 + 3 + 2 + 1 + 2 + 3 questions; the last batch of two processes is smaller
         assert single["eval_questions"] == double["eval_questions"] == 18
+        # Ties in the targets are scored against the gold label of each question, gathered with its record
+        assert single["eval_ties"] == double["eval_ties"] == 3
         for key in ("eval_accuracy", "eval_selection_score"):
             assert double[key] == pytest.approx(single[key], abs=1e-6), key
         # The other calibration metrics, and the trainer's own metrics, count every question once, too

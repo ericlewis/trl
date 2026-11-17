@@ -10,7 +10,7 @@ dataset_config: all
 output_dir: output/clef-typed-decisions
 # float32 weights with bf16 autocast (bf16: true below): KLM's fused CUDA kernels only run on float32 parameters
 dtype: float32
-# attn_implementation (e.g. flash_attention_2) switches the backbone to flash attention
+# attn_implementation (e.g. flash_attention_2) switches the backbone (only) to flash attention
 # attn_implementation: flash_attention_2
 mode: full
 # joint, or cosine for the small cosine head (cosine_width, cosine_initial_scale)

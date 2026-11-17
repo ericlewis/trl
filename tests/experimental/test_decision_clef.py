@@ -90,6 +90,18 @@ def make_row(index, names=("refund", "team", "urgency")):
     }
 
 
+# Gold answers whose probabilities tie, with a label that is not the first of the tied options
+TIED_GOLD = {
+    "refund": {"label": False, "probabilities": {"true": 0.5, "false": 0.5}},
+    "team": {"label": "zeta", "probabilities": {"alpha": 0.5, "zeta": 0.5}},
+    "urgency": {"label": 2, "probabilities": {"0": 0.2, "1": 0.4, "2": 0.4}},
+}
+
+
+def tied_row(index, names=("refund", "team", "urgency")):
+    return {**make_row(index, names), "gold": {name: TIED_GOLD[name] for name in names}}
+
+
 @pytest.fixture
 def tokenizer():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
@@ -505,6 +517,103 @@ class TestDataCollatorForClef:
         assert features["labels"][0] == pytest.approx([0.75, 0.25])
         assert features["labels"][1] == [0.0, 1.0]
         assert features["labels"][2] == [0.0, 1.0, 0.0]
+
+    def test_json_string_state_renders_like_its_record(self, tokenizer, decision_config):
+        # Datasets store the state as a JSON string (with spaces); the record renders as compact JSON
+        state = {"agent": {"autonomy": "high", "tools": ["refund", "escalate"]}, "first_passage": "How do I pay?"}
+        record = {**make_row(0), "state": state}
+        stored = {**record, "state": json.dumps(state)}
+        assert ", " in stored["state"]
+        columns = {key: json.dumps(value) for key, value in record.items()}  # every column a JSON string
+        as_request = {
+            "request": json.dumps({"state": json.dumps(state), "questions": QUESTIONS}),
+            "gold": record["gold"],
+        }
+        collator = DataCollatorForClef(tokenizer, decision_config)
+        expected = collator.tokenize(record)
+        assert '"first_passage":"How' in tokenizer.decode(expected["input_ids"])
+        for row in (stored, columns, as_request):
+            assert collator.tokenize(row) == expected
+
+        # Permuted prompts re-render the decoded state
+        def permuting(**kwargs):
+            return DataCollatorForClef(tokenizer, decision_config, permute_fields=True, seed=3, **kwargs)
+
+        def check_same_permutations(first, second, **kwargs):
+            # Two collators with the same seed draw the same orders, so the batches agree token for token
+            features = [permuting(**kwargs).tokenize(first), permuting(**kwargs).tokenize(second)]
+            assert features[0] == features[1]
+            collators = [permuting(**kwargs), permuting(**kwargs)]
+            orders = set()
+            for _ in range(6):
+                batches = [collator([feature] * 3) for collator, feature in zip(collators, features, strict=True)]
+                assert all(torch.equal(batches[0][key], batches[1][key]) for key in batches[0])
+                orders.update(tuple(question_names(tokenizer, batches[0], row)) for row in range(3))
+            assert len(orders) > 1
+
+        check_same_permutations(record, stored)
+        # A cut state is cut from the decoded state
+        unlimited = DataCollatorForClef(tokenizer, decision_config, max_length=100_000)
+        long_state = {"items": [f"item{index} costs {index * 7}" for index in range(80)]}
+        long_record = {**record, "state": long_state}
+        max_length = len(unlimited.tokenize(long_record)["input_ids"]) - 40
+        cutting = DataCollatorForClef(tokenizer, decision_config, max_length=max_length, truncation="state")
+        cut = cutting.tokenize(long_record)
+        assert cut["truncated"] is True and len(cut["input_ids"]) == max_length
+        assert cutting.tokenize({**long_record, "state": json.dumps(long_state)}) == cut
+        check_same_permutations(
+            long_record,
+            {**long_record, "state": json.dumps(long_state)},
+            max_length=max_length,
+            truncation="state",
+        )
+
+    @pytest.mark.parametrize("state", ["ticket 0: refund alpha", '"a JSON string"', "42", "[not JSON", ""])
+    def test_state_that_is_not_a_json_object_is_left_alone(self, tokenizer, decision_config, state):
+        collator = DataCollatorForClef(tokenizer, decision_config)
+        request = collator._request({**make_row(0), "state": state})
+        assert request["state"] == state
+        if state:
+            assert state in tokenizer.decode(collator.tokenize({**make_row(0), "state": state})["input_ids"])
+
+    def test_gold_label_is_carried_next_to_the_target(self, tokenizer, decision_config):
+        # Options in template order: refund (true, false), team (alpha, zeta), urgency (0, 1, 2)
+        collator = DataCollatorForClef(tokenizer, decision_config)
+        tied = {
+            **make_row(0),
+            "gold": {
+                "refund": {"label": False, "probabilities": {"true": 0.5, "false": 0.5}},
+                "team": {"label": "zeta", "probabilities": {"alpha": 0.5, "zeta": 0.5}},
+                "urgency": {"label": 2, "probabilities": {"0": 0.2, "1": 0.4, "2": 0.4}},
+            },
+        }
+        features = collator.tokenize(tied)
+        assert features["labels"] == [[0.5, 0.5], [0.5, 0.5], pytest.approx([0.2, 0.4, 0.4])]
+        assert features["hard_labels"] == [1, 1, 2]
+        # Without a label (or with one that names no option), the first most probable option
+        unlabeled = {**tied, "gold": {**tied["gold"], "urgency": {"probabilities": {"0": 0.2, "1": 0.4, "2": 0.4}}}}
+        assert collator.tokenize(unlabeled)["hard_labels"] == [1, 1, 1]
+        unknown = {**tied, "gold": {**tied["gold"], "team": {"label": "omega", "probabilities": {"zeta": 1.0}}}}
+        assert collator.tokenize(unknown)["hard_labels"] == [1, 1, 2]
+        targets = {"refund": {"p_true": 0.5}, "team": {"target_index": 1}, "urgency": {"score": 1.5}}
+        assert collator.tokenize({**make_row(0), "targets": targets})["hard_labels"] == [0, 1, 1]
+        # A bare label, as `answers`
+        answers = {**make_row(0), "answers": {"refund": False, "team": "zeta", "urgency": 2}}
+        del answers["gold"]
+        assert collator.tokenize(answers)["hard_labels"] == [1, 1, 2]
+        batch = collator([features, collator.tokenize(make_row(1, names=("team",)))])
+        assert batch["hard_labels"].tolist() == [1, 1, 2, 1]
+        # A permuted record keeps the gold label with its question
+        permuting = DataCollatorForClef(tokenizer, decision_config, permute_fields=True, seed=1)
+        record = permuting.tokenize(tied)
+        expected = {"refund": 1, "team": 1, "urgency": 2}
+        orders = set()
+        for _ in range(8):
+            batch = permuting([record])
+            names = question_names(tokenizer, batch, 0)
+            orders.add(tuple(names))
+            assert batch["hard_labels"].tolist() == [expected[name] for name in names]
+        assert len(orders) > 1
 
     def test_state_truncation_leaves_fitting_records(self, tokenizer, decision_config):
         strict = DataCollatorForClef(tokenizer, decision_config)
@@ -1253,6 +1362,39 @@ class TestClefTraining(TrlTestCase):
         model = build_model(ClefScriptArguments(head_type="joint"), model_args, {"dtype": "float32"})
         assert model.config.head_type == "joint"
 
+    @pytest.mark.parametrize("attention", ["eager", "sdpa"])
+    def test_attention_implementation_reaches_the_model(self, tokenizer, decision_config, attention):
+        # A new head on a backbone, and a Clef checkpoint, both get the attention that was asked for
+        AutoModelForCausalLM.from_pretrained(MODEL_ID).save_pretrained(f"{self.tmp_dir}/backbone")
+        tiny_clef(tokenizer, decision_config).save_pretrained(f"{self.tmp_dir}/clef")
+        new_head = ClefScriptArguments(
+            head_hidden_size=16,
+            head_intermediate_size=32,
+            head_num_layers=1,
+            head_num_evidence_layers=1,
+            head_num_attention_heads=2,
+        )
+        # A checkpoint keeps its own head sizes
+        for folder, script_args in (("backbone", new_head), ("clef", ClefScriptArguments())):
+            model_args = ClefModelArguments(model_name_or_path=f"{self.tmp_dir}/{folder}", dtype="float32")
+            kwargs = {"dtype": "float32", "revision": None, "attn_implementation": attention}
+            model = build_model(script_args, model_args, kwargs)
+            assert model.model.config._attn_implementation == attention, folder
+            # The backbone's only: the head keeps its default, whatever kernel the backbone uses
+            assert model.config._attn_implementation == "sdpa", folder
+
+    def test_attention_implementation_reaches_main(self, tokenizer):
+        trainer, _, _ = self.run_main(tokenizer, "head", attn_implementation="eager")
+        assert trainer.model.model.config._attn_implementation == "eager"
+        assert trainer.model.config._attn_implementation == "sdpa"
+
+    @pytest.mark.parametrize("key, value", [("low_cpu_mem_usage", True), ("device_map", "cpu"), ("cache_dir", "x")])
+    def test_model_init_kwargs_a_new_head_cannot_honour_raise(self, key, value):
+        AutoModelForCausalLM.from_pretrained(MODEL_ID).save_pretrained(f"{self.tmp_dir}/backbone")
+        model_args = ClefModelArguments(model_name_or_path=f"{self.tmp_dir}/backbone", dtype="float32")
+        with pytest.raises(ValueError, match=key):
+            build_model(ClefScriptArguments(), model_args, {"dtype": "float32", "revision": None, key: value})
+
     def test_main_builds_plain_backbone_and_reports(self, tokenizer, decision_config, capsys):
         # A local causal LM becomes the backbone of a new head; the build report counts skipped records
         set_seed(0)
@@ -1728,7 +1870,8 @@ class TestRecordRows(TrlTestCase):
         # Records with three, one and two questions, so batches hold different numbers of rows and options, and the
         # last batch is smaller
         names = [("refund", "team", "urgency"), ("team",), ("urgency", "refund"), ("refund",), ("team", "urgency")]
-        val = Dataset.from_list([collator.tokenize(make_row(index, names[index % 5])) for index in range(11)])
+        rows = [(tied_row if index % 2 else make_row)(index, names[index % 5]) for index in range(11)]
+        val = Dataset.from_list([collator.tokenize(row) for row in rows])
 
         def without_rows(features):
             batch = collator(features)
@@ -1770,8 +1913,16 @@ class TestRecordRows(TrlTestCase):
         real = (packed.predictions != -100).any(-1)
         assert real.sum() == total
         np.testing.assert_allclose(packed.predictions[real], rows.predictions, atol=1e-6)
-        np.testing.assert_array_equal(packed.label_ids[real], rows.label_ids)
-        assert (packed.label_ids[~real] == -100).all()
+        # The labels are the target distributions and the gold labels, packed alike
+        (packed_targets, packed_gold), (row_targets, row_gold) = packed.label_ids, rows.label_ids
+        np.testing.assert_array_equal(packed_targets[real], row_targets)
+        np.testing.assert_array_equal(packed_gold[real], row_gold)
+        assert (packed_targets[~real] == -100).all() and (packed_gold[~real] == -100).all()
+        assert row_gold.tolist() == [label for row in val for label in row["hard_labels"]]
+        # Accuracy is counted against the gold label, which differs from the first most probable option on ties
+        assert (row_gold != np.where(row_targets == -100, -np.inf, row_targets).argmax(-1)).sum() >= 5
+        correct = rows.predictions.argmax(-1) == row_gold
+        assert packed_metrics["eval_accuracy"] == pytest.approx(correct.mean(), abs=1e-9)
 
 
 class TestClefBenchmark(TrlTestCase):
@@ -1900,6 +2051,52 @@ class TestClefBenchmark(TrlTestCase):
             "steady_records_per_second_with_data",
         ):
             assert r[key] is None, key
+
+    def test_settings_are_parsed_as_the_example_parses_them(self):
+        from examples.decisions.benchmark_clef import parse_settings
+
+        # YAML reads 1e-4 as a string; the example's parser (`--config`) turns it into the field's type
+        settings = {
+            "output_dir": self.tmp_dir,
+            "learning_rate": "1e-4",
+            "head_learning_rate": "3e-4",
+            "max_length": 64,
+        }
+        script_args, training_args, model_args = parse_settings(settings)
+        assert training_args.learning_rate == 1e-4 and isinstance(training_args.learning_rate, float)
+        assert training_args.head_learning_rate == 3e-4
+        assert script_args.max_length == 64
+        path = Path(self.tmp_dir, "settings.yaml")
+        path.write_text("learning_rate: 1e-4\nmax_length: 64\n", encoding="utf-8")
+        from trl import TrlParser
+
+        parser = TrlParser((ClefScriptArguments, DecisionConfig, ClefModelArguments))
+        example = parser.parse_args_and_config(["--config", str(path), "--output_dir", self.tmp_dir])
+        assert example[1].learning_rate == training_args.learning_rate
+
+    def test_recipe_redacts_model_init_kwargs(self, tokenizer, decision_config):
+        from types import SimpleNamespace
+
+        from examples.decisions.benchmark_clef import describe_recipe
+
+        model = tiny_clef(tokenizer, decision_config)
+        run = SimpleNamespace(trainer=SimpleNamespace(model=model), reports={})
+        kwargs = {"token": "hf_secret", "dtype": "bfloat16", "revision": "main", "attn_implementation": "eager"}
+        args = DecisionConfig(output_dir=self.tmp_dir, use_cpu=True, report_to="none", model_init_kwargs=kwargs)
+        recipe = describe_recipe(run, ClefScriptArguments(), args, ClefModelArguments(), synthetic=False)
+        assert "hf_secret" not in json.dumps(recipe, default=str)
+        assert recipe["training"]["model_init_kwargs"] == {**kwargs, "token": "<redacted>"}
+
+    def test_benchmark_states_what_its_timings_cover(self):
+        from examples.decisions.benchmark_clef import run_benchmark
+
+        # 20 records hold out 1; 19 training records in batches of 8 leave a partial batch, which is dropped
+        r = run_benchmark(steps=4, warmup_steps_excluded=0, synthetic_records=20)
+        assert r["recipe"]["training"]["dataloader_drop_last"] is True
+        assert r["global_steps"] == 4
+        assert set(r["notes"]) == {"trainer_wall_seconds", "startup_seconds"}
+        assert "not comparable" in r["notes"]["trainer_wall_seconds"]
+        assert "not comparable" in r["notes"]["startup_seconds"]
 
     def test_cli_writes_the_summary(self, capsys, monkeypatch):
         from examples.decisions import benchmark_clef

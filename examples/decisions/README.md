@@ -59,7 +59,10 @@ are drawn before tokenization, so skipped records can leave fewer than asked for
 remote-code package whose `config.json` lists `attention_windows` or `rope_theta` per layer must keep one value per
 kind of layer, since Transformers' UltraBERT config reads them that way; other lists raise rather than silently change
 the architecture. The configuration keeps the weights in float32 and trains in bf16 autocast, since KLM's fused CUDA
-kernels only run on float32 parameters; `attn_implementation` selects flash attention. Nullable questions are
+kernels only run on float32 parameters; `attn_implementation` (for example a flash attention kernel) is applied to the
+backbone only, for a new head and for a Clef checkpoint alike, while Clef's own layers keep their default; other
+`model_init_kwargs` that a new head cannot honour (only `dtype`, `revision` and `attn_implementation` carry over to the
+model built around the backbone) raise. Nullable questions are
 unsupported; activation checkpointing (`gradient_checkpointing: true`) covers the backbone and the head. The collator returns `rows_per_example`, the
 number of questions of each record, so `DecisionTrainer` gathers whole records and the example runs on several
 processes:
@@ -102,10 +105,15 @@ those). The monitor never changes saving or evaluation. The YAML shows the block
 `build_trainer`, trains `--steps` steps without evaluating or saving, evaluates once, and prints a JSON summary (also
 written to `--output`; under torchrun by the main process only). Without `--config` it runs a synthetic recipe (a tiny
 random Qwen2 backbone, 256 generated records; CUDA if available, else CPU); with `--config` it takes the example's YAML
-as it is. Its fields match the baseline benchmark's `summary.json`; every timing boundary synchronises the CUDA device:
+as it is, parsed exactly as the example parses `--config`, with `dataloader_drop_last` forced on so every step holds
+the same number of records. Its fields carry the names of the reference benchmark's `summary.json`; the per-step
+`seconds` and the rates computed from them have the same meanings, `trainer_wall_seconds` and `startup_seconds` do not
+(the summary's `notes` say so). Every timing boundary synchronises the CUDA device:
 
-- `startup_seconds`: process start to just before `trainer.train()`; `build_seconds`: `build_trainer` alone;
-  `trainer_wall_seconds`: `trainer.train()`; `eval_seconds`: one evaluation after training.
+- `startup_seconds`: process start to just before `trainer.train()` (its origin is not the reference's, so the two
+  are not comparable); `build_seconds`: `build_trainer` alone; `trainer_wall_seconds`: `trainer.train()`, which here
+  never evaluates or saves (the reference's includes its evaluations and saves, so the two are not comparable);
+  `eval_seconds`: one evaluation after training.
 - `steps`: per step, `seconds` from `on_step_begin` to `on_step_end` (the trainer collates a step's batches before
   `on_step_begin`) and `data_seconds` from the previous step's end to `on_step_begin` (logging, saving or evaluation,
   then collation). `first_step_seconds` runs from `on_train_begin` to the end of step 1.
@@ -116,8 +124,9 @@ as it is. Its fields match the baseline benchmark's `summary.json`; every timing
 - `head_parameters`: the decision head alone (the `lm_head` table of the lexical prior is
   `recipe.lexical_prior_parameters`). `peak_allocated_gib`, `peak_reserved_gib`: CUDA only, reset just before
   training and read at every step end, so they cover training but not loading nor the final evaluation.
-- `recipe`: the resolved settings, backbone class and floating-point dtypes, attention implementation, activation
-  checkpointing, head type, parameter counts and KLM's `_use_fla_kernels`.
+- `recipe`: the resolved settings (`model_init_kwargs` other than `dtype`, `revision`, `attn_implementation` and
+  `trust_remote_code` redacted), backbone class and floating-point dtypes, the attention implementation the backbone
+  uses, activation checkpointing, head type, parameter counts and KLM's `_use_fla_kernels`.
 
 ```bash
 python examples/decisions/benchmark_clef.py --steps 120

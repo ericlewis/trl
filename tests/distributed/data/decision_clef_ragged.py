@@ -55,9 +55,12 @@ NAMES = [
 
 
 def make_row(index, names):
-    gold = {"refund": index % 2 == 0, "team": ("alpha", "zeta", "beta")[index % 3], "urgency": index % 3}
+    team = ("alpha", "zeta", "beta")[index % 3]
+    gold = {"refund": index % 2 == 0, "team": team, "urgency": index % 3}
+    if index % 2:  # a tie whose gold label is not the first of the tied options (alpha, beta, zeta)
+        gold["team"] = {"label": "zeta", "probabilities": {"alpha": 0.5, "zeta": 0.5}}
     return {
-        "state": f"ticket {index}: {'refund' if index % 2 == 0 else 'thanks'} {gold['team']} {'!' * (index % 4)}",
+        "state": f"ticket {index}: {'refund' if index % 2 == 0 else 'thanks'} {team} {'!' * (index % 4)}",
         "questions": {name: QUESTIONS[name] for name in names},
         "gold": {name: gold[name] for name in names},
     }
@@ -90,8 +93,11 @@ def tiny_clef(tokenizer):
 def compute_metrics(prediction):
     # Question slots that are -100 in every cell are padding of the record-shaped layout
     predictions = np.asarray(prediction.predictions)
-    questions = int((predictions != -100).any(-1).sum())
-    return {**compute_calibration_metrics(prediction), "questions": questions}
+    real = (predictions != -100).any(-1)
+    targets, gold = (np.asarray(labels) for labels in prediction.label_ids)
+    # The questions whose gold label is not the first most probable option of their target
+    ties = int((gold[real] != targets[real].argmax(-1)).sum())
+    return {**compute_calibration_metrics(prediction), "questions": int(real.sum()), "ties": ties}
 
 
 def main(output_dir):

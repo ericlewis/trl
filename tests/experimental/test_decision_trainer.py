@@ -922,15 +922,18 @@ class TestHeadLearningRate(TrlTestCase):
         assert any("score" in name for name in trainable)
 
 
-def naive_calibration_metrics(rows, bins=15, kl_weight=0.25, brier_weight=0.25):
-    """Every metric by an explicit float64 loop over questions given as (probabilities, target) lists."""
+def naive_calibration_metrics(rows, bins=15, kl_weight=0.25, brier_weight=0.25, gold_labels=None):
+    """
+    Every metric by an explicit float64 loop over questions given as (probabilities, target) lists. A question is right
+    when its most probable option is its gold label: `gold_labels[i]`, else the target's first most probable.
+    """
     accuracy = kl = brier = nll = confidence_total = 0.0
     confidences, corrects = [], []
-    for probabilities, target in rows:
+    for index, (probabilities, target) in enumerate(rows):
         probabilities = [float(p) for p in probabilities]
         target = [float(t) for t in target]
         predicted = max(range(len(probabilities)), key=lambda i: probabilities[i])
-        gold = max(range(len(target)), key=lambda i: target[i])
+        gold = max(range(len(target)), key=lambda i: target[i]) if gold_labels is None else gold_labels[index]
         confidence = probabilities[predicted]
         correct = float(predicted == gold)
         accuracy += correct
@@ -1062,6 +1065,45 @@ class TestCalibrationMetrics:
             assert flat[key] == pytest.approx(value, abs=1e-9), key
         for key, value in naive_calibration_metrics(hard).items():
             assert from_indices[key] == pytest.approx(value, abs=1e-9), key
+
+    def test_gold_label_decides_a_tie(self):
+        # Ties in the target: the gold label is the second most probable option, which the model predicts
+        rows = [
+            (np.array([0.2, 0.7, 0.1]), np.array([0.5, 0.5, 0.0])),
+            (np.array([0.6, 0.4]), np.array([0.5, 0.5])),
+            (np.array([0.1, 0.3, 0.6]), np.array([0.0, 0.5, 0.5])),
+        ] + ragged_questions(count=9, max_options=3)
+        gold = [1, 0, 2] + [int(np.argmax(target)) for _, target in rows[3:]]
+        predictions, labels = padded(rows, 3)
+        metrics = compute_calibration_metrics(EvalPrediction(predictions, (labels, np.array(gold))))
+        expected = naive_calibration_metrics(rows, gold_labels=gold)
+        for key, value in expected.items():
+            assert metrics[key] == pytest.approx(value, abs=1e-9), key
+        # Against the first most probable option, the first and third questions would count as wrong
+        first_argmax = compute_calibration_metrics(EvalPrediction(predictions, labels))
+        assert metrics["accuracy"] - first_argmax["accuracy"] == pytest.approx(2 / len(rows))
+        assert metrics["selection_score"] > first_argmax["selection_score"]
+        assert metrics["ece"] != first_argmax["ece"]
+        # Record-shaped, as the trainer passes them: padded slots are -100 in both
+        from trl.experimental.decision.decision_trainer import pack_rows
+
+        rows_per_example = torch.tensor([3, 1, 2, 2, 3, 1])
+        packed = (
+            pack_rows(torch.from_numpy(predictions), rows_per_example, 3, -100).flatten(0, 1).numpy(),
+            (
+                pack_rows(torch.from_numpy(labels), rows_per_example, 3, -100).flatten(0, 1).numpy(),
+                pack_rows(torch.tensor(gold), rows_per_example, 3, -100).flatten(0, 1).numpy(),
+            ),
+        )
+        for key, value in compute_calibration_metrics(EvalPrediction(*packed)).items():
+            assert value == pytest.approx(metrics[key], abs=1e-12), key
+        # A gold label that is not an option of its question, and indices without distributions, are refused
+        outside = list(gold)
+        outside[1] = 2  # the second question has two options
+        with pytest.raises(ValueError, match="gold label"):
+            compute_calibration_metrics(EvalPrediction(predictions, (labels, np.array(outside))))
+        with pytest.raises(ValueError, match="distributions"):
+            compute_calibration_metrics(EvalPrediction(predictions, (np.array(gold), np.array(gold))))
 
     def test_selection_score_weights(self):
         rows = ragged_questions()

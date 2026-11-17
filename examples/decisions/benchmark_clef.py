@@ -28,15 +28,22 @@ Without `--config`, a synthetic recipe runs: a tiny random Qwen2 backbone with a
 on CUDA when there is one and on the CPU otherwise. With `--config`, the example's settings (its YAML) are used as they
 are, except that training runs `--steps` steps without evaluating, saving or reporting, and evaluation runs once after.
 
-The JSON summary has the fields of the baseline benchmark's `summary.json`, with the same meanings, and more. Every
-boundary of a timing synchronises the CUDA device. A step is steady when its index is above `--warmup_steps_excluded`
-(20 by default).
+The settings are parsed exactly as the example parses its `--config` (so `1e-4` in a YAML file is a float), and
+`dataloader_drop_last` is forced on, so that every step holds `records_per_step` records and the rates are exact.
+
+The JSON summary has the fields of the reference benchmark's `summary.json`, under the same names. The per-step
+`seconds` and the rates computed from them (`steady_*`, `window_records_per_second`) have the reference's meanings;
+`trainer_wall_seconds` and `startup_seconds` do not, and the summary's `notes` say so. Every boundary of a timing
+synchronises the CUDA device. A step is steady when its index is above `--warmup_steps_excluded` (20 by default).
 
 - `startup_seconds`: from the start of the process (its creation time when `psutil` is installed, else the import of
   this module) to just before `trainer.train()`. Called as a function, `run_benchmark` counts from the given
-  `process_start`, or from its own call; `recipe.startup_origin` says which.
+  `process_start`, or from its own call; `recipe.startup_origin` says which. Its origin is not the reference's, so it
+  is not comparable with the reference's `startup_seconds`.
 - `build_seconds`: the example's `build_trainer` alone (model, tokenized splits, trainer).
-- `trainer_wall_seconds`: `trainer.train()`. `eval_seconds`: one `trainer.evaluate()` after it.
+- `trainer_wall_seconds`: `trainer.train()`, which here never evaluates or saves (evaluation and saving are off). The
+  reference's covers its evaluations and saves too, so the two are not comparable. `eval_seconds`: one
+  `trainer.evaluate()` after training.
 - `global_steps`: the optimizer steps taken.
 - `steps`: per step, `seconds` from `on_step_begin` to `on_step_end` (forward, backward, optimizer update; the trainer
   fetches and collates the batches of a step before `on_step_begin`), and `data_seconds` from the previous step's end
@@ -55,8 +62,11 @@ boundary of a timing synchronises the CUDA device. A step is steady when its ind
   reset just before `trainer.train()` and read at every step end, so they cover training (with any evaluation during
   it) but not loading nor the final evaluation.
 - `gpu`, `torch`: the device name and the torch version.
-- `recipe`: every resolved setting, and the backbone as it was built (class, floating-point dtypes, attention
-  implementation, activation checkpointing, head type, parameter counts, KLM's `_use_fla_kernels`).
+- `recipe`: every resolved setting (`model_init_kwargs` other than a few harmless keys redacted, since they may hold a
+  token), and the backbone as it was built (class, floating-point dtypes, the attention implementation the backbone
+  uses, activation checkpointing, head type, parameter counts, KLM's `_use_fla_kernels`).
+- `notes`: what `trainer_wall_seconds` and `startup_seconds` cover, and that they are not comparable with the
+  reference's.
 
 Under torchrun only the main process prints and writes the summary.
 
@@ -99,7 +109,15 @@ from trl import TrlParser  # noqa: E402
 from trl.experimental.decision import DecisionConfig  # noqa: E402
 
 
-WINDOW_END = 320  # the last step of `window_records_per_second`, as in the baseline benchmark
+WINDOW_END = 320  # the last step of `window_records_per_second`, as in the reference benchmark
+# The `model_init_kwargs` the recipe prints; the others (a token, say) are redacted
+SHOWN_MODEL_INIT_KWARGS = ("dtype", "revision", "attn_implementation", "trust_remote_code")
+NOTES = {
+    "trainer_wall_seconds": "trainer.train() alone, which runs no evaluation and no save here; the reference's includes "
+    "its evaluations and saves, so the two are not comparable",
+    "startup_seconds": "from the start of the process (see recipe.startup_origin) to just before trainer.train(); its "
+    "origin differs from the reference's, so the two are not comparable",
+}
 SYNTHETIC_RECORDS = 256
 SYNTHETIC_TOKENIZER = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
 GIB = 1024**3
@@ -233,9 +251,16 @@ def process_start() -> tuple[float, str]:
 
 
 def parse_settings(settings: dict[str, Any]):
-    """The example's script, training and model arguments from a mapping of its settings (its YAML)."""
+    """
+    The example's script, training and model arguments from a mapping of its settings (its YAML), parsed exactly as
+    the example parses `--config`: the settings become the defaults of its parser, which converts them to the type of
+    each field (YAML reads `1e-4` as a string).
+    """
     parser = TrlParser((clef.ClefScriptArguments, DecisionConfig, clef.ClefModelArguments))
-    return parser.parse_dict(settings)
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "settings.yaml"
+        path.write_text(yaml.safe_dump(json.loads(json.dumps(settings, default=str))), encoding="utf-8")
+        return parser.parse_args_and_config(["--config", str(path)])
 
 
 def describe_recipe(run, script_args, training_args, model_args, synthetic: bool) -> dict[str, Any]:
@@ -260,17 +285,24 @@ def describe_recipe(run, script_args, training_args, model_args, synthetic: bool
             if parameter.is_floating_point()
         }
     )
+    training = training_args.to_dict()
+    if training.get("model_init_kwargs"):
+        training["model_init_kwargs"] = {
+            key: value if key in SHOWN_MODEL_INIT_KWARGS else "<redacted>"
+            for key, value in training["model_init_kwargs"].items()
+        }
     return {
         "synthetic": synthetic,
         "script": asdict(script_args),
         "model": asdict(model_args),
-        "training": training_args.to_dict(),
+        "training": training,
         "records_per_step": training_args.per_device_train_batch_size
         * training_args.gradient_accumulation_steps
         * training_args.world_size,
         "device": str(training_args.device),
         "backbone": type(backbone).__name__,
         "parameter_dtypes": dtypes,
+        # What the backbone uses; the head keeps its own default
         "attn_implementation": getattr(backbone.config, "_attn_implementation", None),
         "activation_checkpointing": bool(getattr(backbone, "is_gradient_checkpointing", False)),
         "head_type": model.config.head_type,
@@ -338,6 +370,8 @@ def run_benchmark(
             "load_best_model_at_end": False,
             "push_to_hub": False,
             "report_to": "none",
+            # Every step holds records_per_step records, so the rates are exact
+            "dataloader_drop_last": True,
         }
         script_args, training_args, model_args = parse_settings(settings)
         timer = StepTimer()
@@ -375,6 +409,7 @@ def run_benchmark(
             "torch": torch.__version__,
             "steps": timer.steps,
             "recipe": recipe,
+            "notes": dict(NOTES),
         }
         run.trainer.end()
     return summary

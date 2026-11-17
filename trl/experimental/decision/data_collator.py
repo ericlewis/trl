@@ -152,6 +152,24 @@ def target_from_gold(gold: Any, question: Question) -> dict[str, list[float]]:
     return {"target_probs": [0.0] + [1.0 if key == option else 0.0 for key in options]}
 
 
+def _hard_label(row: Any, question: Question, target: tuple[float, ...], from_gold: bool) -> int:
+    """
+    The gold label of one question, as an index among its options: the option `row` names (its `label` for a gold
+    answer, its `target_index` for a target row), else the first most probable option of `target` (null first), or
+    `-100` when `target` puts all of its mass on null.
+    """
+    if from_gold:
+        option = _gold_key(row.get("label") if isinstance(row, Mapping) else row, question)
+        if option is not None:
+            return list(question.options).index(option)
+    elif isinstance(row, Mapping) and type(row.get("target_index")) is int:
+        return row["target_index"]
+    options = target[1:]
+    if not any(value > 0 for value in options):
+        return -100
+    return max(range(len(options)), key=lambda index: (options[index], -index))
+
+
 def _json_value(value: Any) -> Any:
     return json.loads(value) if isinstance(value, str) else value
 
@@ -213,6 +231,17 @@ class DataCollatorForDecision(DataCollatorMixin):
         """The null-first target of each of `questions` (in template order) from the targets of `example`, see
         [`~experimental.decision.DataCollatorForDecision.prepare_request`]. Raises `ValueError` when they are unusable.
         """
+        return self.prepare_labeled_targets(example, questions)[0]
+
+    def prepare_labeled_targets(
+        self, example: dict[str, Any], questions: list
+    ) -> tuple[list[tuple[float, ...]], list[int]]:
+        """The targets of [`~experimental.decision.DataCollatorForDecision.prepare_targets`], and the gold label of each
+        question: the index (among its options, without null) of the option the row names as its `label` (in `gold` or
+        `answers`) or as its `target_index` (in `targets`), else of the target's most probable option (the first of a
+        tie). It is `-100` when the target puts all of its mass on null. Accuracy is counted against it, so a tie in
+        the target probabilities is scored against the label the row gives.
+        """
         names = [question.name for question in questions]
         if example.get("targets") is not None:
             rows, convert = _json_value(example["targets"]), lambda row, question: row
@@ -228,12 +257,15 @@ class DataCollatorForDecision(DataCollatorMixin):
         if unknown:
             raise ValueError(f"`{source}` names unknown questions {unknown}; the questions are {names}")
 
-        targets = []
+        targets, labels = [], []
         for question in questions:
             if question.name not in rows:
                 raise ValueError(f"`{source}` has no entry for question {question.name!r}")
+            row = rows[question.name]
             try:
-                targets.append(normalize_target(convert(rows[question.name], question), question))
+                target = normalize_target(convert(row, question), question)
             except ValueError as error:
                 raise ValueError(f"Question {question.name!r}: {error}") from error
-        return targets
+            targets.append(target)
+            labels.append(_hard_label(row, question, target, from_gold=source != "targets"))
+        return targets, labels
