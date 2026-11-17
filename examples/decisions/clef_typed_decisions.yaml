@@ -1,7 +1,9 @@
 # Train a Clef decision head and its KLM-1.6 backbone together on typed decisions.
 # Use mode: head or mode: lora (with use_peft and lora_* settings) to leave the backbone frozen.
-# model_name_or_path can also be an encoder (BERT, ModernBERT, a reranker): it then reads its first token with the
-# plain prompt; set global_pooling (last/first) and prompt_style (chatml/plain) to override the choice.
+# model_name_or_path can also be an encoder (BERT, ModernBERT, UltraBERT, a reranker): it then reads its first token
+# with the plain prompt; set global_pooling (last/first) and prompt_style (chatml/plain) to override the choice.
+# Backbone weights are never newly initialised and remote code is never run: a remote-code package such as the
+# UltraBERT reranker (weights under backbone.) loads its backbone from the one prefix that holds all of it, or fails.
 model_name_or_path: MinimaLabs/KLM-1.6
 dataset_name: LocalLLaMA/typed-decisions
 dataset_config: all

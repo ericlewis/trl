@@ -30,6 +30,7 @@ from examples.decisions.clef_typed_decisions import (
     DataCollatorForClef,
     build_model,
     clef_decision_config,
+    describe,
     load_backbone,
     prepare_split,
 )
@@ -128,6 +129,75 @@ def tiny_encoder(tokenizer, kind):
         return ModernBertModel(ModernBertConfig(**sizes, num_attention_heads=2, pad_token_id=tokenizer.pad_token_id))
     config = BertConfig(**sizes, num_attention_heads=2)
     return BertForSequenceClassification(config) if kind == "bert-reranker" else BertModel(config)
+
+
+def ultrabert_tokenizer(tokenizer):
+    """The tokenizer made like UltraBERT's: no `[CLS]`; padding, beginning and end of sequence one token; a separator."""
+    tokenizer = copy.deepcopy(tokenizer)
+    end = "<|endoftext|>"
+    tokenizer.add_special_tokens({"bos_token": end, "eos_token": end, "pad_token": end, "sep_token": "<|sep|>"})
+    assert tokenizer.cls_token is None
+    return tokenizer
+
+
+def tiny_ultrabert(tokenizer):
+    """A tiny UltraBERT: two local layers of radius 8 and a global one, each kind with its own RoPE base."""
+    from transformers import UltrabertConfig, UltrabertModel
+
+    set_seed(0)
+    config = UltrabertConfig(
+        vocab_size=len(tokenizer) + 2,
+        hidden_size=32,
+        intermediate_size=32,
+        num_hidden_layers=3,
+        num_attention_heads=2,
+        layer_types=["sliding_attention", "sliding_attention", "full_attention"],
+        sliding_window=8,
+        pad_token_id=tokenizer.pad_token_id,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+    return UltrabertModel(config)
+
+
+def prefixed(backbone, prefix, keys=None):
+    """The tensors of `backbone` (or of its `keys`) under `prefix`, as a wrapper stores them."""
+    state = backbone.state_dict()
+    return {f"{prefix}{key}": state[key].clone().contiguous() for key in (state if keys is None else keys)}
+
+
+PAIR_HEAD = {
+    "pair_head.0.weight": torch.full((16, 32), 0.5),
+    "pair_head.0.bias": torch.zeros(16),
+    "pair_head.2.weight": torch.ones(1, 16),
+}
+
+
+def reranker_package(folder, backbone, tokenizer, tensors):
+    """
+    A folder laid out like the UltraBERT reranker package: its config as its remote code writes it (per-layer
+    `attention_windows` and `rope_theta`, the `UltrabertForReranking` architecture, an `auto_map` to code files that
+    are not there), `tensors` as its `model.safetensors`, and the tokenizer.
+    """
+    from safetensors.torch import save_file
+
+    Path(folder).mkdir(parents=True)
+    config = backbone.config.to_dict()
+    layer_types, window = config.pop("layer_types"), config.pop("sliding_window")
+    rope_parameters = config.pop("rope_parameters")
+    config.update(
+        architectures=["UltrabertForReranking"],
+        auto_map={
+            "AutoConfig": "configuration_ultrabert.UltrabertConfig",
+            "AutoModelForSequenceClassification": "modeling_reranker.UltrabertForReranking",
+        },
+        attention_windows=[window if kind == "sliding_attention" else None for kind in layer_types],
+        rope_theta=[rope_parameters[kind]["rope_theta"] for kind in layer_types],
+    )
+    Path(folder, "config.json").write_text(json.dumps(config), encoding="utf-8")
+    save_file(tensors, f"{folder}/model.safetensors", metadata={"format": "pt"})
+    tokenizer.save_pretrained(folder)
+    return folder
 
 
 def encoder_tokenizer(tokenizer):
@@ -467,14 +537,26 @@ class TestClefTraining(TrlTestCase):
             "urgency": "score",
         }
 
-    def run_main(self, tokenizer, mode, training_kwargs=None, backbone=None, script_kwargs=None, **model_kwargs):
+    def run_main(
+        self,
+        tokenizer,
+        mode,
+        training_kwargs=None,
+        backbone=None,
+        script_kwargs=None,
+        checkpoint=None,
+        **model_kwargs,
+    ):
         """
-        Run the script's `main` on a tiny local backbone (the causal LM of `MODEL_ID` by default) and dataset; returns
-        the trainer, the model `build_model` builds with the same seed, and the backbone.
+        Run the script's `main` on a tiny local backbone (the causal LM of `MODEL_ID` by default), or on the folder
+        `checkpoint` as it is, and dataset; returns the trainer, the model `build_model` builds with the same seed, and
+        the backbone.
         """
-        backbone = backbone if backbone is not None else AutoModelForCausalLM.from_pretrained(MODEL_ID)
-        backbone.save_pretrained(f"{self.tmp_dir}/backbone")
-        tokenizer.save_pretrained(f"{self.tmp_dir}/backbone")
+        if checkpoint is None:
+            backbone = backbone if backbone is not None else AutoModelForCausalLM.from_pretrained(MODEL_ID)
+            backbone.save_pretrained(f"{self.tmp_dir}/backbone")
+            tokenizer.save_pretrained(f"{self.tmp_dir}/backbone")
+            checkpoint = f"{self.tmp_dir}/backbone"
         rows = [make_row(index) for index in range(12)] + [LONG_ROW]
         with open(f"{self.tmp_dir}/train.jsonl", "w") as file:
             for row in rows:
@@ -508,7 +590,7 @@ class TestClefTraining(TrlTestCase):
             report_to="none",
         )
         training_args = DecisionConfig(**{**training_args, **(training_kwargs or {})})
-        model_args = ClefModelArguments(model_name_or_path=f"{self.tmp_dir}/backbone", dtype="float32", **model_kwargs)
+        model_args = ClefModelArguments(model_name_or_path=checkpoint, dtype="float32", **model_kwargs)
         trainer = clef_main(script_args, training_args, model_args)
         set_seed(training_args.seed)
         initial = build_model(script_args, model_args, {"dtype": "float32", "revision": None})
@@ -567,8 +649,11 @@ class TestClefTraining(TrlTestCase):
         class Opaque(torch.nn.Module):
             base_model = property(lambda self: self)
 
+        info = {"missing_keys": set(), "unexpected_keys": set(), "mismatched_keys": set()}
         monkeypatch.setattr(
-            clef_typed_decisions.AutoModelForSequenceClassification, "from_pretrained", lambda *a, **k: Opaque()
+            clef_typed_decisions.AutoModelForSequenceClassification,
+            "from_pretrained",
+            lambda *a, **k: (Opaque(), info),
         )
         with pytest.raises(ValueError, match="cannot be unwrapped"):
             load_backbone(f"{self.tmp_dir}/reranker", config, {})
@@ -772,6 +857,195 @@ class TestClefTraining(TrlTestCase):
 
         for name, value in reloaded.model.state_dict().items():
             torch.testing.assert_close(value.float(), merged[name].float())
+
+    def build_from(self, folder, **script_kwargs):
+        """The model the script builds from `folder`, with a tiny head."""
+        script_args = ClefScriptArguments(
+            head_hidden_size=16,
+            head_intermediate_size=32,
+            head_num_layers=1,
+            head_num_evidence_layers=1,
+            head_num_attention_heads=2,
+            **script_kwargs,
+        )
+        model_args = ClefModelArguments(model_name_or_path=folder, dtype="float32")
+        return build_model(script_args, model_args, {"dtype": "float32", "revision": None})
+
+    @staticmethod
+    def no_training(monkeypatch):
+        """Fail the test if the script gets as far as building its trainer."""
+        from examples.decisions import clef_typed_decisions
+
+        def trainer(*args, **kwargs):
+            raise AssertionError("training started")
+
+        monkeypatch.setattr(clef_typed_decisions, "DecisionTrainer", trainer)
+
+    def test_reranker_package_backbone_is_loaded_not_reinitialised(self, tokenizer):
+        tokenizer = ultrabert_tokenizer(tokenizer)
+        backbone = tiny_ultrabert(tokenizer)
+        folder = reranker_package(
+            f"{self.tmp_dir}/reranker", backbone, tokenizer, {**prefixed(backbone, "backbone."), **PAIR_HEAD}
+        )
+        # As measured on the real package: `AutoModel` alone loads none of its backbone, with only a warning
+        _, info = AutoModel.from_pretrained(folder, output_loading_info=True)
+        assert set(info["missing_keys"]) == set(backbone.state_dict())
+        model = self.build_from(folder)
+        assert type(model.model).__name__ == "UltrabertModel"
+        assert not hasattr(model, "lm_head")
+        expected, built = backbone.state_dict(), model.model.state_dict()
+        assert set(built) == set(expected)
+        for name, value in built.items():
+            assert torch.equal(value, expected[name]), name
+        # The settings of the remote config are read: the windows and RoPE bases of the layers
+        text_config = model.config.text_config
+        assert text_config.layer_types == ["sliding_attention", "sliding_attention", "full_attention"]
+        assert text_config.sliding_window == 8
+        assert text_config.rope_parameters == backbone.config.rope_parameters
+        assert (model.config.global_pooling, model.config.prompt_style) == ("first", "plain")
+        line = describe(model)
+        assert "prefix" in line and "backbone." in line
+        assert 'backbone weights: prefix "backbone."' in line
+        assert "dropped 3 non-backbone tensors" in line
+        assert all(key in line for key in PAIR_HEAD)
+
+    def test_missing_backbone_weights_raise(self, tokenizer, monkeypatch):
+        tokenizer = ultrabert_tokenizer(tokenizer)
+        backbone = tiny_ultrabert(tokenizer)
+        keys = list(backbone.state_dict())
+        kept, removed = keys[::2], keys[1::2]
+        folder = reranker_package(
+            f"{self.tmp_dir}/half", backbone, tokenizer, {**prefixed(backbone, "backbone.", kept), **PAIR_HEAD}
+        )
+        self.no_training(monkeypatch)
+        with pytest.raises(ValueError, match="missing") as error:
+            self.run_main(tokenizer, "full", checkpoint=folder)
+        message = str(error.value)
+        assert removed[0] in message
+        assert sum(key in message for key in removed) == min(10, len(removed))
+        assert not Path(self.tmp_dir, "out").exists()
+        # Every key under the prefix but one of the wrong shape: refused too
+        tensors = {**prefixed(backbone, "backbone."), **PAIR_HEAD}
+        tensors["backbone.norm.weight"] = torch.ones(16)
+        folder = reranker_package(f"{self.tmp_dir}/shape", backbone, tokenizer, tensors)
+        with pytest.raises(ValueError, match="norm.weight"):
+            self.build_from(folder)
+
+    def test_ambiguous_prefix_raises(self, tokenizer):
+        tokenizer = ultrabert_tokenizer(tokenizer)
+        backbone = tiny_ultrabert(tokenizer)
+        keys = list(backbone.state_dict())
+        # Split across two prefixes: no single one holds every key
+        split = {**prefixed(backbone, "backbone.", keys[::2]), **prefixed(backbone, "encoder.", keys[1::2])}
+        folder = reranker_package(f"{self.tmp_dir}/split", backbone, tokenizer, split)
+        with pytest.raises(ValueError, match="missing"):
+            self.build_from(folder)
+        # Two whole copies under two prefixes: which one is the backbone is not guessed
+        teacher = {f"teacher.{key}": torch.zeros_like(value) for key, value in backbone.state_dict().items()}
+        copies = {**prefixed(backbone, "backbone."), **teacher}
+        folder = reranker_package(f"{self.tmp_dir}/copies", backbone, tokenizer, copies)
+        with pytest.raises(ValueError, match="ambiguous") as error:
+            self.build_from(folder)
+        assert '"backbone."' in str(error.value) and '"teacher."' in str(error.value)
+
+    def test_native_ultrabert_checkpoint_loads_directly(self, tokenizer):
+        tokenizer = ultrabert_tokenizer(tokenizer)
+        backbone = tiny_ultrabert(tokenizer)
+        backbone.save_pretrained(f"{self.tmp_dir}/native")
+        tokenizer.save_pretrained(f"{self.tmp_dir}/native")
+        model = self.build_from(f"{self.tmp_dir}/native")
+        assert type(model.model).__name__ == "UltrabertModel"
+        expected, built = backbone.state_dict(), model.model.state_dict()
+        assert set(built) == set(expected)
+        for name, value in built.items():
+            assert torch.equal(value, expected[name]), name
+        line = describe(model)
+        assert "backbone weights: direct" in line and "dropped 0 non-backbone tensors" in line
+        assert "prefix" not in line
+
+    @pytest.mark.parametrize("head_type", ["joint", "cosine"])
+    def test_main_trains_on_ultrabert_reranker_package(self, tokenizer, head_type, capsys):
+        tokenizer = ultrabert_tokenizer(tokenizer)
+        backbone = tiny_ultrabert(tokenizer)
+        folder = reranker_package(
+            f"{self.tmp_dir}/reranker", backbone, tokenizer, {**prefixed(backbone, "backbone."), **PAIR_HEAD}
+        )
+        script_kwargs = {"head_type": head_type, "cosine_width": 8}
+        trainer, initial, _ = self.run_main(tokenizer, "full", checkpoint=folder, script_kwargs=script_kwargs)
+        assert trainer.state.global_step == 5
+        out = capsys.readouterr().out
+        assert (
+            f"Clef setup: bidirectional backbone (ultrabert), global_pooling=first, prompt_style=plain, "
+            f'head_type={head_type}, backbone weights: prefix "backbone."' in out
+        )
+        assert type(trainer.model.model).__name__ == "UltrabertModel"
+        assert not hasattr(trainer.model, "lm_head")
+        reloaded = self.check_saved_model(
+            trainer, tokenizer, global_pooling="first", prompt_style="plain", head_type=head_type
+        )
+        assert reloaded.config.text_config.layer_types == backbone.config.layer_types
+        # The plain prompt starts with the beginning of sequence token and ends with the separator
+        ((inputs, _),) = reloaded.decision_config.prepare_inputs(make_row(0), tokenizer)
+        assert inputs["input_ids"][0, 0] == tokenizer.bos_token_id
+        assert inputs["input_ids"][0, -1] == tokenizer.sep_token_id
+        # The model starts from the reranker's backbone
+        expected = backbone.state_dict()
+        for name, value in initial.model.state_dict().items():
+            assert torch.equal(value, expected[name]), name
+
+    def test_remote_code_is_never_executed(self, tokenizer, capsys):
+        import sys
+
+        tokenizer = ultrabert_tokenizer(tokenizer)
+        backbone = tiny_ultrabert(tokenizer)
+        folder = reranker_package(
+            f"{self.tmp_dir}/reranker", backbone, tokenizer, {**prefixed(backbone, "backbone."), **PAIR_HEAD}
+        )
+        sentinel = Path(self.tmp_dir, "imported")
+        for module in ("configuration_ultrabert", "modeling_reranker", "modeling_ultrabert"):
+            Path(folder, f"{module}.py").write_text(
+                f"from pathlib import Path\nPath({str(sentinel)!r}).write_text({module!r})\n"
+                f"raise RuntimeError('remote code {module} was imported')\n",
+                encoding="utf-8",
+            )
+        trainer, _, _ = self.run_main(tokenizer, "full", checkpoint=folder)
+        assert trainer.state.global_step == 5
+        assert 'backbone weights: prefix "backbone."' in capsys.readouterr().out
+        assert not sentinel.exists()
+        assert not any("modeling_reranker" in name or "configuration_ultrabert." in name for name in sys.modules)
+        # Asking for remote code is refused rather than ignored
+        with pytest.raises(ValueError, match="remote code"):
+            remote = {"model_init_kwargs": {"trust_remote_code": True}}
+            self.run_main(tokenizer, "full", checkpoint=folder, training_kwargs=remote)
+        assert not sentinel.exists()
+
+    @pytest.mark.parametrize(
+        "settings", [{"rlcd_weight": -0.25}, {"rlcd_sigma": 0.0}, {"rlcd_samples": 1}, {"rlcd_sigma": -0.4}]
+    )
+    def test_loaded_checkpoint_loss_settings_are_validated(self, tokenizer, decision_config, settings, monkeypatch):
+        # The loss settings applied to a loaded Clef checkpoint are checked as a new config checks them
+        tiny_clef(tokenizer, decision_config).save_pretrained(f"{self.tmp_dir}/clef")
+        tokenizer.save_pretrained(f"{self.tmp_dir}/clef")
+        self.no_training(monkeypatch)
+        (key,) = settings
+        with pytest.raises(ValueError, match=key):
+            self.run_main(tokenizer, "full", checkpoint=f"{self.tmp_dir}/clef", script_kwargs=settings)
+        assert not Path(self.tmp_dir, "out").exists()
+        # Valid settings are applied
+        model = self.build_from(f"{self.tmp_dir}/clef", rlcd_weight=0.25, rlcd_sigma=0.3, rlcd_samples=4)
+        assert (model.config.rlcd_weight, model.config.rlcd_sigma, model.config.rlcd_samples) == (0.25, 0.3, 4)
+
+    def test_clef_checkpoint_with_missing_weights_raises(self, tokenizer, decision_config):
+        from safetensors.torch import load_file, save_file
+
+        folder = f"{self.tmp_dir}/clef"
+        tiny_clef(tokenizer, decision_config).save_pretrained(folder)
+        tensors = load_file(f"{folder}/model.safetensors")
+        removed = next(key for key in tensors if key.startswith("model.layers."))
+        del tensors[removed]
+        save_file(tensors, f"{folder}/model.safetensors", metadata={"format": "pt"})
+        with pytest.raises(ValueError, match="missing"):
+            self.build_from(folder)
 
 
 def lora_clef(tokenizer, decision_config):

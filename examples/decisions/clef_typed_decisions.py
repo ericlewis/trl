@@ -30,6 +30,11 @@ its base model) reads its first token with the plain prompt between [CLS] and [S
 small cosine head instead of the joint one. The resolved setup is printed at start-up. `rlcd_weight` (with
 `rlcd_sigma`, `rlcd_samples`, `rlcd_normalize_advantage`) adds Clef's RLCD policy term to the training loss.
 
+Backbone weights are never newly initialised and remote code is never run. A checkpoint whose weights sit under a
+prefix (a remote-code package such as an UltraBERT reranker, with `backbone.<name>` keys) has its backbone read from
+its safetensors under the one prefix that holds all of them, and its other tensors dropped; the start-up line names
+where the weights came from. A backbone with weights that no single prefix provides is refused.
+
 python examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
 
 torchrun --nproc_per_node=2 \
@@ -46,6 +51,7 @@ from typing import Any
 
 import torch
 from datasets import Features, Sequence, Value, load_dataset
+from safetensors import safe_open
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -364,26 +370,153 @@ def is_causal(config) -> bool:
     return is_decoder_type or bool(getattr(config, "is_decoder", False))
 
 
+@dataclass
+class BackboneWeights:
+    """Where the weights of a backbone came from: `direct` or `prefix "<p>"`, and the checkpoint tensors left out."""
+
+    source: str
+    dropped: list[str]
+
+    def __str__(self):
+        names = ", ".join(self.dropped[:10]) + (", ..." if len(self.dropped) > 10 else "")
+        return f"{self.source} (dropped {len(self.dropped)} non-backbone tensors{': ' + names if names else ''})"
+
+
+def without_remote_code(model_kwargs):
+    """`model_kwargs` with `trust_remote_code=False`: this script never runs the code of a checkpoint."""
+    if model_kwargs.get("trust_remote_code"):
+        raise ValueError("This example never runs remote code; remove trust_remote_code")
+    return {**model_kwargs, "trust_remote_code": False}
+
+
+def loading_problems(info) -> list[str]:
+    """The keys that `from_pretrained` initialised anew: missing from the checkpoint, or of another shape."""
+    mismatched = [key[0] if isinstance(key, tuple) else key for key in info.get("mismatched_keys", ())]
+    return sorted({*info.get("missing_keys", ()), *mismatched})
+
+
+def checkpoint_shapes(name, revision=None) -> dict[str, tuple[str, tuple[int, ...]]]:
+    """The file and shape of every tensor of the safetensors weights of `name`, read from their headers only."""
+    files = []
+    single = cached_file(name, "model.safetensors", revision=revision, _raise_exceptions_for_missing_entries=False)
+    if single is not None:
+        files = [single]
+    else:
+        index = cached_file(
+            name, "model.safetensors.index.json", revision=revision, _raise_exceptions_for_missing_entries=False
+        )
+        if index is not None:
+            shards = sorted(set(json.loads(Path(index).read_text(encoding="utf-8"))["weight_map"].values()))
+            files = [cached_file(name, shard, revision=revision) for shard in shards]
+    shapes = {}
+    for file in files:
+        with safe_open(file, framework="pt") as weights:
+            for key in weights.keys():
+                shapes[key] = (file, tuple(weights.get_slice(key).get_shape()))
+    return shapes
+
+
+def repair_backbone(name, backbone, missing, revision=None) -> BackboneWeights:
+    """
+    Load the weights of `backbone` from the safetensors of `name` under the single key prefix that holds every one of
+    them with its shape (`backbone.`, `model.`, ...), strictly. Raises a `ValueError` naming the missing keys when no
+    prefix holds them all, or when several do.
+    """
+    expected = {key: tuple(value.shape) for key, value in backbone.state_dict().items()}
+    shapes = checkpoint_shapes(name, revision)
+    reference = next(iter(expected))
+    # Any prefix that holds every key holds the first: the candidates are the prefixes of that one
+    candidates = sorted(
+        key[: -len(reference)]
+        for key in shapes
+        if key.endswith("." + reference) and key[: -len(reference)] not in ("", ".")
+    )
+    # The weights each candidate lacks, or holds with another shape
+    absent = {
+        prefix: [key for key, shape in expected.items() if shapes.get(prefix + key, (None, None))[1] != shape]
+        for prefix in candidates
+    }
+    resolved = [prefix for prefix in candidates if not absent[prefix]]
+    if len(resolved) > 1:
+        prefixes = ", ".join(f'"{prefix}"' for prefix in resolved)
+        raise ValueError(
+            f"The weights of {name} are ambiguous: the prefixes {prefixes} each hold a whole "
+            f"{type(backbone).__name__}. Save the backbone on its own and train from that."
+        )
+    if not resolved:
+        where = "under the names of its class"
+        if candidates:  # the keys that the closest prefix lacks
+            closest = min(candidates, key=lambda prefix: len(absent[prefix]))
+            missing, where = absent[closest], f'under the closest prefix "{closest}"'
+        listed = ", ".join(missing[:10]) + (", ..." if len(missing) > 10 else "")
+        raise ValueError(
+            f"{len(missing)} of the {len(expected)} weights of the {type(backbone).__name__} backbone are missing "
+            f"from {name} {where} (or have another shape), and no single key prefix of its safetensors holds them "
+            f"all: {listed}. Refusing to train from newly initialised weights."
+        )
+    (prefix,) = resolved
+    state = {}
+    for key in expected:
+        file, _ = shapes[prefix + key]
+        with safe_open(file, framework="pt") as weights:
+            state[key] = weights.get_tensor(prefix + key)
+    backbone.load_state_dict(state, strict=True)
+    used = {prefix + key for key in expected}
+    return BackboneWeights(f'prefix "{prefix}"', sorted(key for key in shapes if key not in used))
+
+
 def load_backbone(name, config, model_kwargs):
     """
-    The backbone of a new head, and the table its `lm_head` starts from (`None` without one): the base model of a
-    causal LM with its output embeddings, or a bidirectional encoder with its input embeddings. A checkpoint that only
+    The backbone of a new head, the table its `lm_head` starts from, and where its weights came from: the base model of
+    a causal LM with its output embeddings, or a bidirectional encoder with its input embeddings. A checkpoint that only
     registers a sequence classification class (a reranker) is loaded as that and unwrapped to its `base_model`.
+
+    No weight of the backbone is newly initialised: when the checkpoint does not provide one under the names of the
+    loaded class, the backbone is read from its safetensors under the one key prefix that holds all of its weights
+    (see `repair_backbone`), or a `ValueError` is raised. Remote code is never run.
     """
-    if is_causal(config):
-        causal_lm = AutoModelForCausalLM.from_pretrained(name, **model_kwargs)
-        return causal_lm.base_model, causal_lm.get_output_embeddings().weight
+    model_kwargs = without_remote_code(model_kwargs)
     architectures = config.architectures or []
-    if architectures and all(architecture.endswith("ForSequenceClassification") for architecture in architectures):
-        classifier = AutoModelForSequenceClassification.from_pretrained(name, **model_kwargs)
-        backbone = classifier.base_model
-        if backbone is classifier or not hasattr(backbone, "get_input_embeddings"):
+    if is_causal(config):
+        loaded, info = AutoModelForCausalLM.from_pretrained(name, output_loading_info=True, **model_kwargs)
+    elif architectures and all(architecture.endswith("ForSequenceClassification") for architecture in architectures):
+        loaded, info = AutoModelForSequenceClassification.from_pretrained(
+            name, output_loading_info=True, **model_kwargs
+        )
+        if loaded.base_model is loaded or not hasattr(loaded.base_model, "get_input_embeddings"):
             raise ValueError(
                 f"{name} registers only {architectures}, whose base model cannot be unwrapped into a backbone"
             )
     else:
-        backbone = AutoModel.from_pretrained(name, **model_kwargs)
-    return backbone, backbone.get_input_embeddings().weight
+        loaded, info = AutoModel.from_pretrained(name, output_loading_info=True, **model_kwargs)
+    backbone = loaded.base_model
+    # The keys of the loaded class that belong to its backbone, and the others (a task head, an `lm_head`)
+    wrapper = "" if backbone is loaded else f"{loaded.base_model_prefix}."
+    problems = loading_problems(info)
+    missing = [key[len(wrapper) :] for key in problems if key.startswith(wrapper)]
+    head = [key for key in problems if not key.startswith(wrapper)]
+    if is_causal(config) and head:  # the output embeddings the lexical prior starts from
+        raise ValueError(f"{name} is missing weights of its causal LM outside its backbone: {', '.join(head[:10])}")
+    if missing:
+        weights = repair_backbone(name, backbone, missing, revision=model_kwargs.get("revision"))
+    else:
+        dropped = sorted(info.get("unexpected_keys", ()))
+        if wrapper and not is_causal(config):  # the task head of the loaded class is not kept
+            dropped += sorted(key for key in loaded.state_dict() if not key.startswith(wrapper) and key not in head)
+        weights = BackboneWeights("direct", dropped)
+    embeddings = loaded.get_output_embeddings().weight if is_causal(config) else backbone.get_input_embeddings().weight
+    return backbone, embeddings, weights
+
+
+LOSS_SETTINGS = (
+    "label_smoothing",
+    "brier_weight",
+    "ordinal_weight",
+    "rlcd_weight",
+    "rlcd_sigma",
+    "rlcd_samples",
+    "rlcd_normalize_advantage",
+)
 
 
 def build_model(script_args, model_args, model_kwargs):
@@ -395,39 +528,38 @@ def build_model(script_args, model_args, model_kwargs):
     from transformers import ClefConfig, ClefForDecision
 
     name, revision = model_args.model_name_or_path, model_args.model_revision
-    losses = {
-        key: getattr(script_args, key)
-        for key in (
-            "label_smoothing",
-            "brier_weight",
-            "ordinal_weight",
-            "rlcd_weight",
-            "rlcd_sigma",
-            "rlcd_samples",
-            "rlcd_normalize_advantage",
-        )
-        if getattr(script_args, key) is not None
-    }
+    losses = {key: getattr(script_args, key) for key in LOSS_SETTINGS if getattr(script_args, key) is not None}
     head_settings = {
         key: getattr(script_args, key)
         for key in ("head_type", "global_pooling", "prompt_style", "cosine_width", "cosine_initial_scale")
         if getattr(script_args, key) is not None
     }
-    config = AutoConfig.from_pretrained(name, revision=revision)
+    model_kwargs = without_remote_code(model_kwargs)
+    config = AutoConfig.from_pretrained(name, revision=revision, trust_remote_code=False)
     is_checkpoint = (
         config.model_type == "clef"
         or cached_file(name, "joint_head_config.json", revision=revision, _raise_exceptions_for_missing_entries=False)
         is not None
     )
     if is_checkpoint:
-        model = AutoModelForDecision.from_pretrained(name, **model_kwargs)
+        model, info = AutoModelForDecision.from_pretrained(name, output_loading_info=True, **model_kwargs)
+        problems = loading_problems(info)
+        if problems:
+            raise ValueError(
+                f"{len(problems)} weights of the Clef checkpoint {name} are missing or of another shape: "
+                f"{', '.join(problems[:10])}{', ...' if len(problems) > 10 else ''}"
+            )
         changed = {key: value for key, value in head_settings.items() if getattr(model.config, key) != value}
         if changed:
             raise ValueError(f"{name} is a Clef checkpoint; its head settings cannot change ({changed})")
+        # `setattr` skips the checks of a new config: the loss settings it ends up with are checked by building one
+        loss_keys = [key for key in LOSS_SETTINGS if hasattr(model.config, key)]
+        ClefConfig(**{**{key: getattr(model.config, key) for key in loss_keys}, **losses})
         for key, value in losses.items():
             setattr(model.config, key, value)
+        model.backbone_weights = "Clef checkpoint"
     else:
-        backbone, embeddings = load_backbone(name, config, model_kwargs)
+        backbone, embeddings, weights = load_backbone(name, config, model_kwargs)
         sizes = {
             key: getattr(script_args, f"head_{value}")
             for key, value in {
@@ -457,6 +589,7 @@ def build_model(script_args, model_args, model_kwargs):
             with torch.no_grad():
                 model.lm_head.weight.copy_(embeddings)
             model.lm_head.to(backbone.dtype)
+        model.backbone_weights = weights
         del backbone, embeddings
     if model.decision_config.chat_template is None:
         model.decision_config = clef_decision_config()
@@ -464,12 +597,17 @@ def build_model(script_args, model_args, model_kwargs):
 
 
 def describe(model) -> str:
-    """The resolved setup of a Clef model: the attention of its backbone, its pooling, prompt style and head."""
+    """
+    The resolved setup of a Clef model: the attention of its backbone, its pooling, prompt style and head, and where
+    `build_model` read the weights of its backbone from.
+    """
     config = model.config
     attention = "causal" if is_causal(config.text_config) else "bidirectional"
+    weights = getattr(model, "backbone_weights", None)
     return (
         f"Clef setup: {attention} backbone ({config.text_config.model_type}), global_pooling={config.global_pooling}, "
         f"prompt_style={config.prompt_style}, head_type={config.head_type}"
+        + ("" if weights is None else f", backbone weights: {weights}")
     )
 
 
@@ -522,7 +660,9 @@ def main(script_args, training_args, model_args):
     model = build_model(script_args, model_args, model_kwargs)
     if training_args.process_index == 0:
         print(describe(model))
-    tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, revision=model_args.model_revision)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_args.model_name_or_path, revision=model_args.model_revision, trust_remote_code=False
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
