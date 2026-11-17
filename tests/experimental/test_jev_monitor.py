@@ -687,11 +687,16 @@ def test_ledger_roundtrip_and_truncate(tmp_path):
     records = ledger.read()
     assert [r["step"] for r in records] == [10, 20, 30]
     assert records[0]["kind"] == "ask" and records[0]["payload"] == {"loss": None, "step": 10}
-    ledger.truncate_after(20)
+    aside = ledger.truncate_after(20)
     assert [r["step"] for r in ledger.read()] == [10, 20]
+    assert aside.parent == ledger.path.parent and aside.name.startswith("ledger.moved-")
+    assert [r["step"] for r in Ledger(aside).read()] == [30]  # moved, not deleted
+    assert ledger.truncate_after(20) is None  # nothing to move: no file
     ledger.append("ask", 25, {})
     assert [r["step"] for r in ledger.read()] == [10, 20, 25]
-    Ledger(tmp_path / "missing.jsonl").truncate_after(0)
+    second = ledger.truncate_after(10)
+    assert second != aside and [r["step"] for r in Ledger(aside).read()] == [30]  # never overwritten
+    assert Ledger(tmp_path / "missing.jsonl").truncate_after(0) is None
 
 
 def test_ledger_torn_last_line_does_not_swallow_the_next_record(tmp_path):
@@ -714,8 +719,9 @@ def test_ledger_read_tolerates_undecodable_bytes(tmp_path):
         f.write(b'{"kind": "x", "step": 2, "payload": {"s": "\xff"}}\n')
     records = ledger.read()
     assert [r["step"] for r in records] == [1, 2]
-    ledger.truncate_after(1)
+    aside = ledger.truncate_after(1)
     assert [r["step"] for r in ledger.read()] == [1]
+    assert b"not json" in aside.read_bytes()  # an unreadable line is moved aside too, not lost
 
 
 def test_ledger_append_never_raises(tmp_path):
@@ -1636,6 +1642,9 @@ def test_several_evaluations_at_one_step_are_merged(tmp_path):
     run.cb.on_evaluate(run.args, run.state, run.control, metrics={**first, **second})
     run.end()
     assert kinds(callback, "missing") == []  # the second evaluation at 10 did not discard the verdict for 10
+    # Once per run, a note says the request already sent covers the first dataset only
+    (note,) = [r for r in kinds(callback, "note") if r["payload"]["note"] == "several_evaluations"]
+    assert note["step"] == 10 and "metric_prefix" in note["payload"]["reason"]
     assert [r["payload"]["for_step"] for r in kinds(callback, "verdict")] == [10]
     assert [state["step"] for state in backend.calls] == [10, 20]  # one request per step
     assert backend.calls[1]["history"][0] == {
@@ -1877,3 +1886,198 @@ def test_no_stop_at_the_final_evaluation(tmp_path):
     assert not (tmp_path / "monitor-stop-20").exists()
     (note,) = [n for n in kinds(callback, "note") if n["payload"]["note"] == "stop_not_needed"]
     assert note["step"] == 20 and note["payload"]["proposal"]["reason"] == "rule"
+
+
+# -- record what happened ---------------------------------------------------------------------------------------
+
+LOGGER = "trl.experimental.decision.jev_monitor.callback"
+
+
+def messages(caplog, level):
+    import logging
+
+    return [r.getMessage() for r in caplog.records if r.name == LOGGER and r.levelno == getattr(logging, level)]
+
+
+@requires_decision
+def test_stop_is_not_enforced_unless_recorded(tmp_path, caplog):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")  # the monitor's directory cannot be created
+    wire = Wire()
+    kwargs = {"rules": [rule()], "mode": "enforce", "patience": 1, "finish_timeout": 1.0}
+    from trl.experimental.decision.jev_monitor import JevMonitorCallback
+
+    trainer = FakeTrainer()
+    cb0 = JevMonitorCallback(
+        FakeBackend(),
+        CQ,
+        output_dir=blocker / "monitor",
+        broadcast=wire.rank0,
+        stop_when=kwargs.pop("rules"),
+        **kwargs,
+    ).attach(trainer)
+    cb1 = monitor(
+        tmp_path / "r1", FakeBackend(), rules=[rule()], broadcast=wire.other, trainer=FakeTrainer(), **kwargs
+    )
+    run0 = Run(cb0, tmp_path).begin()
+    run1 = Run(cb1, tmp_path / "r1", rank0=False).begin()
+    with caplog.at_level("WARNING", logger=LOGGER):
+        for step in (10, 20):
+            assert not run0.evaluate(step)
+            assert not run1.evaluate(step)
+    run0.end()
+    run1.end()
+    assert trainer.saved == [str(tmp_path / "monitor-stop-20")]  # saved, but nothing could record the stop
+    assert wire.sent[2] is False  # what the other ranks receive: "saved and recorded"
+    (error,) = messages(caplog, "ERROR")
+    assert "not enforced" in error and "20" in error
+    ledger_warnings = [m for m in messages(caplog, "WARNING") if "ledger" in m]
+    assert len(ledger_warnings) == 1  # once, on the first ledger failure
+
+
+@requires_decision
+@pytest.mark.parametrize("broken", ["intervened.json", "ledger"])
+def test_stop_is_enforced_when_either_record_is_written(tmp_path, monkeypatch, caplog, broken):
+    callback = monitor(tmp_path, FakeBackend(), rules=[rule()], mode="enforce", patience=1, trainer=FakeTrainer())
+    run = Run(callback, tmp_path).begin()
+    if broken == "intervened.json":
+        (tmp_path / "monitor" / "intervened.json").mkdir(parents=True)  # cannot be replaced by a file
+    else:
+        append = callback.ledger.append
+        monkeypatch.setattr(callback.ledger, "append", lambda k, s, p: False if k == "intervened" else append(k, s, p))
+    run.evaluate(10)
+    with caplog.at_level("WARNING", logger=LOGGER):
+        assert run.evaluate(20)
+    run.end()
+    assert any("stopped training at step 20" in m for m in messages(caplog, "WARNING"))
+    if broken == "intervened.json":
+        assert [r["step"] for r in kinds(callback, "intervened")] == [20]
+    else:
+        assert json.loads((tmp_path / "monitor" / "intervened.json").read_text())["step"] == 20
+
+
+@requires_decision
+def test_failed_save_and_first_backend_failure_are_logged(tmp_path, server, caplog, monkeypatch):
+    monkeypatch.setenv(ENV, "sekrit-key")
+    server.respond(("status", 401))
+    client = SystemOneClient(url=server.url, model="m", api_key_env=ENV, timeout=0.5)
+    trainer = FakeTrainer(fail=True)
+    callback = monitor(tmp_path, client, mode="enforce", trainer=trainer)
+    run = Run(callback, tmp_path).begin()
+    with caplog.at_level("WARNING", logger=LOGGER):
+        for step in (10, 20, 30):
+            run.evaluate(step, eval_loss=float("nan") if step == 30 else 0.5)
+    run.end()
+    warnings = messages(caplog, "WARNING")
+    judge = [m for m in warnings if "judge" in m]
+    assert len(judge) == 1 and "HTTP 401" in judge[0]  # once, whatever the number of failures
+    assert any("could not save" in m and "disk full" in m for m in warnings)
+    assert all("sekrit" not in r.getMessage() for r in caplog.records)
+
+
+@requires_decision
+def test_answer_records_hold_the_digest_sent(tmp_path):
+    gate = threading.Event()
+    backend = FakeBackend(gate=gate)
+    callback = monitor(tmp_path, backend, budget_bytes=2048)
+    run = Run(callback, tmp_path).begin()
+    run.evaluate(10, wait=False)
+    assert backend.started.wait(5)
+    run.evaluate(20, wait=False)  # the request for 10 is late
+    gate.set()
+    assert callback.wait(5)
+    run.evaluate(30)
+    run.end()
+    records = {r["step"]: r for r in kinds(callback, "answer") + kinds(callback, "late")}
+    assert records[10]["kind"] == "late"
+    sent = {state["step"]: state for state in backend.calls}
+    for step, record in records.items():
+        assert record["payload"]["digest"] == sent[step]
+        assert len(compact(record["payload"]["digest"]).encode()) <= 2048
+    assert "slopes" in records[30]["payload"]["digest"] and "sentinels" in records[30]["payload"]["digest"]
+
+
+def moved_files(directory, stem):
+    return sorted(p.name for p in directory.iterdir() if p.name.startswith(stem + ".moved-"))
+
+
+@requires_decision
+def test_a_new_run_in_a_reused_directory_moves_the_earlier_records_aside(tmp_path):
+    def stop_run():
+        trainer = FakeTrainer()
+        callback = monitor(tmp_path, FakeBackend(), rules=[rule()], mode="enforce", patience=1, trainer=trainer)
+        run = Run(callback, tmp_path).begin()
+        run.evaluate(10)
+        assert run.evaluate(20)
+        run.end()
+        return callback
+
+    first = stop_run()
+    earlier = first.ledger.read()
+    assert any(r["kind"] == "intervened" for r in earlier)
+    directory = tmp_path / "monitor"
+    second = monitor(tmp_path, FakeBackend())
+    Run(second, tmp_path).begin().end()
+    # Nothing is deleted: the first run's records, and its intervened.json, are kept beside the new ledger
+    (aside,) = moved_files(directory, "ledger")
+    assert Ledger(directory / aside).read() == earlier
+    assert not (directory / "intervened.json").exists()
+    (old_json,) = moved_files(directory, "intervened")
+    assert json.loads((directory / old_json).read_text())["step"] == 20
+    (note,) = [r for r in kinds(second, "note") if r["payload"]["note"] == "earlier_records_moved"]
+    assert note["payload"]["records"] == len(earlier) and note["payload"]["to"].endswith(aside)
+    assert note["payload"]["intervened_json_to"].endswith(old_json)
+    # A third run never overwrites what the second moved aside
+    stop_run()
+    Run(monitor(tmp_path, FakeBackend()), tmp_path).begin().end()
+    assert len(moved_files(directory, "ledger")) == 3 and len(moved_files(directory, "intervened")) == 2
+
+
+@requires_decision
+def test_resume_from_before_a_stop_moves_its_record_aside(tmp_path):
+    trainer = FakeTrainer()
+    first = monitor(tmp_path, FakeBackend(), rules=[rule()], mode="enforce", patience=1, trainer=trainer)
+    run = Run(first, tmp_path).begin()
+    for step in (10, 20):
+        run.evaluate(step)
+    run.end()
+    resumed = monitor(tmp_path, FakeBackend())
+    Run(resumed, tmp_path).begin(step=10).end()
+    directory = tmp_path / "monitor"
+    assert not (directory / "intervened.json").exists() and len(moved_files(directory, "intervened")) == 1
+    (aside,) = moved_files(directory, "ledger")
+    assert {r["kind"] for r in Ledger(directory / aside).read()} >= {"intervened", "verdict", "eval"}
+    assert all(r["step"] <= 10 for r in resumed.ledger.read() if r["kind"] not in ("end",))
+
+
+@requires_decision
+def test_resume_after_a_stop_is_stopped_only_by_new_verdicts(tmp_path):
+    trainer = FakeTrainer()
+    first = monitor(tmp_path, FakeBackend(stop_answer(0.99)), rules=[rule()], mode="enforce", trainer=trainer)
+    run = Run(first, tmp_path).begin()
+    assert [run.evaluate(step) for step in (10, 20, 30, 40)] == [False, False, False, True]
+    run.end()
+    # Resume from step 40 with the same rule: the streak that stopped the first run is not restored
+    second = monitor(tmp_path, FakeBackend(stop_answer(0.0)), rules=[rule()], mode="enforce", trainer=FakeTrainer())
+    run = Run(second, tmp_path).begin(step=40)
+    assert (tmp_path / "monitor" / "intervened.json").exists()  # step 40 is kept, and so is its record
+    assert [run.evaluate(step) for step in (50, 60, 70)] == [False, False, False]
+    run.end()
+    new = [r for r in kinds(second, "verdict") if r["step"] > 40]
+    assert len(new) == 2 and all(rule["streak"] == 0 for r in new for rule in r["payload"]["rules"])
+
+
+@requires_decision
+def test_persistent_nonfinite_gradients_record_transitions_only(tmp_path):
+    model = TinyModel()
+    callback = monitor(tmp_path, None, grad_norm_every=1)
+    run = Run(callback, tmp_path, model=model).begin()
+    model.set_grads(float("nan"))
+    for step in range(10):
+        run.optimizer_step(step)
+    model.set_grads(0.5)
+    run.optimizer_step(10)
+    run.end()
+    assert [r["payload"]["consecutive"] for r in kinds(callback, "sentinel")] == [1, 2]
+    (cleared,) = [r for r in kinds(callback, "note") if r["payload"]["note"] == "finite_gradients"]
+    assert cleared["step"] == 11 and cleared["payload"]["after"] == 10

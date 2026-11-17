@@ -15,6 +15,7 @@
 import copy
 import inspect
 import json
+import logging
 import math
 import os
 import threading
@@ -29,8 +30,10 @@ from transformers import TrainerCallback
 
 from .client import SystemOneClient, validate_questions
 from .digest import build_digest, json_safe
-from .ledger import Ledger
+from .ledger import Ledger, free_sibling
 
+
+logger = logging.getLogger(__name__)
 
 MODES = ("advise", "enforce")
 # A learned logit scale above this (a temperature below 1/100) is reported as a sentinel; it never stops training.
@@ -184,28 +187,35 @@ class JevMonitorCallback(TrainerCallback):
     without an attached trainer to tell, under fp16, every non-finite check is a `note`. One clean check clears the
     gradient sentinel. Before stopping, every process calls `trainer.save_model` to
     `<args.output_dir>/monitor-stop-<step>`: the save is collective under FSDP and DeepSpeed, and processes that do not
-    write return at once under DDP. The main process then checks that the directory holds a non-empty weights file, and
-    only then is the stop enforced and `intervened.json` written; otherwise training goes on and the reason is
-    recorded. It never sets `should_save`, `should_evaluate` or `should_epoch_stop`. A learned logit scale above
+    write return at once under DDP. The main process then checks that the directory holds a non-empty weights file and
+    records the stop (an `intervened` ledger record and `intervened.json`); the stop is enforced only if the weights
+    are there and at least one of the two records was written, otherwise training goes on and the reason is recorded
+    and logged. It never sets `should_save`, `should_evaluate` or `should_epoch_stop`. A learned logit scale above
     `log(100)` is recorded, never a reason to stop.
 
-    Only the main process talks to the judge and writes files. The decision to stop is sent from it to every process
-    with `broadcast`, so all processes stop at the same step. A stop is attempted at most once per step, and not at an
-    evaluation after which training ends anyway (`should_training_stop` already set, as at `max_steps`): that is
-    recorded as a `note`. Evaluations outside `train()`, or whose metrics do not carry `metric_prefix`, are ignored; an
-    evaluation that comes after a training step began and before it ended (or the pass ended) most likely follows a
+    Only the main process talks to the judge, writes files and logs. The decision to stop is sent from it to every
+    process with `broadcast`, so all processes stop at the same step. A stop is attempted at most once per step, and
+    not at an evaluation after which training ends anyway (`should_training_stop` already set, as at `max_steps`): that
+    is recorded as a `note`. Every request goes in the ledger with the digest sent (in its `answer` or `late` record).
+    The first failure of the judge and of the ledger are logged as warnings, once each, and every enforced stop and
+    failed save is logged. Evaluations outside `train()`, or whose metrics do not carry `metric_prefix`, are ignored;
+    an evaluation that comes after a training step began and before it ended (or the pass ended) most likely follows a
     `train()` that failed inside that step, and is ignored with a `note`; the monitor stays on. Several evaluations at
-    one step (a dict of evaluation datasets) are merged into one record of that step, their metrics named without the
-    prefix (`<dataset>_<metric>`); the judge is sent the merged digest if its request has not started yet, else the
-    digest of the first. Set `metric_prefix` (for example `"eval_validation"`) to watch one dataset only. When training
-    resumes, ledger records after the resumed step are dropped and the streaks are rebuilt from the rest. No hook
-    raises into the Trainer: errors are recorded in the ledger.
+    one step (a dict of evaluation datasets) are merged into the history of that step, their metrics named
+    `<dataset>_<metric>`, but the judge's request for the step usually starts with the first evaluation and then covers
+    the first dataset only: a `note` and a warning say so, once per run. Set `metric_prefix` (for example
+    `"eval_validation"`) to watch one dataset. No hook raises into the Trainer: errors are recorded in the ledger.
+
+    When training starts at step S > 0 (a resume), the ledger keeps the records up to S, and the history and the
+    streaks are rebuilt from them; streaks end at an `intervened` record, so a run resumed after a stop is stopped
+    again only by new verdicts. Later records are moved to a new file beside the ledger (`ledger.moved-<time>.jsonl`),
+    never deleted, as is an `intervened.json` of a later step; a `note` record says so. A run that starts at step 0 in
+    a reused directory moves all the earlier records aside the same way.
 
     Limits: under FSDP the main process sees only its own shard of the gradients, and under DeepSpeed ZeRO the
     gradients may not be available to callbacks, so the gradient check may see nothing; a zero-dimensional scale
     parameter that is sharded is not found. The main process may finish up to `finish_timeout` seconds after the
-    others. Resuming does not apply the verdict on the evaluation of the checkpoint's own step. A reused output
-    directory keeps the earlier ledger records up to the step training starts or resumes from. A failed `train()` is
+    others. Resuming does not apply the verdict on the evaluation of the checkpoint's own step. A failed `train()` is
     detected only when it failed inside a training step: after a failure after `on_step_end` (in an evaluation during
     training, while saving a checkpoint, logging or in another callback) or while loading a batch, a later standalone
     `evaluate()` is recorded and sent to the judge as if it were part of training.
@@ -365,6 +375,9 @@ class JevMonitorCallback(TrainerCallback):
         self._last_eval_step: int | None = None
         self._high_scales: set[str] = set()
         self._control_warned = False
+        self._ledger_warned = False
+        self._backend_warned = False
+        self._merge_noted = False
 
     def attach(self, trainer) -> "JevMonitorCallback":
         """Give the callback the trainer it saves with before an enforced stop, and add it to the trainer's callbacks."""
@@ -373,14 +386,22 @@ class JevMonitorCallback(TrainerCallback):
             trainer.add_callback(self)
         return self
 
-    def _record(self, kind: str, step: int, payload: dict) -> None:
-        """Ledger a record from the main process; never raises."""
+    def _record(self, kind: str, step: int, payload: dict) -> bool:
+        """Ledger a record from the main process; never raises. Returns whether it was written."""
         if not self._rank0 or self.ledger is None:
-            return
+            return False
         try:
-            self.ledger.append(kind, step, payload)
+            written = self.ledger.append(kind, step, payload)
         except Exception:  # noqa: BLE001 - Ledger.append does not raise; this is a last guard
-            pass
+            written = False
+        if not written and not self._ledger_warned:
+            self._ledger_warned = True
+            logger.warning(
+                "The Jev monitor cannot write its ledger %s (%s); training goes on, and this is not logged again.",
+                self.ledger.path,
+                self.ledger.last_error,
+            )
+        return written
 
     def _error(self, where: str, step: Any, error: BaseException) -> None:
         try:
@@ -433,7 +454,12 @@ class JevMonitorCallback(TrainerCallback):
             answers, error = None, f"the backend returned a {type(answers).__name__}, not a mapping"
         if answers is None and error is None:
             error = getattr(self.backend, "last_error", None) or "the backend gave no answer"
-        payload = {"answers": answers, "error": error, "seconds": round(time.monotonic() - started, 3)}
+        payload = {
+            "answers": answers,
+            "error": error,
+            "seconds": round(time.monotonic() - started, 3),
+            "digest": digest,  # exactly what was sent, at most `budget_bytes`
+        }
         # Recorded under the lock, so nothing is written once `on_train_end` has closed the worker
         with self._cond:
             if not self._active or generation != self._generation:  # training ended, or another run started
@@ -443,6 +469,15 @@ class JevMonitorCallback(TrainerCallback):
             if not late:
                 self._results[step] = answers
             self._record("late" if late else "answer", step, payload)
+            warn = answers is None and not self._backend_warned
+            self._backend_warned = self._backend_warned or warn
+        if warn:
+            logger.warning(
+                "The Jev monitor's judge gave no answer for the evaluation at step %d (%s). Training goes on; later "
+                "failures are only recorded in the ledger.",
+                step,
+                str(error)[:200],
+            )
 
     def wait(self, timeout: float = 5.0) -> bool:
         """
@@ -502,28 +537,56 @@ class JevMonitorCallback(TrainerCallback):
             self._error("on_train_begin", step, e)
 
     def _resume(self, step: int) -> None:
+        """
+        Keep the ledger records up to `step` and rebuild the history and the streaks from them. Later records, and an
+        `intervened.json` of a later step, are moved aside, never deleted. A run that starts at step 0 keeps nothing.
+        """
         records = self.ledger.read()
-        if not records:
-            return
-        self.ledger.truncate_after(step)
-        records = [r for r in records if isinstance(r.get("step"), int) and r["step"] <= step]
+        cutoff = step if step > 0 else -1
+        moved_to = self.ledger.truncate_after(cutoff) if records else None
+        kept = [r for r in records if isinstance(r.get("step"), int) and r["step"] <= cutoff]
+        json_to = None
+        intervened = self.ledger.path.parent / "intervened.json"
+        if intervened.exists():
+            try:
+                stale_step = json.loads(intervened.read_text(encoding="utf-8")).get("step")
+            except (ValueError, AttributeError, UnicodeDecodeError):
+                stale_step = None
+            if not isinstance(stale_step, int) or stale_step > cutoff:
+                json_to = free_sibling(intervened)
+                os.replace(intervened, json_to)
+        if moved_to is not None or json_to is not None:
+            note = {
+                "note": "earlier_records_moved",
+                "reason": f"training starts at step {step}: later records of an earlier run are kept aside",
+                "records": len(records) - len(kept),
+                "to": None if moved_to is None else str(moved_to),
+                "intervened_json_to": None if json_to is None else str(json_to),
+            }
+            self._record("note", step, note)
+            logger.info("The Jev monitor moved earlier records aside: %s", note)
         keys = [(rule.question, rule.option, rule.threshold) for rule in self.stop_when]
-        for record in records:
+        for record in kept:
             payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
-            if record.get("kind") == "eval" and isinstance(payload.get("metrics"), dict):
+            kind = record.get("kind")
+            if kind == "eval" and isinstance(payload.get("metrics"), dict):
                 if self._history and self._history[-1]["step"] == record["step"]:  # several datasets, one step
                     self._history[-1].update(payload["metrics"])
                 else:
                     self._history.append({"step": record["step"], **payload["metrics"]})
-            elif record.get("kind") == "verdict" and isinstance(payload.get("rules"), list):
+            elif kind == "verdict" and isinstance(payload.get("rules"), list):
                 for entry in payload["rules"]:
                     if not isinstance(entry, dict):
                         continue
                     key = (entry.get("question"), entry.get("option"), entry.get("threshold"))
                     if key in keys:
                         self._update_streak(keys.index(key), payload.get("for_step"), entry.get("probability"))
+            elif kind == "intervened":  # that run was stopped: only new verdicts can stop this one
+                for streak in self._streaks:
+                    streak.clear()
         self._history = self._history[-_HISTORY_LIMIT:]
-        self._record("resume", step, {"from_step": step, "kept_records": len(records)})
+        if kept:
+            self._record("resume", step, {"from_step": step, "kept_records": len(kept)})
 
     def on_step_begin(self, args, state, control, **kwargs):
         self._armed = False
@@ -550,6 +613,8 @@ class JevMonitorCallback(TrainerCallback):
                 self._grad_check = {"step": step, "groups": bad}
             elif norms:
                 self._grad_norms = {name: math.sqrt(value) for name, value in norms.items()}
+                if self._grad_streak:  # only transitions are recorded
+                    self._record("note", step, {"note": "finite_gradients", "after": self._grad_streak})
                 self._grad_streak, self._grad_sentinel = 0, None
         except Exception as e:  # noqa: BLE001
             self._error("on_pre_optimizer_step", getattr(state, "global_step", 0), e)
@@ -570,7 +635,8 @@ class JevMonitorCallback(TrainerCallback):
                 return
             self._grad_streak += 1
             sentinel = {"sentinel": "nonfinite_gradients", **check, "consecutive": self._grad_streak}
-            self._record("sentinel", check["step"], sentinel)
+            if self._grad_streak in (1, self.patience_gradients):  # transitions only, not every check of a long run
+                self._record("sentinel", check["step"], sentinel)
             if self._grad_streak >= self.patience_gradients and self._grad_sentinel is None:
                 self._grad_sentinel = sentinel
         except Exception as e:  # noqa: BLE001
@@ -734,17 +800,30 @@ class JevMonitorCallback(TrainerCallback):
         self._record("eval", step, {"metrics": entry})
 
         if self._ask is not None:
+            merged = False
             with self._cond:
                 if same_step:
                     # Send the merged digest if this step's request has not started; else it covers the first part
                     if self._job is not None and self._job[1] == step:
                         self._job = (self._generation, step, digest)
+                        merged = True
                 else:
                     if self._job is not None:  # an older request never started: it was already recorded missing
                         self._discarded.discard(self._job[1])
                     self._job = (self._generation, step, digest)
                 self._cond.notify_all()
             self._pending_step = step
+            if same_step and not self._merge_noted:
+                self._merge_noted = True
+                reason = "several evaluations at one step (a dict of evaluation datasets): " + (
+                    "this one was merged into the judge's request, which had not started yet, but a request that "
+                    "has started covers the first dataset only"
+                    if merged
+                    else "the judge's request already sent covers the first dataset only"
+                )
+                reason += "; set metric_prefix (for example 'eval_validation') to watch one dataset"
+                self._record("note", step, {"note": "several_evaluations", "merged": merged, "reason": reason})
+                logger.warning("Jev monitor: %s.", reason)
 
         if self._stopped:
             return None
@@ -845,7 +924,11 @@ class JevMonitorCallback(TrainerCallback):
     # -- decision (every process) ------------------------------------------------------------------------------
 
     def _decide(self, args, control, step: int, proposal: dict | None) -> None:
-        """Every process: receive rank 0's decision, save, and set `should_training_stop` identically."""
+        """
+        Every process: receive rank 0's decision, save, and set `should_training_stop` identically. The main process
+        then checks the checkpoint and records the stop, and the stop is enforced only if both the checkpoint and at
+        least one record of it (the ledger line or `intervened.json`) exist: that is what it broadcasts.
+        """
         try:
             decision = self._broadcast(proposal if self._rank0 else None)
         except Exception as e:  # noqa: BLE001
@@ -858,38 +941,68 @@ class JevMonitorCallback(TrainerCallback):
         if not isinstance(checkpoint, str) or not checkpoint:
             checkpoint = f"{getattr(args, 'output_dir', '.')}/monitor-stop-{step}"
         saved, error = self._save(checkpoint)
-        if saved and self._rank0:
+        ready = False
+        if self._rank0:
             # Nothing on the main process may raise before the second broadcast: the others wait in it
-            try:
-                if not _has_weights(checkpoint):
-                    saved, error = False, f"save_model wrote no weights file to {checkpoint}"
-            except Exception as e:  # noqa: BLE001 - an unreadable checkpoint is not a saved one
-                saved, error = False, f"cannot check the checkpoint: {type(e).__name__}: {e}"[:500]
+            ready, error = self._check_and_record(decision, step, checkpoint, saved, error)
         try:
-            saved = self._broadcast(saved if self._rank0 else None)
+            ready = self._broadcast(ready if self._rank0 else None)
         except Exception as e:  # noqa: BLE001
             self._error("broadcast", step, e)
             return
-        if saved is not True:
-            self._record(
-                "error",
-                step,
-                {"where": "save", "error": error or "the checkpoint was not saved", "checkpoint": checkpoint},
-            )
+        if ready is not True:
             return
+        self._stopped = True
+        control.should_training_stop = True
+        if self._rank0:
+            reason = decision.get("reason")
+            logger.warning(
+                "The Jev monitor stopped training at step %d (%s); the model is saved in %s.", step, reason, checkpoint
+            )
+
+    def _check_and_record(
+        self, decision: dict, step: int, checkpoint: str, saved: bool, error: str | None
+    ) -> tuple[bool, str | None]:
+        """Main process: whether the checkpoint holds weights and the stop was recorded. Never raises."""
+        try:
+            if saved and not _has_weights(checkpoint):
+                saved, error = False, f"save_model wrote no weights file to {checkpoint}"
+        except Exception as e:  # noqa: BLE001 - an unreadable checkpoint is not a saved one
+            saved, error = False, f"cannot check the checkpoint: {_describe(e)}"[:500]
+        if not saved:
+            error = error or "the checkpoint was not saved"
+            self._record("error", step, {"where": "save", "error": error, "checkpoint": checkpoint})
+            logger.warning(
+                "The Jev monitor could not save %s before stopping at step %d (%s); training goes on.",
+                checkpoint,
+                step,
+                error,
+            )
+            return False, error
         record = {**decision, "step": step, "checkpoint": checkpoint, "mode": self.mode}
-        if self._rank0 and self.ledger is not None:
+        written_json = False
+        if self.ledger is not None:
             try:
                 directory = self.ledger.path.parent
                 directory.mkdir(parents=True, exist_ok=True)
                 tmp = directory / "intervened.json.tmp"
                 tmp.write_text(json.dumps(json_safe(record), indent=2, allow_nan=False) + "\n", encoding="utf-8")
                 os.replace(tmp, directory / "intervened.json")
-            except Exception as e:  # noqa: BLE001 - the checkpoint exists: the stop stands
+                written_json = True
+            except Exception as e:  # noqa: BLE001
                 self._error("intervened.json", step, e)
-            self._record("intervened", step, record)
-        self._stopped = True
-        control.should_training_stop = True
+        written_line = self._record("intervened", step, record)
+        if not (written_json or written_line):
+            logger.error(
+                "The Jev monitor would stop training at step %d (%s), but can write neither its ledger nor "
+                "intervened.json in %s: the stop is not enforced and training goes on. The model was saved in %s.",
+                step,
+                decision.get("reason"),
+                None if self.ledger is None else self.ledger.path.parent,
+                checkpoint,
+            )
+            return False, "the stop could not be recorded"
+        return True, None
 
     def _save(self, checkpoint: str) -> tuple[bool, str | None]:
         """

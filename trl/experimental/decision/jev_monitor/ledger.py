@@ -88,16 +88,53 @@ class Ledger:
                     records.append(record)
         return records
 
-    def truncate_after(self, step: int) -> None:
-        """Drop every record whose step is greater than `step`, as when training resumes from an earlier checkpoint."""
+    def truncate_after(self, step: int) -> Path | None:
+        """
+        Move every record whose step is greater than `step` out of the ledger, as when training resumes from an earlier
+        checkpoint. Nothing is deleted: the moved lines, and any line that is not a valid record, go to a new sibling
+        file `<stem>.moved-<time>[-<n>]<suffix>` that is never overwritten, and are flushed to disk before the ledger
+        is rewritten.
+
+        Returns:
+            `Path` or `None`: the file the records were moved to, or `None` when there was nothing to move.
+        """
         with self._lock:
             if not self.path.exists():
-                return
-            kept = [r for r in self._read() if isinstance(r.get("step"), int) and r["step"] <= step]
+                return None
+            kept, moved = [], []
+            with open(self.path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.rstrip("\n")
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        record = None
+                    keep = isinstance(record, dict) and isinstance(record.get("step"), int) and record["step"] <= step
+                    (kept if keep else moved).append(line + "\n")
+            if not moved:
+                return None
+            aside = free_sibling(self.path)
+            with open(aside, "x", encoding="utf-8") as f:
+                f.writelines(moved)
+                f.flush()
+                os.fsync(f.fileno())
             tmp = self.path.with_name(self.path.name + ".tmp")
             with open(tmp, "w", encoding="utf-8") as f:
-                for record in kept:
-                    f.write(json.dumps(record, allow_nan=False, separators=(",", ":")) + "\n")
+                f.writelines(kept)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.path)
+            return aside
+
+
+def free_sibling(path: str | os.PathLike) -> Path:
+    """A path beside `path` that does not exist yet: `<stem>.moved-<time><suffix>`, then `-1`, `-2`, ... if taken."""
+    path = Path(path)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for n in range(10000):
+        candidate = path.with_name(f"{path.stem}.moved-{stamp}{'' if n == 0 else f'-{n}'}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(f"no free name beside {path}")
