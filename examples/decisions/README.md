@@ -46,9 +46,13 @@ becomes a new head's backbone. Backbone weights are never newly initialised and 
 checkpoint stores its backbone under a prefix (the UltraBERT reranker package keeps `backbone.<name>` next to its
 `pair_head`), the backbone is read from its safetensors under the one prefix that holds every weight with its shape,
 the other tensors are dropped, and the start-up line says `backbone weights: prefix "backbone."` (or `direct`) with
-what was dropped; missing weights or several candidate prefixes raise instead. `max_length` with `truncation: error|skip` handles over-length prompts, and `permute_fields`
-shuffles the question order of training batches only. The script prints a build report of rows, questions and skipped
-records. Nullable questions and activation checkpointing are unsupported. The collator returns `rows_per_example`, the
+what was dropped; missing weights or several candidate prefixes raise instead. `truncation` decides what happens to a
+prompt longer than `max_length`: `state` (the configuration's choice, as Clef itself does) cuts the end of the record's
+state so the prompt is exactly `max_length` tokens, never touching its questions or options, and skips a record that
+is too long even without its state; `skip` drops over-length records; `error` stops at the first one. `skip` and
+`state` also skip invalid records. `permute_fields` shuffles the question order of training batches only (a permuted
+prompt is cut the same way). The script prints a build report of rows, questions, skipped records by reason, and
+records whose state was cut (`truncated`). Nullable questions and activation checkpointing are unsupported. The collator returns `rows_per_example`, the
 number of questions of each record, so `DecisionTrainer` gathers whole records and the example runs on several
 processes:
 

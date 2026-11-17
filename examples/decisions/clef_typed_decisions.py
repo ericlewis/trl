@@ -81,6 +81,18 @@ def clef_decision_config():
     return ClefConfig.prompt_decision_config("chatml")
 
 
+def common_prefix_length(first: list, second: list) -> int:
+    """The number of leading items `first` and `second` have in common."""
+    return next(
+        (index for index, (a, b) in enumerate(zip(first, second, strict=False)) if a != b),
+        min(len(first), len(second)),
+    )
+
+
+class SchemaTooLongError(ValueError):
+    """A prompt is longer than `max_length` even without its state, so cutting the state cannot make it fit."""
+
+
 @dataclass
 class DataCollatorForClef(DataCollatorForDecision):
     """
@@ -107,12 +119,21 @@ class DataCollatorForClef(DataCollatorForDecision):
             Maximum number of tokens of a prompt.
         truncation (`str`, *optional*, defaults to `"error"`):
             What to do with a record whose prompt is longer than `max_length`, or whose request or targets are
-            invalid: reject it (`"error"`) or mark it as skipped (`"skip"`) under a reason that does not depend on
-            the record. Prompts are never cut, since that would remove options or questions.
+            invalid:
+
+            - `"error"`: raise.
+            - `"skip"`: mark it as skipped under a reason that does not depend on the record.
+            - `"state"`: as Clef does, cut the end of the state of an over-length prompt so that it is exactly
+              `max_length` tokens, keeping everything else of the prompt (its questions and options) and the targets;
+              the record is marked `truncated`. A record whose prompt is too long even without its state is skipped
+              (`"schema longer than max_length (N tokens)"`), as are invalid records.
+
+            Only the state is ever cut, since cutting anything else would remove options or questions.
         permute_fields (`bool`, *optional*, defaults to `False`):
             Keep the request of each record and re-render it with its questions in a new random order every time it
             is batched. Only records tokenized by a collator with `permute_fields` are permuted, so evaluation uses
-            a separate collator without it. A re-render that fails, or that no longer matches the targets, raises.
+            a separate collator without it. A re-render that fails, or that no longer matches the targets, raises; so
+            does an over-length one, unless `truncation="state"` cuts its state.
         seed (`int`, *optional*, defaults to `3407`):
             Seed of the permutations, combined with the seed of the dataloader worker and the process rank.
     """
@@ -127,8 +148,8 @@ class DataCollatorForClef(DataCollatorForDecision):
     def __post_init__(self):
         if self.max_length < 1:
             raise ValueError("max_length must be positive")
-        if self.truncation not in {"error", "skip"}:
-            raise ValueError("truncation must be error or skip")
+        if self.truncation not in {"error", "skip", "state"}:
+            raise ValueError("truncation must be error, skip or state")
 
     @staticmethod
     def _request(example: dict[str, Any]) -> dict[str, Any]:
@@ -138,10 +159,10 @@ class DataCollatorForClef(DataCollatorForDecision):
             request["questions"] = json.loads(request["questions"])
         return request
 
-    def _features(self, inputs, questions, labels):
+    def _features(self, input_ids, marks, questions, labels):
         return {
-            "input_ids": inputs["input_ids"][0].tolist(),
-            "marks": inputs["marks"].tolist(),
+            "input_ids": input_ids,
+            "marks": marks,
             "num_options": [len(question.options) for question in questions],
             "question_type_ids": [Question.questions_types.index(question.type) for question in questions],
             "labels": labels,
@@ -149,20 +170,75 @@ class DataCollatorForClef(DataCollatorForDecision):
         }
 
     def _skip(self, reason: str, error: Exception) -> dict[str, Any]:
-        """Raise `error`, or with `truncation="skip"` return a skipped record with the empty lists and `reason`."""
+        """
+        Raise `error`, or with `truncation="skip"` or `"state"` return a skipped record with the empty lists and
+        `reason`.
+        """
         if self.truncation == "error":
             raise error
         empty = {key: [] for key in ("input_ids", "marks", "num_options", "question_type_ids", "labels", "is_choice")}
-        return {**empty, "skip": True, "reason": reason, **({"request": ""} if self.permute_fields else {})}
+        skipped = {**empty, "skip": True, "reason": reason, "truncated": False}
+        return {**skipped, **({"request": ""} if self.permute_fields else {})}
+
+    def _render(self, request: dict[str, Any]) -> tuple[list[int], list[int], list]:
+        """The `input_ids`, `marks` and questions of the one prompt of `request`."""
+        prompts = self.decision_config.prepare_inputs(request, self.tokenizer)
+        if len(prompts) != 1:
+            raise ValueError(f"The template renders {len(prompts)} prompts; Clef needs all questions in one")
+        inputs, questions = prompts[0]
+        return inputs["input_ids"][0].tolist(), inputs["marks"].tolist(), questions
+
+    def _cut_state(self, request, input_ids, marks) -> tuple[list[int], list[int]]:
+        """
+        Cut the end of the state of the over-length prompt `input_ids` of `request` so that it is exactly `max_length`
+        tokens, and move `marks` with it. Raises a `SchemaTooLongError` when the prompt is too long without its state.
+
+        The template renders the state between `<|split|>` sentinels, so the tokens before and after it do not depend
+        on it: the request rendered with an empty state is exactly those tokens, and the prompt must start and end with
+        them (with its marks after the state), or this raises rather than cutting by guess. The state starts at the one
+        split of the prompt into that beginning, the state and that end. When several splits fit (the state begins
+        with the tokens that follow it, or ends with those before it), two renderings whose states differ in their
+        first token tell where it starts.
+        """
+        empty, empty_marks, _ = self._render({**request, "state": ""})
+        if len(empty) > self.max_length:
+            raise SchemaTooLongError(
+                f"A record is longer than max_length even without its state ({len(empty)} > {self.max_length} "
+                "tokens); increase max_length"
+            )
+        state_length = len(input_ids) - len(empty)
+        # The starts of the state for which the prompt is the empty rendering with `state_length` tokens inserted
+        latest = common_prefix_length(input_ids, empty)
+        earliest = len(empty) - common_prefix_length(input_ids[::-1], empty[::-1])
+        start = earliest
+        if earliest < latest:
+            first, _, _ = self._render({**request, "state": "a"})
+            second, _, _ = self._render({**request, "state": "b"})
+            start = common_prefix_length(first, second)
+        if (
+            state_length <= 0
+            or not earliest <= start <= latest
+            or [mark - state_length for mark in marks] != empty_marks
+            or any(mark < start for mark in empty_marks)
+        ):
+            raise ValueError(
+                "The template does not render the state on its own between <|split|> sentinels, so the state of an "
+                "over-length prompt cannot be cut; use truncation='error' or 'skip'"
+            )
+        end, overflow = start + state_length, len(input_ids) - self.max_length
+        return input_ids[: end - overflow] + input_ids[end:], [mark - overflow for mark in marks]
 
     def tokenize(self, example: dict[str, Any]) -> dict[str, Any]:
         """Render and tokenize one record with the native Transformers template.
 
         Returns `input_ids`, `marks`, `num_options`, `question_type_ids`, `labels` (the target distribution of each
-        question over its options), `is_choice`, `skip` and `reason`, plus the `request` when `permute_fields`. A
-        record that is too long, whose request is invalid, that asks a nullable question or whose targets cannot be
-        used raises, or with `truncation="skip"` returns `skip=True`, the empty lists and one of the reasons
-        `"longer than max_length (N tokens)"`, `"invalid request"`, `"nullable question"` and `"unusable targets"`.
+        question over its options), `is_choice`, `skip`, `reason` and `truncated` (whether the state was cut), plus the
+        `request` when `permute_fields`. A record that is too long, whose request is invalid, that asks a nullable
+        question or whose targets cannot be used raises, or with `truncation="skip"` returns `skip=True`, the empty
+        lists and one of the reasons `"longer than max_length (N tokens)"`, `"invalid request"`, `"nullable
+        question"` and `"unusable targets"`. With `truncation="state"`, an over-length record has the end of its state
+        cut instead, and one that is too long without its state is skipped with `"schema longer than max_length (N
+        tokens)"`.
         """
         try:
             request = self._request(example)
@@ -178,12 +254,9 @@ class DataCollatorForClef(DataCollatorForDecision):
                 return self._skip("nullable question", error)
         # The request is rendered (and its questions validated) once, then the targets are read for its questions
         try:
-            prompts = self.decision_config.prepare_inputs(request, self.tokenizer)
-            if len(prompts) != 1:
-                raise ValueError(f"The template renders {len(prompts)} prompts; Clef needs all questions in one")
+            input_ids, marks, questions = self._render(request)
         except ValueError as error:
             return self._skip("invalid request", error)
-        inputs, questions = prompts[0]
         try:
             targets = self.prepare_targets(example, questions)
         except ValueError as error:
@@ -194,16 +267,21 @@ class DataCollatorForClef(DataCollatorForDecision):
                 return self._skip("nullable question", error)
         if self.permute_fields and [question.name for question in questions] != list(request["questions"]):
             raise ValueError("permute_fields needs a template that renders the questions in the order of the request")
-        length = inputs["input_ids"].shape[-1]
-        if length > self.max_length:
+        truncated = len(input_ids) > self.max_length
+        if truncated and self.truncation != "state":
             error = ValueError(
-                f"A record is longer than max_length ({length} > {self.max_length} tokens); increase max_length or "
-                "set truncation='skip'"
+                f"A record is longer than max_length ({len(input_ids)} > {self.max_length} tokens); increase "
+                "max_length or set truncation='state' or 'skip'"
             )
             return self._skip(f"longer than max_length ({self.max_length} tokens)", error)
+        if truncated:
+            try:
+                input_ids, marks = self._cut_state(request, input_ids, marks)
+            except SchemaTooLongError as error:
+                return self._skip(f"schema longer than max_length ({self.max_length} tokens)", error)
         # The null column is dropped: Clef has no null output
-        features = self._features(inputs, questions, [list(target[1:]) for target in targets])
-        features |= {"skip": False, "reason": ""}
+        features = self._features(input_ids, marks, questions, [list(target[1:]) for target in targets])
+        features |= {"skip": False, "reason": "", "truncated": truncated}
         if self.permute_fields:
             features["request"] = json.dumps(request)
         return features
@@ -229,20 +307,19 @@ class DataCollatorForClef(DataCollatorForDecision):
         self._shuffler().shuffle(order)
         permuted = {**request, "questions": {names[i]: request["questions"][names[i]] for i in order}}
         try:
-            prompts = self.decision_config.prepare_inputs(permuted, self.tokenizer)
+            input_ids, marks, questions = self._render(permuted)
         except Exception as error:
             raise ValueError(f"Re-rendering a request with permuted questions failed: {error}") from error
-        if len(prompts) != 1:
-            raise ValueError("The template must render all questions in one prompt")
-        inputs, questions = prompts[0]
         if [question.name for question in questions] != [names[i] for i in order]:
             raise ValueError("The permuted prompt does not list the questions in the permuted order")
         labels = [feature["labels"][i] for i in order]
         if [len(question.options) for question in questions] != [len(row) for row in labels]:
             raise ValueError("The options of a permuted question no longer match its labels")
-        if inputs["input_ids"].shape[-1] > self.max_length:
-            raise ValueError(f"A permuted prompt is longer than max_length ({self.max_length} tokens)")
-        return {**feature, **self._features(inputs, questions, labels)}
+        if len(input_ids) > self.max_length:
+            if self.truncation != "state":
+                raise ValueError(f"A permuted prompt is longer than max_length ({self.max_length} tokens)")
+            input_ids, marks = self._cut_state(permuted, input_ids, marks)
+        return {**feature, **self._features(input_ids, marks, questions, labels)}
 
     def torch_call(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         if "input_ids" not in features[0]:
@@ -344,7 +421,11 @@ class ClefScriptArguments(ScriptArguments):
     )
     max_length: int = field(default=2048, metadata={"help": "Maximum prompt token length."})
     truncation: str = field(
-        default="error", metadata={"help": "Over-length or invalid records: error, or skip and count them."}
+        default="error",
+        metadata={
+            "help": "Over-length or invalid records: error; skip and count them; or state, which cuts the end of the "
+            "state of an over-length record to fit (as Clef does) and skips the rest."
+        },
     )
     permute_fields: bool = field(default=False, metadata={"help": "Shuffle the question order of training prompts."})
 
@@ -622,6 +703,7 @@ def prepare_split(dataset, collator, training_args, desc):
         "is_choice": Sequence(Value("bool")),
         "skip": Value("bool"),
         "reason": Value("string"),
+        "truncated": Value("bool"),
     }
     if collator.permute_fields:
         features["request"] = Value("string")
@@ -633,13 +715,15 @@ def prepare_split(dataset, collator, training_args, desc):
             desc=f"Tokenizing {desc} dataset",
         )
         reasons = Counter(reason for reason in tokenized["reason"] if reason)
-        tokenized = tokenized.filter(lambda skip: not skip, input_columns="skip").remove_columns(["skip", "reason"])
+        truncated = sum(tokenized["truncated"])
+        tokenized = tokenized.filter(lambda skip: not skip, input_columns="skip")
+        tokenized = tokenized.remove_columns(["skip", "reason", "truncated"])
     report = {
         "rows": len(dataset),
         "questions": sum(len(counts) for counts in tokenized["num_options"]),
         "skipped": dict(reasons),
-        # Prompts are never cut: an over-length record is rejected or skipped
-        "truncated": 0,
+        # The records whose state was cut to fit (truncation="state"); nothing else of a prompt is ever cut
+        "truncated": truncated,
     }
     if training_args.process_index == 0:
         print(f"Build report ({desc}): {json.dumps(report)}")

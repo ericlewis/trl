@@ -91,9 +91,15 @@ backbone of a new head. A causal LM reads its last token with Clef's ChatML prom
 (per question `target_index`, `target_probs`, `p_true` or `score`) or `gold` / `answers` (per question a label or
 probabilities), through `DataCollatorForDecision.prepare_request`. The example collator `DataCollatorForClef` returns
 one row of `labels` and `option_mask` per question, with the questions of all records of a batch one after the other.
-Nullable questions raise: Clef has no coverage output. A prompt longer than `max_length`, an invalid request, a nullable question or unusable targets raise, or with
-`truncation: skip` the record is dropped and counted in the build report the script prints (rows, questions, skipped by reason, truncated). With `permute_fields`, each training batch re-renders its prompts with the questions in a new
-random order, each keeping its target; evaluation never does. Activation checkpointing (`gradient_checkpointing: true`) covers the backbone and the head. The collator returns `rows_per_example`, so the
+Nullable questions raise: Clef has no coverage output. `truncation` has three modes. With `error`, a prompt longer than
+`max_length`, an invalid request, a nullable question or unusable targets raise. With `skip`, such a record is dropped
+and counted by reason in the build report the script prints (rows, questions, skipped by reason, truncated). With
+`state`, the configuration's choice and what Clef itself does, an over-length record keeps its whole prompt but the end
+of its state, cut so that the prompt is exactly `max_length` tokens: the questions, options and targets are never cut,
+and the build report counts these records as `truncated`. A record too long even without its state is skipped
+(`schema longer than max_length`), as are invalid records. With `permute_fields`, each training batch re-renders its
+prompts with the questions in a new random order, each keeping its target (and cut the same way); evaluation never
+does. Activation checkpointing (`gradient_checkpointing: true`) covers the backbone and the head. The collator returns `rows_per_example`, so the
 example also runs on several processes:
 
 ```bash

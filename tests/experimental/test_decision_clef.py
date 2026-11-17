@@ -64,6 +64,8 @@ QUESTIONS = {
 }
 INSTRUCTIONS = {question["instructions"]: name for name, question in QUESTIONS.items()}
 LONG_ROW = {"state": "word " * 200, "questions": QUESTIONS, "gold": {"refund": True, "team": "zeta", "urgency": 0}}
+# A long state of distinct words, so that a cut shows which end of the state was kept
+VARIED_ROW = {**LONG_ROW, "state": " ".join(f"item{index} costs {index * 7}" for index in range(80))}
 
 
 def make_row(index, names=("refund", "team", "urgency")):
@@ -223,6 +225,29 @@ def question_names(tokenizer, batch, row):
         names.append(next(name for instruction, name in INSTRUCTIONS.items() if instruction in text))
         position += 2 * (1 + count)
     return names
+
+
+def marked_spans(tokenizer, features):
+    """The text of every instruction and option span of a tokenized record, read through its marks."""
+    marks, input_ids = features["marks"], features["input_ids"]
+    return [tokenizer.decode(input_ids[start:end]) for start, end in zip(marks[::2], marks[1::2], strict=False)]
+
+
+def state_layout(tokenizer, collator, row):
+    """
+    The untruncated features of `row`, the tokens of its state (a string between sentinels, so tokenized on its own)
+    and where they start, found independently of the collator's own search.
+    """
+    full = collator.tokenize(row)
+    state_ids = tokenizer(row["state"], add_special_tokens=False)["input_ids"]
+    input_ids = full["input_ids"]
+    starts = [
+        start
+        for start in range(len(input_ids) - len(state_ids) + 1)
+        if input_ids[start : start + len(state_ids)] == state_ids
+    ]
+    assert len(starts) == 1
+    return full, state_ids, starts[0]
 
 
 class TestDataCollatorForClef:
@@ -413,6 +438,151 @@ class TestDataCollatorForClef:
         assert features["labels"][1] == [0.0, 1.0]
         assert features["labels"][2] == [0.0, 1.0, 0.0]
 
+    def test_state_truncation_leaves_fitting_records(self, tokenizer, decision_config):
+        strict = DataCollatorForClef(tokenizer, decision_config)
+        cutting = DataCollatorForClef(tokenizer, decision_config, truncation="state")
+        rows = [make_row(0), make_row(1, names=("team",)), {**make_row(2), "state": {"ticket": 2, "body": "hi"}}]
+        for row in rows:
+            features = cutting.tokenize(row)
+            assert features == strict.tokenize(row)
+            assert features["truncated"] is False and features["skip"] is False
+
+    @pytest.mark.parametrize("prompt_style", ["chatml", "plain"])
+    def test_state_truncation_cuts_the_end_of_the_state(self, tokenizer, prompt_style):
+        if prompt_style == "plain":  # the encoder prompt, between [CLS] and [SEP]
+            tokenizer = encoder_tokenizer(tokenizer)
+        decision_config = ClefConfig.prompt_decision_config(prompt_style)
+        unlimited = DataCollatorForClef(tokenizer, decision_config, max_length=100_000)
+        full, state_ids, start = state_layout(tokenizer, unlimited, VARIED_ROW)
+        length, end = len(full["input_ids"]), start + len(state_ids)
+        schema_only = len(unlimited.tokenize({**VARIED_ROW, "state": ""})["input_ids"])
+        assert schema_only == length - len(state_ids)
+        if prompt_style == "plain":
+            assert full["input_ids"][0] == tokenizer.cls_token_id and full["input_ids"][-1] == tokenizer.sep_token_id
+        for max_length in (schema_only, schema_only + 1, schema_only + 17, length - 1):
+            collator = DataCollatorForClef(tokenizer, decision_config, max_length=max_length, truncation="state")
+            cut = collator.tokenize(VARIED_ROW)
+            assert cut["skip"] is False and cut["truncated"] is True
+            input_ids, kept = cut["input_ids"], max_length - schema_only
+            assert len(input_ids) == max_length
+            # The prompt before the state and the schema after it are untouched
+            assert input_ids[:start] == full["input_ids"][:start]
+            assert input_ids[start + kept :] == full["input_ids"][end:]
+            # The state keeps its beginning: a strict prefix of its tokens
+            assert input_ids[start : start + kept] == state_ids[:kept] and kept < len(state_ids)
+            # Every instruction and option span reads the same text, through marks moved by the cut
+            assert cut["marks"] == [mark - (length - max_length) for mark in full["marks"]]
+            assert marked_spans(tokenizer, cut) == marked_spans(tokenizer, full)
+            for key in ("labels", "num_options", "question_type_ids", "is_choice"):
+                assert cut[key] == full[key], key
+        # A record that fits is left as it is, and not counted as truncated
+        fitting = DataCollatorForClef(tokenizer, decision_config, max_length=length, truncation="state")
+        assert fitting.tokenize(VARIED_ROW) == full
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            # The state ends with the tokens before it, or begins with those after it: several splits fit
+            VARIED_ROW["state"] + "\nSTATE:\n",
+            "\n\nSCHEMA FIELDS:\n" + VARIED_ROW["state"],
+        ],
+    )
+    def test_state_truncation_finds_an_ambiguous_state(self, tokenizer, decision_config, state, monkeypatch):
+        row = {**VARIED_ROW, "state": state}
+        unlimited = DataCollatorForClef(tokenizer, decision_config, max_length=100_000)
+        full, state_ids, start = state_layout(tokenizer, unlimited, row)
+        schema_only = len(full["input_ids"]) - len(state_ids)
+        collator = DataCollatorForClef(tokenizer, decision_config, max_length=schema_only + 9, truncation="state")
+        rendered = []
+        render = collator._render
+        monkeypatch.setattr(collator, "_render", lambda request: rendered.append(request["state"]) or render(request))
+        cut = collator.tokenize(row)
+        # The prompt, the empty state, and the two states that tell where the state starts
+        assert rendered == [state, "", "a", "b"]
+        assert (
+            cut["input_ids"] == full["input_ids"][:start] + state_ids[:9] + full["input_ids"][start + len(state_ids) :]
+        )
+        assert marked_spans(tokenizer, cut) == marked_spans(tokenizer, full)
+
+    def test_state_truncation_skips_records_whose_schema_is_too_long(self, tokenizer, decision_config):
+        unlimited = DataCollatorForClef(tokenizer, decision_config)
+        schema_only = len(unlimited.tokenize({**VARIED_ROW, "state": ""})["input_ids"])
+        collator = DataCollatorForClef(tokenizer, decision_config, max_length=schema_only - 1, truncation="state")
+        reason = f"schema longer than max_length ({schema_only - 1} tokens)"
+        for row in (VARIED_ROW, LONG_ROW, {**VARIED_ROW, "state": ""}):
+            skipped = collator.tokenize(row)
+            assert skipped["skip"] is True and skipped["truncated"] is False
+            assert skipped["reason"] == reason
+            assert skipped["input_ids"] == [] and skipped["labels"] == []
+        # Invalid records are skipped as with truncation="skip"
+        invalid = collator.tokenize({"state": "s", "questions": {"team": {"type": "bogus"}}, "gold": {"team": "zeta"}})
+        assert invalid["skip"] is True and invalid["reason"] == "invalid request"
+
+    def test_state_truncation_needs_the_state_between_sentinels(self, tokenizer):
+        decision_config = clef_decision_config()
+        template = decision_config.chat_template
+        joined = 'STATE:\\n<|split|>" ~ r(state) ~ "<|split|>\\n\\nSCHEMA FIELDS:\\n"'
+        assert joined in template
+        # The state now runs into the text around it, so the tokens next to it depend on it
+        decision_config.chat_template = template.replace(joined, 'STATE:" ~ r(state) ~ "ing SCHEMA FIELDS:\\n"')
+        collator = DataCollatorForClef(tokenizer, decision_config, max_length=300, truncation="state")
+        with pytest.raises(ValueError, match="sentinels"):
+            collator.tokenize({**LONG_ROW, "state": "runn" * 200})
+
+    def test_truncated_batch_trains(self, tokenizer, decision_config):
+        unlimited = DataCollatorForClef(tokenizer, decision_config, max_length=100_000)
+        rows = [VARIED_ROW, make_row(0), LONG_ROW]
+        max_length = len(unlimited.tokenize({**VARIED_ROW, "state": ""})["input_ids"]) + 30
+        collator = DataCollatorForClef(tokenizer, decision_config, max_length=max_length, truncation="state")
+        features = tokenized(collator, rows)
+        assert [feature["truncated"] for feature in features] == [True, False, True]
+        batch = collator(features)
+        reference = unlimited(tokenized(unlimited, rows))
+        assert batch["input_ids"].shape[1] == max_length
+        assert batch["attention_mask"].sum(-1).tolist() == [len(feature["input_ids"]) for feature in features]
+        # The targets of every question are those of the untruncated records, in the same order
+        for key in ("labels", "option_mask", "is_choice", "rows_per_example", "num_options"):
+            assert torch.equal(batch[key], reference[key]), key
+        for row in range(len(rows)):
+            assert question_names(tokenizer, batch, row) == question_names(tokenizer, reference, row)
+        model = tiny_clef(tokenizer, decision_config)
+        inputs = {key: value for key, value in batch.items() if key not in {"is_choice", "rows_per_example"}}
+        output = model(**inputs)
+        assert output.logits.shape == batch["labels"].shape
+        assert torch.isfinite(output.loss)
+        output.loss.backward()
+
+    def test_permuted_prompts_are_cut_to_max_length(self, tokenizer, decision_config):
+        rows = [VARIED_ROW, {**VARIED_ROW, "state": VARIED_ROW["state"][::-1]}, make_row(0)]
+        unlimited = DataCollatorForClef(tokenizer, decision_config, max_length=100_000)
+        max_length = len(unlimited.tokenize(VARIED_ROW)["input_ids"]) - 40
+        collator = DataCollatorForClef(
+            tokenizer, decision_config, max_length=max_length, truncation="state", permute_fields=True, seed=1
+        )
+        features = tokenized(collator, rows)
+        assert [feature["truncated"] for feature in features] == [True, True, False]
+        reference = unlimited(tokenized(unlimited, rows))
+        expected = {
+            (row, name): reference["labels"][row * 3 + index].tolist()
+            for row in range(len(rows))
+            for index, name in enumerate(question_names(tokenizer, reference, row))
+        }
+        orders = set()
+        for _ in range(8):
+            batch = collator(features)
+            lengths = batch["attention_mask"].sum(-1).tolist()
+            assert lengths[:2] == [max_length, max_length] and lengths[2] <= max_length
+            for row in range(len(rows)):
+                names = question_names(tokenizer, batch, row)
+                orders.add(tuple(names))
+                for index, name in enumerate(names):
+                    assert batch["labels"][row * 3 + index].tolist() == expected[row, name]
+        assert len(orders) > 1
+        # Without the state mode, an over-length permutation raises rather than being cut
+        strict = DataCollatorForClef(tokenizer, decision_config, max_length=max_length, permute_fields=True)
+        with pytest.raises(ValueError, match="max_length"):
+            strict([{**features[0], "truncated": False}])
+
 
 def make_trainer(tmp_dir, tokenizer, decision_config, **kwargs):
     collator = DataCollatorForClef(tokenizer, decision_config)
@@ -523,6 +693,34 @@ class TestClefTraining(TrlTestCase):
             )
             with pytest.raises(ValueError):
                 prepare_split(records, strict, args, "train")
+
+    def test_build_report_counts_truncated_records(self, tokenizer, decision_config):
+        unlimited = DataCollatorForClef(tokenizer, decision_config, max_length=100_000)
+        max_length = len(unlimited.tokenize({**VARIED_ROW, "state": ""})["input_ids"]) + 10
+        criteria = {f"option {index:02d}": f"The description of option {index}" for index in range(40)}
+        wide = {
+            "state": "s",
+            "questions": {"answer": {"type": "choice", "criteria": criteria}},
+            "gold": {"answer": "option 03"},
+        }
+        assert len(unlimited.tokenize({**wide, "state": ""})["input_ids"]) > max_length
+        invalid_request = {"state": "s", "questions": {"team": {"type": "bogus"}}, "gold": {"team": "zeta"}}
+        rows = [make_row(index) for index in range(3)] + [VARIED_ROW, LONG_ROW, wide, invalid_request]
+        dataset = Dataset.from_list([{key: json.dumps(value) for key, value in row.items()} for row in rows])
+        args = DecisionConfig(output_dir=self.tmp_dir, use_cpu=True, report_to="none")
+        collator = DataCollatorForClef(tokenizer, decision_config, max_length=max_length, truncation="state")
+        built, report = prepare_split(dataset, collator, args, "train")
+        assert len(built) == 5 and "truncated" not in built.column_names
+        assert max(len(input_ids) for input_ids in built["input_ids"]) == max_length
+        assert report == {
+            "rows": 7,
+            "questions": 15,
+            "skipped": {f"schema longer than max_length ({max_length} tokens)": 1, "invalid request": 1},
+            "truncated": 2,
+        }
+        # Without the state mode nothing is cut
+        skipping = DataCollatorForClef(tokenizer, decision_config, max_length=max_length, truncation="skip")
+        assert prepare_split(dataset, skipping, args, "train")[1]["truncated"] == 0
 
     def test_pipeline_on_saved_checkpoint(self, tokenizer, decision_config):
         model = tiny_clef(tokenizer, decision_config)
