@@ -15,12 +15,22 @@ dtype: float32
 mode: full
 # joint, or cosine for the small cosine head (cosine_width, cosine_initial_scale)
 head_type: joint
-# Laya's RLCD policy term, in training only; unset keeps the config's values (weight 0, sigma 0.4, 32 samples).
+# Laya's RLCD ("Reinforcement Learning for Calibrated Decisions"), a community recipe, in training only. It is meant as
+# a second phase after cross-entropy training; unset settings keep the config's values (weight 0, sigma 0.4, 32 samples).
 # rlcd_normalize_advantage: true with rlcd_samples: 4 is Laya's original objective.
+# Recipe 1, two runs: train with cross-entropy (as above), then start this example again from the saved checkpoint with
+# a fresh optimizer (no resume_from_checkpoint), and RLCD on from the first step:
+# model_name_or_path: output/clef-typed-decisions
 # rlcd_weight: 0.25
 # rlcd_sigma: 0.4
 # rlcd_samples: 32
 # rlcd_normalize_advantage: false
+# Recipe 2, one run: cross-entropy first, RLCD from epoch rlcd_start_epoch on with rlcd_weight, and one noise scale per
+# epoch of the RLCD phase (Laya's schedule; the last is held for later epochs). The model starts with weight 0.
+# num_train_epochs: 5
+# rlcd_weight: 0.25
+# rlcd_start_epoch: 1
+# rlcd_sigmas: [0.4, 0.3, 0.2, 0.1]
 max_length: 2048
 # state cuts the end of an over-length record's state to fit, as Clef does, and skips records too long without it;
 # skip drops over-length records instead, and error stops at the first one

@@ -69,6 +69,24 @@ torchrun --nproc_per_node=2 \
     examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
 ```
 
+### RLCD
+
+`rlcd_weight` adds Laya's RLCD ("Reinforcement Learning for Calibrated Decisions", a community recipe, not an official
+Cloudflare objective): a policy term on noisy samples of the option logits, joined to the supervised loss. It is
+normally run as a second phase after cross-entropy training, and applies in training only, so `eval_loss` is always the
+supervised loss. Two ways to run it:
+
+1. **Two runs (recommended).** Train with cross-entropy, then start the example again with `model_name_or_path` set to
+   the saved Clef checkpoint and `rlcd_weight` set (and `rlcd_sigma`, `rlcd_samples`, `rlcd_normalize_advantage` if
+   wanted). It starts from the checkpoint's weights with a fresh optimizer, so do not pass `resume_from_checkpoint`;
+   its first evaluation reproduces the first run's final `eval_loss`. The paired RLCD experiments used a fresh
+   optimizer for the RLCD phase.
+2. **One run.** `rlcd_weight` with `rlcd_start_epoch` and/or `rlcd_sigmas`: cross-entropy until `rlcd_start_epoch`, then
+   RLCD with `rlcd_weight`, and the noise scale annealed per epoch of the phase (`rlcd_sigmas: [0.4, 0.3, 0.2, 0.1]` is
+   Laya's schedule; the last value is held). The weight must be positive; the model is built with weight 0 and the
+   schedule follows the epoch alone, so resuming and several processes agree. The final weight and last sigma are left
+   on the saved config.
+
 `benchmark_clef.py` times this training path: it builds the model, data and trainer with the example's own
 `build_trainer`, trains `--steps` steps without evaluating or saving, evaluates once, and prints a JSON summary (also
 written to `--output`; under torchrun by the main process only). Without `--config` it runs a synthetic recipe (a tiny

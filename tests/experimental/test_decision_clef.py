@@ -15,6 +15,8 @@
 import copy
 import json
 import math
+import shutil
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -48,11 +50,17 @@ from transformers import (
     ClefForDecision,
     ModernBertConfig,
     Qwen2Config,
+    TrainerState,
     pipeline,
     set_seed,
 )
 
-from trl.experimental.decision import DecisionConfig, DecisionTrainer, compute_calibration_metrics
+from trl.experimental.decision import (
+    DecisionConfig,
+    DecisionTrainer,
+    RlcdScheduleCallback,
+    compute_calibration_metrics,
+)
 from trl.experimental.decision.decision_trainer import pack_rows, unpack_rows
 
 from ..testing_utils import TrlTestCase, require_peft
@@ -1001,6 +1009,172 @@ class TestClefTraining(TrlTestCase):
         self.check_saved_model(
             trainer, tokenizer, rlcd_weight=0.25, rlcd_samples=8, rlcd_sigma=0.4, rlcd_normalize_advantage=False
         )
+
+    @staticmethod
+    def drive(callback, model, epochs):
+        """The (weight, sigma) the model's config holds at the start of a step at each of `epochs`."""
+        state = TrainerState()
+        seen = []
+        for epoch in epochs:
+            state.epoch = epoch
+            callback.on_step_begin(None, state, None, model=model)
+            seen.append((model.config.rlcd_weight, model.config.rlcd_sigma))
+        return seen
+
+    def test_schedule_values_follow_the_epoch(self, tokenizer, decision_config):
+        model = tiny_clef(tokenizer, decision_config)
+        callback = RlcdScheduleCallback(0.25, start_epoch=1, sigmas=[0.4, 0.3, 0.2, 0.1])
+        epochs = [0.0, 0.5, 0.99, 1.0, 1.5, 2.0, 3.7, 9.0]
+        seen = self.drive(callback, model, epochs)
+        assert [weight for weight, _ in seen] == [0.0, 0.0, 0.0, 0.25, 0.25, 0.25, 0.25, 0.25]
+        # Before start_epoch the sigma is left alone (the config's 0.4); from there one per epoch, the last held
+        assert [sigma for _, sigma in seen[3:]] == [0.4, 0.4, 0.3, 0.2, 0.1]
+        assert seen[0][1] == ClefConfig().rlcd_sigma
+        # No sigmas: the config's sigma is never touched; an epoch of None counts as 0
+        model = tiny_clef(tokenizer, decision_config)
+        model.config.rlcd_sigma = 0.37
+        callback = RlcdScheduleCallback(0.5, start_epoch=0.5)
+        assert self.drive(callback, model, [None, 0.4, 0.5, 2.0]) == [
+            (0.0, 0.37),
+            (0.0, 0.37),
+            (0.5, 0.37),
+            (0.5, 0.37),
+        ]
+        # Wrapped models (DistributedDataParallel) are unwrapped
+        model = tiny_clef(tokenizer, decision_config)
+        wrapper = type("Wrapper", (), {"module": model})()
+        RlcdScheduleCallback(0.25).on_step_begin(None, TrainerState(epoch=0.0), None, model=wrapper)
+        assert model.config.rlcd_weight == 0.25
+
+    def test_schedule_is_stateless_across_resume(self, tokenizer, decision_config):
+        sigmas = [0.4, 0.3, 0.2, 0.1]
+        whole = tiny_clef(tokenizer, decision_config)
+        self.drive(RlcdScheduleCallback(0.25, start_epoch=1, sigmas=sigmas), whole, [0.0, 0.5, 1.0, 1.5, 2.0, 2.3])
+        resumed = tiny_clef(tokenizer, decision_config)
+        self.drive(RlcdScheduleCallback(0.25, start_epoch=1, sigmas=sigmas), resumed, [2.3])
+        assert (resumed.config.rlcd_weight, resumed.config.rlcd_sigma) == (0.25, 0.3)
+        assert (resumed.config.rlcd_weight, resumed.config.rlcd_sigma) == (
+            whole.config.rlcd_weight,
+            whole.config.rlcd_sigma,
+        )
+
+    def test_final_values_left_on_config(self, tokenizer, decision_config):
+        model = tiny_clef(tokenizer, decision_config)
+        callback = RlcdScheduleCallback(0.25, start_epoch=1, sigmas=[0.4, 0.3, 0.2, 0.1])
+        state = TrainerState()
+        callback.on_train_begin(None, state, None, model=model)
+        self.drive(callback, model, [0.5, 1.5, 3.5])
+        assert model.config.rlcd_sigma == 0.2
+        callback.on_train_end(None, state, None, model=model)
+        # The weight of the recipe, and the last sigma that applied
+        assert (model.config.rlcd_weight, model.config.rlcd_sigma) == (0.25, 0.2)
+        # Training that ended before the phase started still records the recipe's weight
+        model = tiny_clef(tokenizer, decision_config)
+        callback = RlcdScheduleCallback(0.25, start_epoch=3, sigmas=[0.4])
+        self.drive(callback, model, [0.0, 1.0])
+        callback.on_train_end(None, state, None, model=model)
+        assert (model.config.rlcd_weight, model.config.rlcd_sigma) == (0.25, ClefConfig().rlcd_sigma)
+
+    def test_invalid_arguments(self):
+        for kwargs in (
+            {"weight": -0.1},
+            {"weight": 0.25, "start_epoch": -1},
+            {"weight": 0.25, "sigmas": []},
+            {"weight": 0.25, "sigmas": [0.4, 0.0]},
+            {"weight": 0.25, "sigmas": [-0.1]},
+        ):
+            with pytest.raises(ValueError):
+                RlcdScheduleCallback(**kwargs)
+        assert RlcdScheduleCallback(0.0).weight == 0.0
+
+    def test_model_without_rlcd_raises(self):
+        model = torch.nn.Linear(2, 2)
+        model.config = type("Config", (), {})()
+        callback = RlcdScheduleCallback(0.25)
+        with pytest.raises(ValueError, match="rlcd_weight"):
+            callback.on_train_begin(None, TrainerState(), None, model=model)
+
+    def record_training_steps(self, monkeypatch):
+        """Record (epoch, rlcd_weight, rlcd_sigma) of the config each training step starts with."""
+        seen = []
+        original = DecisionTrainer.training_step
+
+        def training_step(trainer, model, *args, **kwargs):
+            seen.append((trainer.state.epoch, model.config.rlcd_weight, model.config.rlcd_sigma))
+            return original(trainer, model, *args, **kwargs)
+
+        monkeypatch.setattr(DecisionTrainer, "training_step", training_step)
+        return seen
+
+    def test_one_run_ce_then_rlcd(self, tokenizer, monkeypatch):
+        seen = self.record_training_steps(monkeypatch)
+        script_kwargs = {"rlcd_weight": 0.25, "rlcd_samples": 8, "rlcd_start_epoch": 1, "rlcd_sigmas": [0.4, 0.1]}
+        training_kwargs = {"max_steps": -1, "num_train_epochs": 2, "logging_steps": 1}
+        trainer, initial, _ = self.run_main(
+            tokenizer, "full", training_kwargs=training_kwargs, script_kwargs=script_kwargs
+        )
+        # The model is built without RLCD: the schedule turns it on
+        assert initial.config.rlcd_weight == 0.0
+        assert trainer.state.global_step == len(seen) and len(seen) > 2
+        first_epoch = [entry for entry in seen if entry[0] < 1.0]
+        second_epoch = [entry for entry in seen if entry[0] >= 1.0]
+        assert first_epoch and second_epoch
+        assert all(weight == 0.0 for _, weight, _ in first_epoch)
+        assert all((weight, sigma) == (0.25, 0.4) for _, weight, sigma in second_epoch)
+        losses = [entry["loss"] for entry in trainer.state.log_history if "loss" in entry]
+        assert losses and all(np.isfinite(loss) for loss in losses)
+        # The supervised evaluation loss does not depend on the term or on any randomness
+        first = trainer.evaluate()["eval_loss"]
+        assert trainer.evaluate()["eval_loss"] == first
+        # The saved config records the recipe: the weight, and the last sigma that applied
+        self.check_saved_model(trainer, tokenizer, rlcd_weight=0.25, rlcd_samples=8, rlcd_sigma=0.4)
+
+    def test_two_runs_ce_then_rlcd(self, tokenizer, monkeypatch):
+        # Run 1: plain cross-entropy
+        first, _, _ = self.run_main(tokenizer, "full", training_kwargs={"eval_strategy": "no"})
+        assert first.model.config.rlcd_weight == 0.0
+        first_loss = first.evaluate()["eval_loss"]
+        # The dataset folder is the run's temporary folder, so the checkpoint moves out of it
+        with tempfile.TemporaryDirectory() as keep:
+            checkpoint = f"{keep}/checkpoint"
+            shutil.move(f"{self.tmp_dir}/out", checkpoint)
+            self.second_run_from(tokenizer, monkeypatch, checkpoint, first_loss)
+
+    def second_run_from(self, tokenizer, monkeypatch, checkpoint, first_loss):
+        # Run 2: the example again from the saved checkpoint, RLCD on from the first step, no resume
+        starting = []
+        original = DecisionTrainer.train
+
+        def train(trainer, *args, **kwargs):
+            assert kwargs.get("resume_from_checkpoint") is None
+            starting.append(trainer.evaluate()["eval_loss"])
+            return original(trainer, *args, **kwargs)
+
+        monkeypatch.setattr(DecisionTrainer, "train", train)
+        second, initial, _ = self.run_main(
+            tokenizer,
+            "full",
+            training_kwargs={"output_dir": f"{self.tmp_dir}/out2", "logging_steps": 1},
+            script_kwargs={"rlcd_weight": 0.25, "rlcd_samples": 8},
+            checkpoint=checkpoint,
+        )
+        # Strict loading of the checkpoint, and the weights it saved
+        assert initial.config.rlcd_weight == 0.25
+        assert starting == [first_loss]
+        # A fresh run: it trained from step 0 with a fresh optimizer, not resumed
+        assert second.state.global_step == 5 and second.args.resume_from_checkpoint is None
+        losses = [entry["loss"] for entry in second.state.log_history if "loss" in entry]
+        assert losses and all(np.isfinite(loss) for loss in losses)
+        assert second.model.config.rlcd_weight == 0.25
+        assert AutoModelForDecision.from_pretrained(f"{self.tmp_dir}/out2").config.rlcd_weight == 0.25
+        assert AutoModelForDecision.from_pretrained(checkpoint).config.rlcd_weight == 0.0
+
+    @pytest.mark.parametrize("weight", [None, 0.0])
+    def test_schedule_requires_positive_weight(self, tokenizer, weight):
+        for key, value in (("rlcd_start_epoch", 1.0), ("rlcd_sigmas", [0.4, 0.1])):
+            script_kwargs = {key: value, **({} if weight is None else {"rlcd_weight": weight})}
+            with pytest.raises(ValueError, match="rlcd_weight"):
+                self.run_main(tokenizer, "full", script_kwargs=script_kwargs)
 
     def test_sample_rows_draws_a_seeded_random_subset(self):
         dataset = Dataset.from_list([{"index": index} for index in range(100)])

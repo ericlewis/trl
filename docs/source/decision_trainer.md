@@ -107,14 +107,43 @@ torchrun --nproc_per_node=2 \
     examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
 ```
 
-`label_smoothing`, `brier_weight` and `ordinal_weight` set the terms of Clef's native loss, and `rlcd_weight` adds its
-RLCD policy term, adapted from [Laya](https://github.com/NandhaKishorM/laya) (Apache-2.0): noisy samples of the option
-logits are rewarded by a strictly proper scoring rule, and a REINFORCE term with a per-question mean baseline joins the
-supervised loss. `rlcd_sigma`, `rlcd_samples` and `rlcd_normalize_advantage` tune it; each setting left unset keeps the
-value of the model's config. The term applies in training only, so `eval_loss` stays the deterministic supervised
-loss. Its defaults (sigma 0.4, 32 samples, advantages not divided by their standard deviation; `0.25` is the suggested
-weight) are a revised variant of Laya's objective; `rlcd_normalize_advantage: true` with `rlcd_samples: 4` reproduces
-Laya's original. These loss terms are a community recipe, not an official Cloudflare objective.
+`label_smoothing`, `brier_weight` and `ordinal_weight` set the terms of Clef's native loss. `rlcd_weight` adds the RLCD
+policy term, described next.
+
+### RLCD
+
+RLCD is Laya's "Reinforcement Learning for Calibrated Decisions", adapted from [Laya](https://github.com/NandhaKishorM/laya)
+(Apache-2.0). It is a community recipe, not an official Cloudflare objective, and is normally run as a second phase
+after cross-entropy training: noisy samples of the option logits are rewarded by a strictly proper scoring rule, and a
+REINFORCE term with a per-question mean baseline joins the supervised loss, which the phase keeps. `rlcd_sigma`,
+`rlcd_samples` and `rlcd_normalize_advantage` tune it; each setting left unset keeps the value of the model's config.
+The term applies in training only, so `eval_loss` is always the deterministic supervised loss. Its defaults (sigma 0.4,
+32 samples, advantages not divided by their standard deviation; `0.25` is the suggested weight) are a revised variant
+of Laya's objective; `rlcd_normalize_advantage: true` with `rlcd_samples: 4` reproduces Laya's original.
+
+There are two ways to run it:
+
+1. **Two runs (recommended).** Train with cross-entropy, then start the example again with `model_name_or_path` set to
+   the saved Clef checkpoint and `rlcd_weight` set. The second run loads the checkpoint as its starting weights and
+   trains with a fresh optimizer (do not pass `resume_from_checkpoint`); its first evaluation reproduces the final
+   `eval_loss` of the first run. The paired RLCD experiments used this recipe.
+2. **One run.** Cross-entropy first, RLCD from a given epoch: set `rlcd_weight` (the weight of the phase, which must
+   be positive), `rlcd_start_epoch` and `rlcd_sigmas`. The model is built with `rlcd_weight` 0, and
+   [`~trl.experimental.decision.RlcdScheduleCallback`] switches it on at `rlcd_start_epoch`. `rlcd_weight` without
+   either schedule setting turns RLCD on from the first step.
+
+`rlcd_sigmas` anneals the noise per epoch of the RLCD phase, counted from `rlcd_start_epoch`: Laya's schedule
+`[0.4, 0.3, 0.2, 0.1]` uses sigma 0.4 in the first epoch of the phase, 0.3 in the second, and so on, and the last value
+is held for later epochs. The values are a function of the epoch alone, so a resumed run and every process of a
+distributed run agree, and when training ends the final weight and the last sigma are left on the model's config, so the
+saved checkpoint records the recipe.
+
+```yaml
+num_train_epochs: 5
+rlcd_weight: 0.25
+rlcd_start_epoch: 1
+rlcd_sigmas: [0.4, 0.3, 0.2, 0.1]
+```
 
 ## JEV
 
@@ -191,3 +220,7 @@ answers = decide(request)
 ## compute_calibration_metrics
 
 [[autodoc]] experimental.decision.compute_calibration_metrics
+
+## RlcdScheduleCallback
+
+[[autodoc]] experimental.decision.RlcdScheduleCallback

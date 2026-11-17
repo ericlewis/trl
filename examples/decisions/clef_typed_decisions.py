@@ -28,7 +28,10 @@ reads its last token with the ChatML prompt; a bidirectional encoder (BERT, Mode
 its base model) reads its first token with the plain prompt between [CLS] and [SEP]. `global_pooling` and
 `prompt_style` override that choice; `head_type: cosine` (with `cosine_width`, `cosine_initial_scale`) selects the
 small cosine head instead of the joint one. The resolved setup is printed at start-up. `rlcd_weight` (with
-`rlcd_sigma`, `rlcd_samples`, `rlcd_normalize_advantage`) adds Clef's RLCD policy term to the training loss.
+`rlcd_sigma`, `rlcd_samples`, `rlcd_normalize_advantage`) adds Clef's RLCD policy term to the training loss. RLCD is
+meant as a second phase after cross-entropy training: start this script again from the saved checkpoint with
+`rlcd_weight` set, or in one run give `rlcd_start_epoch` and/or `rlcd_sigmas` (one noise scale per epoch of the RLCD
+phase), which keep the weight at 0 until that epoch.
 
 Backbone weights are never newly initialised and remote code is never run. A checkpoint whose weights sit under a
 prefix (a remote-code package such as an UltraBERT reranker, with `backbone.<name>` keys) has its backbone read from
@@ -70,6 +73,7 @@ from trl.experimental.decision import (
     DataCollatorForDecision,
     DecisionConfig,
     DecisionTrainer,
+    RlcdScheduleCallback,
     compute_calibration_metrics,
 )
 
@@ -447,6 +451,20 @@ class ClefScriptArguments(ScriptArguments):
             "help": "Divide the RLCD advantages by their standard deviation (Laya's original). Defaults to False."
         },
     )
+    rlcd_start_epoch: float | None = field(
+        default=None,
+        metadata={
+            "help": "Run cross-entropy only until this epoch, then switch RLCD on with rlcd_weight (which must be "
+            "positive). The model is built with rlcd_weight 0."
+        },
+    )
+    rlcd_sigmas: list[float] | None = field(
+        default=None,
+        metadata={
+            "help": "One RLCD noise scale per epoch of the RLCD phase, counted from rlcd_start_epoch (0 if unset); the "
+            "last is held for later epochs, e.g. [0.4, 0.3, 0.2, 0.1]. Needs a positive rlcd_weight."
+        },
+    )
     max_length: int = field(default=2048, metadata={"help": "Maximum prompt token length."})
     truncation: str = field(
         default="error",
@@ -668,6 +686,22 @@ LOSS_SETTINGS = (
 )
 
 
+def rlcd_schedule(script_args) -> RlcdScheduleCallback | None:
+    """
+    The callback that runs RLCD from `rlcd_start_epoch` with the noise scales `rlcd_sigmas`, or `None` when neither is
+    given. `rlcd_weight` is then the weight of the phase and must be positive.
+    """
+    if script_args.rlcd_start_epoch is None and script_args.rlcd_sigmas is None:
+        return None
+    if not script_args.rlcd_weight or script_args.rlcd_weight <= 0:
+        raise ValueError("rlcd_start_epoch and rlcd_sigmas schedule RLCD, so rlcd_weight must be positive")
+    return RlcdScheduleCallback(
+        script_args.rlcd_weight,
+        start_epoch=script_args.rlcd_start_epoch or 0.0,
+        sigmas=script_args.rlcd_sigmas,
+    )
+
+
 def build_model(script_args, model_args, model_kwargs):
     """
     A Clef checkpoint is loaded as it is; any other model becomes the backbone of a new head. A causal backbone reads
@@ -678,6 +712,8 @@ def build_model(script_args, model_args, model_kwargs):
 
     name, revision = model_args.model_name_or_path, model_args.model_revision
     losses = {key: getattr(script_args, key) for key in LOSS_SETTINGS if getattr(script_args, key) is not None}
+    if rlcd_schedule(script_args) is not None:  # the schedule turns RLCD on: the model starts as plain cross-entropy
+        losses["rlcd_weight"] = 0.0
     head_settings = {
         key: getattr(script_args, key)
         for key in ("head_type", "global_pooling", "prompt_style", "cosine_width", "cosine_initial_scale")
@@ -820,6 +856,7 @@ class ClefRun:
 def build_trainer(script_args, training_args, model_args) -> ClefRun:
     """Everything the script does before training: the model, the tokenized splits and the trainer."""
     set_seed(training_args.seed)
+    schedule = rlcd_schedule(script_args)
     if script_args.mode not in {"head", "lora", "full"}:
         raise ValueError("mode must be head, lora, or full")
     training_args.accelerator_config.dispatch_batches = False
@@ -893,6 +930,8 @@ def build_trainer(script_args, training_args, model_args) -> ClefRun:
         data_collator=collator,
         compute_metrics=compute_calibration_metrics,
     )
+    if schedule is not None:
+        trainer.add_callback(schedule)
     return ClefRun(trainer, lora_backbone, {"train": train_report, "eval": eval_report})
 
 
