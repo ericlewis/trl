@@ -55,7 +55,7 @@ synchronises the CUDA device. A step is steady when its index is above `--warmup
 - `steady_step_p50`, `steady_step_p95`: percentiles of the steady steps' `seconds`.
 - `steady_records_per_second`: records per step × steady steps / sum of their `seconds`.
 - `window_records_per_second`: the same over the window, the steady steps up to step 320; `window_steps` is its
-  length. With the default warm-up the window is steps 21 to 320, as in the baseline.
+  length. With the default warm-up the window is steps 21 to 320, as in the reference benchmark.
 - `steady_data_p50`: median steady `data_seconds`; `steady_records_per_second_with_data`: steady throughput counting
   `seconds + data_seconds`, so that the cost of collation (permuted prompts are re-rendered) stays visible.
 - `head_parameters`: the decision head alone, without the backbone or the `lm_head` table of the lexical prior (in

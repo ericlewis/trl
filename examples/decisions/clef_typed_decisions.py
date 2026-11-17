@@ -50,6 +50,7 @@ torchrun --nproc_per_node=2 \
 import json
 import os
 import random
+import warnings
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -82,11 +83,14 @@ from trl.experimental.decision import (
 from trl.experimental.decision.jev_monitor import PRESETS, JevMonitorCallback, SystemOneClient
 
 
-def clef_decision_config():
-    """Clef's decision config with its ChatML prompt: any number of options, since the head reads no label token."""
+def clef_decision_config(prompt_style: str = "chatml"):
+    """
+    Clef's decision config with its ChatML prompt (or its plain one, `prompt_style="plain"`): any number of options,
+    since the head reads no label token.
+    """
     from transformers import ClefConfig
 
-    return ClefConfig.prompt_decision_config("chatml")
+    return ClefConfig.prompt_decision_config(prompt_style)
 
 
 def common_prefix_length(first: list, second: list) -> int:
@@ -754,6 +758,8 @@ def rlcd_schedule(script_args) -> RlcdScheduleCallback | None:
         return None
     if not script_args.rlcd_weight or script_args.rlcd_weight <= 0:
         raise ValueError("rlcd_start_epoch and rlcd_sigmas schedule RLCD, so rlcd_weight must be positive")
+    if script_args.rlcd_sigmas is not None and script_args.rlcd_sigma is not None:
+        raise ValueError("rlcd_sigmas sets the noise scale of every epoch of the RLCD phase; remove rlcd_sigma")
     return RlcdScheduleCallback(
         script_args.rlcd_weight,
         start_epoch=script_args.rlcd_start_epoch or 0.0,
@@ -794,6 +800,18 @@ def build_model(script_args, model_args, model_kwargs):
         for key in ("head_type", "global_pooling", "prompt_style", "cosine_width", "cosine_initial_scale")
         if getattr(script_args, key) is not None
     }
+    # The sizes of the head, under the names of `ClefConfig`
+    sizes = {
+        key: getattr(script_args, f"head_{value}")
+        for key, value in {
+            "hidden_size": "hidden_size",
+            "intermediate_size": "intermediate_size",
+            "num_hidden_layers": "num_layers",
+            "num_evidence_layers": "num_evidence_layers",
+            "num_attention_heads": "num_attention_heads",
+        }.items()
+        if getattr(script_args, f"head_{value}") is not None
+    }
     model_kwargs = without_remote_code(model_kwargs)
     config = AutoConfig.from_pretrained(name, revision=revision, trust_remote_code=False)
     is_checkpoint = (
@@ -814,9 +832,15 @@ def build_model(script_args, model_args, model_kwargs):
                 f"{len(problems)} weights of the Clef checkpoint {name} are missing or of another shape: "
                 f"{', '.join(problems[:10])}{', ...' if len(problems) > 10 else ''}"
             )
-        changed = {key: value for key, value in head_settings.items() if getattr(model.config, key) != value}
+        changed = {
+            key: value for key, value in {**head_settings, **sizes}.items() if getattr(model.config, key) != value
+        }
         if changed:
-            raise ValueError(f"{name} is a Clef checkpoint; its head settings cannot change ({changed})")
+            raise ValueError(
+                f"{name} is a Clef checkpoint; its head settings and sizes cannot change ({changed}). Remove them, or "
+                "train a new head from its backbone."
+            )
+        check_cosine_settings(script_args, model.config.head_type)
         # `setattr` skips the checks of a new config: the loss settings it ends up with are checked by building one
         loss_keys = [key for key in LOSS_SETTINGS if hasattr(model.config, key)]
         ClefConfig(**{**{key: getattr(model.config, key) for key in loss_keys}, **losses})
@@ -832,17 +856,14 @@ def build_model(script_args, model_args, model_kwargs):
                 "or train from a Clef checkpoint, which is loaded with all of them."
             )
         backbone, embeddings, weights = load_backbone(name, config, model_kwargs)
-        sizes = {
-            key: getattr(script_args, f"head_{value}")
-            for key, value in {
-                "hidden_size": "hidden_size",
-                "intermediate_size": "intermediate_size",
-                "num_hidden_layers": "num_layers",
-                "num_evidence_layers": "num_evidence_layers",
-                "num_attention_heads": "num_attention_heads",
-            }.items()
-            if getattr(script_args, f"head_{value}") is not None
-        }
+        check_cosine_settings(script_args, head_settings.get("head_type", "joint"))
+        if (losses.get("rlcd_weight") or 0) > 0:
+            warnings.warn(
+                f"rlcd_weight={losses['rlcd_weight']} on a new head with no schedule runs RLCD from the first step. "
+                "RLCD is meant as a phase after cross-entropy training: train with cross-entropy first and start again "
+                "from the saved checkpoint, or set rlcd_start_epoch.",
+                stacklevel=2,
+            )
         text_config = backbone.config
         # The attention the backbone was loaded with (the one asked for, or the default it resolved to): building a
         # config around `text_config` resets it
@@ -867,9 +888,29 @@ def build_model(script_args, model_args, model_kwargs):
             model.lm_head.to(backbone.dtype)
         model.backbone_weights = weights
         del backbone, embeddings
-    if model.decision_config.chat_template is None:
-        model.decision_config = clef_decision_config()
+    if model.decision_config.chat_template is None:  # the template of the model's own prompt style
+        model.decision_config = clef_decision_config(model.config.prompt_style)
     return model
+
+
+def check_cosine_settings(script_args, head_type):
+    """Refuse `cosine_width` and `cosine_initial_scale` for a head that is not the cosine head, which ignores them."""
+    given = [key for key in ("cosine_width", "cosine_initial_scale") if getattr(script_args, key) is not None]
+    if given and head_type != "cosine":
+        raise ValueError(f"{given} only apply to head_type: cosine, and this head is {head_type}; remove them")
+
+
+def position_limit(backbone) -> int | None:
+    """
+    The longest sequence a backbone with a learned table of absolute positions (BERT, RoBERTa) can read, or `None`
+    when it has none (rotary or relative positions).
+    """
+    for name, module in backbone.named_modules():
+        if name.split(".")[-1] == "position_embeddings" and isinstance(module, torch.nn.Embedding):
+            # RoBERTa-style tables count positions from after the padding index
+            offset = 0 if module.padding_idx is None else module.padding_idx + 1
+            return module.num_embeddings - offset
+    return None
 
 
 def describe(model) -> str:
@@ -952,14 +993,26 @@ def build_trainer(script_args, training_args, model_args) -> ClefRun:
     monitor = jev_monitor(script_args)
     if script_args.mode not in {"head", "lora", "full"}:
         raise ValueError("mode must be head, lora, or full")
-    training_args.accelerator_config.dispatch_batches = False
-    training_args.accelerator_config.split_batches = False
+    # Batches hold whole records (rows_per_example), so they are never dispatched or split across processes
+    config = training_args.accelerator_config
+    if config.dispatch_batches or config.split_batches:
+        raise ValueError(
+            "The Clef example batches whole records, which dispatch_batches and split_batches would break apart; set "
+            "both to false in accelerator_config"
+        )
+    config.dispatch_batches = config.split_batches = False
     model_kwargs = dict(training_args.model_init_kwargs or {})
     model_kwargs.setdefault("revision", model_args.model_revision)
     model_kwargs.setdefault("dtype", model_args.dtype)
     if model_args.attn_implementation is not None:
         model_kwargs["attn_implementation"] = model_args.attn_implementation
     model = build_model(script_args, model_args, model_kwargs)
+    limit = position_limit(model.model)
+    if limit is not None and script_args.max_length > limit:
+        raise ValueError(
+            f"max_length is {script_args.max_length} tokens, but the {model.config.text_config.model_type} backbone "
+            f"reads at most {limit} positions; set max_length to {limit} or less"
+        )
     if training_args.process_index == 0:
         print(describe(model))
     tokenizer = AutoTokenizer.from_pretrained(
@@ -1001,7 +1054,8 @@ def build_trainer(script_args, training_args, model_args) -> ClefRun:
     train_dataset = sample_rows(train_dataset, script_args.max_train_samples, training_args.seed)
     eval_dataset = sample_rows(eval_dataset, script_args.max_eval_samples, script_args.eval_sample_seed)
 
-    # Training batches permute the questions; evaluation never does, so it has its own collator
+    # Training batches permute the questions; evaluation never does: it has its own collator, for tokenizing and for
+    # batching
     collator_kwargs = {"max_length": script_args.max_length, "truncation": script_args.truncation}
     collator = DataCollatorForClef(
         tokenizer,
@@ -1021,6 +1075,7 @@ def build_trainer(script_args, training_args, model_args) -> ClefRun:
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
         data_collator=collator,
+        eval_data_collator=eval_collator,
         compute_metrics=compute_calibration_metrics,
     )
     if schedule is not None:

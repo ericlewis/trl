@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .data_collator import DataCollatorForDecision
+from .data_collator import DataCollatorForDecision, target_from_gold
 from .decision_config import DecisionConfig
 from .decision_trainer import DecisionTrainer
 from .jev_monitor import JevMonitorCallback, StopRule
@@ -28,4 +28,5 @@ __all__ = [
     "RlcdScheduleCallback",
     "StopRule",
     "compute_calibration_metrics",
+    "target_from_gold",
 ]

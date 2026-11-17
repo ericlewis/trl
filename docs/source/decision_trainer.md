@@ -48,13 +48,13 @@ Requests use Transformers' `state` / `questions` schema, with one question per t
 A row with several questions rendered into one prompt (a template that reads `questions`, such as Clef's) goes through
 `prepare_request`, which returns the inputs, the questions in template order and one target per question. Targets come
 from `targets` (`{question_name: {"target_index" | "target_probs" | "p_true" | "score": ...}}`), or from `gold` /
-`answers`, where each entry is a bare label or `{"label", "probabilities", "noul"}`. `target_from_gold` turns the latter
-into `target_probs` in the question's option order. A template that renders one prompt per question is rejected.
+`answers`, where each entry is a bare label or `{"label", "probabilities", "noul"}`. `target_from_gold` turns the
+latter into `target_probs` in the question's option order. A template that renders one prompt per question is rejected.
 
-Positional targets (`target_index`, `target_probs`) index the options in the order the template gives them, which is not
-always the order of the request: Clef's template sorts choice options by key, so with criteria `{"zeta": ..., "alpha":
-...}`, `target_index: 0` is `alpha`. Prefer `gold` / `answers`, which name the option, so the target follows it
-whatever the order.
+Positional targets (`target_index`, `target_probs`) index the options in the order the template gives them, which is
+not always the order of the request: Clef's template sorts choice options by key, so with criteria `{"zeta": ...,
+"alpha": ...}`, `target_index: 0` is `alpha`. Prefer `gold` / `answers`, which name the option, so the target follows
+it whatever the order.
 
 Choice questions use a `criteria` mapping and may set `allow_null=True`. Score questions use a `criteria` list and
 may supply numeric `values`. The [Jeva example collator](https://github.com/huggingface/trl/blob/main/examples/decisions/jeva_banking77.py)
@@ -80,10 +80,10 @@ to each device's batch. Context parallelism is unsupported for this example.
 ## Clef example
 
 Clef answers every question of a record in one prompt: the model reads the state once and scores the options of all
-questions jointly. It requires a Transformers build with Clef training support (Clef's native loss and batched forward, head choice and
-RLCD) on top of [Transformers #50058](https://github.com/huggingface/transformers/pull/50058), which adds Clef without
-them. The
-[Clef example](https://github.com/huggingface/trl/blob/main/examples/decisions/clef_typed_decisions.py) trains it on
+questions jointly. It requires a Transformers build with Clef training support (Clef's native loss and batched forward,
+head choice and RLCD) on top of [Transformers #50058](https://github.com/huggingface/transformers/pull/50058), which
+adds Clef without them. The [Clef
+example](https://github.com/huggingface/trl/blob/main/examples/decisions/clef_typed_decisions.py) trains it on
 `LocalLLaMA/typed-decisions`, with KLM-1.6 as the backbone by default:
 
 ```bash
@@ -95,21 +95,46 @@ The configuration trains the head at `head_learning_rate` (`3e-4`, the backbone 
 and keeps the checkpoint with the best `eval_selection_score`: `save_strategy: best` saves a checkpoint at each
 evaluation that improves on it, so the best one is on disk, and `load_best_model_at_end` restores it after training.
 
-`mode` selects head-only, LoRA, or full training. LoRA puts adapters on the backbone and trains the head in full; the output is the merged native checkpoint, with the adapter alone in `adapter/`. A Clef checkpoint is loaded as it is; any other model becomes the
-backbone of a new head. A causal LM reads its last token with Clef's ChatML prompt; a bidirectional encoder (BERT, ModernBERT, or a reranker, unwrapped to its base model) reads its first token with the plain prompt between `[CLS]` and `[SEP]`. `global_pooling` (`last` or `first`) and `prompt_style` (`chatml` or `plain`) override that choice, and `head_type: cosine` (with `cosine_width` and `cosine_initial_scale`) selects the small cosine head; the script prints the resolved setup at start-up. UltraBERT (`model_type: ultrabert`) is such an encoder; its tokenizer has no `[CLS]`, so the plain prompt starts with its `<|endoftext|>` and ends with its `<|sep|>`. The script never newly initialises backbone weights and never runs remote code (`trust_remote_code` is refused): a checkpoint that stores its backbone under a key prefix, such as a remote-code reranker package with `backbone.<name>` weights, has its backbone read from its safetensors under the one prefix that holds every weight with its shape, its other tensors dropped, and the start-up line names the source (`direct` or `prefix "backbone."`) and the dropped tensors. Weights that no single prefix provides, or several prefixes that each do, raise a `ValueError`; so do per-layer `attention_windows` or `rope_theta` lists in such a package's `config.json` that differ within a kind of layer, which Transformers' UltraBERT config would read as one value per kind. `max_train_samples` limits the training split to a random sample drawn with `seed`, not to its first rows; the evaluation holdout and `max_eval_samples` are drawn with `eval_sample_seed` (0 by default), so runs with different seeds evaluate on the same records. Samples are drawn before tokenization, so skipped records can leave fewer than asked for (the build report shows how many). The configuration keeps the weights in float32 with `bf16: true`, since KLM's fused CUDA kernels only run on float32 parameters. Loss settings given for a Clef checkpoint are checked as a new `ClefConfig` checks them. Each row holds `state` (a record, or its JSON string, which is decoded so that the prompt renders the record), `questions` and the targets of all of its questions, either `targets`
-(per question `target_index`, `target_probs`, `p_true` or `score`) or `gold` / `answers` (per question a label or
-probabilities), through `DataCollatorForDecision.prepare_request`. The example collator `DataCollatorForClef` returns
-one row of `labels` and `option_mask` per question, with the questions of all records of a batch one after the other.
-Nullable questions raise: Clef has no coverage output. `truncation` has three modes. With `error`, a prompt longer than
+`mode` selects head-only, LoRA, or full training. LoRA puts adapters on the backbone and trains the head in full; the
+output is the merged native checkpoint, with the adapter alone in `adapter/`. A Clef checkpoint is loaded as it is; any
+other model becomes the backbone of a new head. A causal LM reads its last token with Clef's ChatML prompt; a
+bidirectional encoder (BERT, ModernBERT, or a reranker, unwrapped to its base model) reads its first token with the
+plain prompt between `[CLS]` and `[SEP]`. `global_pooling` (`last` or `first`) and `prompt_style` (`chatml` or `plain`)
+override that choice, and `head_type: cosine` (with `cosine_width` and `cosine_initial_scale`) selects the small cosine
+head; the script prints the resolved setup at start-up. UltraBERT (`model_type: ultrabert`) is such an encoder; its
+tokenizer has no `[CLS]`, so the plain prompt starts with its `<|endoftext|>` and ends with its `<|sep|>`. The script
+never newly initialises backbone weights and never runs remote code (`trust_remote_code` is refused): a checkpoint that
+stores its backbone under a key prefix, such as a remote-code reranker package with `backbone.<name>` weights, has its
+backbone read from its safetensors under the one prefix that holds every weight with its shape, its other tensors
+dropped, and the start-up line names the source (`direct` or `prefix "backbone."`) and the dropped tensors. Weights
+that no single prefix provides, or several prefixes that each do, raise a `ValueError`; so do per-layer
+`attention_windows` or `rope_theta` lists in such a package's `config.json` that differ within a kind of layer, which
+Transformers' UltraBERT config would read as one value per kind. `max_train_samples` limits the training split to a
+random sample drawn with `seed`, not to its first rows; the evaluation holdout and `max_eval_samples` are drawn with
+`eval_sample_seed` (0 by default), so runs with different seeds evaluate on the same records. Samples are drawn before
+tokenization, so skipped records can leave fewer than asked for (the build report shows how many). The configuration
+keeps the weights in float32 with `bf16: true`, since KLM's fused CUDA kernels only run on float32 parameters. Loss
+settings given for a Clef checkpoint are checked as a new `ClefConfig` checks them. Each row holds `state` (a record,
+or its JSON string, which is decoded so that the prompt renders the record), `questions` and the targets of all of its
+questions, either `targets` (per question `target_index`, `target_probs`, `p_true` or `score`) or `gold` / `answers`
+(per question a label or probabilities), in exactly one of these forms. The example collator `DataCollatorForClef`
+reads the request itself (its `tokenize` decodes the JSON columns and renders the one prompt) and the targets with
+`DataCollatorForDecision.prepare_labeled_targets`, which also gives the gold label of each question. It returns one row
+of `labels` and `option_mask` per question, with the questions of all records of a batch one after the other. Nullable
+questions raise: Clef has no coverage output. `truncation` has three modes. With `error`, a prompt longer than
 `max_length`, an invalid request, a nullable question or unusable targets raise. With `skip`, such a record is dropped
 and counted by reason in the build report the script prints (rows, questions, skipped by reason, truncated). With
 `state`, the configuration's choice and what Clef itself does, an over-length record keeps its whole prompt but the end
 of its state, cut so that the prompt is exactly `max_length` tokens: the questions, options and targets are never cut,
-and the build report counts these records as `truncated`. A record too long even without its state is skipped
-(`schema longer than max_length`), as are invalid records. With `permute_fields`, each training batch re-renders its
-prompts with the questions in a new random order, each keeping its target (and cut the same way); evaluation never
-does. Activation checkpointing (`gradient_checkpointing: true`) covers the backbone and the head. The collator returns `rows_per_example`, so the
-example also runs on several processes:
+and the build report counts these records as `truncated`. A record too long even without its state is skipped (`schema
+longer than max_length`), as are invalid records. With `permute_fields`, each training batch re-renders its prompts
+with the questions in a new random order, each keeping its target (and cut the same way); evaluation never does.
+Activation checkpointing (`gradient_checkpointing: true`) covers the backbone and the head. A BERT-style encoder loaded
+as the backbone keeps its pooler, which Clef never reads, so the pooler's parameters get no gradient: DDP then fails
+unless `ddp_find_unused_parameters: true`, which does not combine with activation checkpointing; train such a backbone
+with `mode: head` or `lora`, or on one process, or without activation checkpointing. The collator returns
+`rows_per_example`, so the example also runs on several processes, and evaluates with its own collator, which never
+permutes:
 
 ```bash
 torchrun --nproc_per_node=2 \
@@ -121,31 +146,35 @@ policy term, described next.
 
 ### RLCD
 
-RLCD is Laya's "Reinforcement Learning for Calibrated Decisions", adapted from [Laya](https://github.com/NandhaKishorM/laya)
-(Apache-2.0). It is a community recipe, not an official Cloudflare objective, and is normally run as a second phase
-after cross-entropy training: noisy samples of the option logits are rewarded by a strictly proper scoring rule, and a
-REINFORCE term with a per-question mean baseline joins the supervised loss, which the phase keeps. `rlcd_sigma`,
-`rlcd_samples` and `rlcd_normalize_advantage` tune it; each setting left unset keeps the value of the model's config.
-The term applies in training only, so `eval_loss` is always the deterministic supervised loss. Its defaults (sigma 0.4,
-32 samples, advantages not divided by their standard deviation; `0.25` is the suggested weight) are a revised variant
-of Laya's objective; `rlcd_normalize_advantage: true` with `rlcd_samples: 4` reproduces Laya's original.
+RLCD is Laya's "Reinforcement Learning for Calibrated Decisions", adapted from
+[Laya](https://github.com/NandhaKishorM/laya) (Apache-2.0). It is a community recipe, not an official Cloudflare
+objective, and is normally run as a second phase after cross-entropy training: noisy samples of the option logits are
+rewarded by a strictly proper scoring rule, and a REINFORCE term with a per-question mean baseline joins the supervised
+loss, which the phase keeps. `rlcd_sigma`, `rlcd_samples` and `rlcd_normalize_advantage` tune it; each setting left
+unset keeps the value of the model's config. The term applies in training only, so `eval_loss` is always the
+deterministic supervised loss. Its defaults (sigma 0.4, 32 samples, advantages not divided by their standard deviation;
+`0.25` is the suggested weight) are a revised variant of Laya's objective; `rlcd_normalize_advantage: true` with
+`rlcd_samples: 4` reproduces Laya's original.
 
 There are two ways to run it:
 
 1. **Two runs (recommended).** Train with cross-entropy, then start the example again with `model_name_or_path` set to
-   the saved Clef checkpoint and `rlcd_weight` set. The second run loads the checkpoint as its starting weights and
-   trains with a fresh optimizer (do not pass `resume_from_checkpoint`); its first evaluation reproduces the final
-   `eval_loss` of the first run. The paired RLCD experiments used this recipe.
+   the saved Clef checkpoint, another `output_dir`, and `rlcd_weight` set. The second run loads the checkpoint as its
+   starting weights and trains with a fresh optimizer (do not pass `resume_from_checkpoint`); its first evaluation
+   reproduces the final `eval_loss` of the first run. The paired RLCD experiments used this recipe.
 2. **One run.** Cross-entropy first, RLCD from a given epoch: set `rlcd_weight` (the weight of the phase, which must
    be positive), `rlcd_start_epoch` and `rlcd_sigmas`. The model is built with `rlcd_weight` 0, and
    [`~trl.experimental.decision.RlcdScheduleCallback`] switches it on at `rlcd_start_epoch`. `rlcd_weight` without
-   either schedule setting turns RLCD on from the first step.
+   either schedule setting turns RLCD on from the first step, which on a new head logs a warning.
+   `rlcd_start_epoch` must be before the end of the run, and `rlcd_sigma` cannot be combined with `rlcd_sigmas`; both
+   raise.
 
 `rlcd_sigmas` anneals the noise per epoch of the RLCD phase, counted from `rlcd_start_epoch`: Laya's schedule
 `[0.4, 0.3, 0.2, 0.1]` uses sigma 0.4 in the first epoch of the phase, 0.3 in the second, and so on, and the last value
 is held for later epochs. The values are a function of the epoch alone, so a resumed run and every process of a
 distributed run agree, and when training ends the model's config keeps the weight and sigma in effect at the last step,
-so the saved checkpoint records what it was trained with (a run that stops before `rlcd_start_epoch` keeps weight 0).
+so the saved checkpoint records what it was trained with (a run that stops early, before `rlcd_start_epoch`, keeps
+weight 0).
 With `load_best_model_at_end`, the restored weights may come from an earlier phase than the saved config records.
 
 ```yaml
@@ -236,9 +265,20 @@ distributions in `labels`. The trainer removes it before calling the model and p
 option a row's gold `label` (or `target_index`) names, else the target's first most probable option. Accuracy is
 counted against it, so a tie in the target probabilities is scored against the label the row gives.
 
-`compute_calibration_metrics` can be passed as `compute_metrics` as it is. It reports, per question, `accuracy` (against the gold
-label when `label_ids` carries one, else against the target's first most probable option), `kl` (from the target
-distribution), `brier`, `ece`, `mean_confidence`, `soft_nll`, `confidence_gap` (mean confidence minus
+To get one row per question back from the record-shaped arrays (keeping `rows_per_example` yourself), use
+`trl.experimental.decision.decision_trainer.unpack_rows`, the inverse of the packing; or drop the slots that are `-100`
+in every cell. Records are never dispatched or split across processes: the trainer raises when a dataloader does so
+(streaming datasets are dispatched by default), so set `accelerator_config` to
+`{"dispatch_batches": false, "split_batches": false}`.
+
+`eval_loss` is the mean of the batch losses weighted by the records of each batch, so it shifts slightly with the
+evaluation batch size and the number of processes when records have different numbers of questions; the per-question
+metrics do not. `eval_choice_accuracy` counts only choice questions with a one-hot target;
+`compute_calibration_metrics` counts every question.
+
+`compute_calibration_metrics` can be passed as `compute_metrics` as it is. It reports, per question, `accuracy`
+(against the gold label when `label_ids` carries one, else against the target's first most probable option), `kl` (from
+the target distribution), `brier`, `ece`, `mean_confidence`, `soft_nll`, `confidence_gap` (mean confidence minus
 accuracy) and `selection_score` (`accuracy - kl_weight * kl - brier_weight * brier`, with both weights `0.25` by
 default), a single number to select checkpoints with `metric_for_best_model: eval_selection_score`.
 
@@ -285,6 +325,12 @@ answers = decide(request)
 [[autodoc]] experimental.decision.DataCollatorForDecision
     - prepare_example
     - prepare_request
+    - prepare_targets
+    - prepare_labeled_targets
+
+## target_from_gold
+
+[[autodoc]] experimental.decision.target_from_gold
 
 ## compute_calibration_metrics
 

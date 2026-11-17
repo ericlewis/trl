@@ -121,9 +121,10 @@ def target_from_gold(gold: Any, question: Question) -> dict[str, list[float]]:
 
     `gold` is a bare label, or a dict with `label` and/or `probabilities` (for a noul question, `noul` is also accepted
     as the probability of true). Probabilities take each option's value (missing or negative counts as zero), fill the
-    missing side of a noul as `1 - p`, and are normalized to sum to one. Without probabilities, a label that names an
-    option gives a one-hot target. Labels are normalized per type: noul takes booleans and "true"/"false", score takes
-    an integer level or its string. Probabilities follow `question.options`.
+    missing side of a noul as `1 - p`, and are normalized to sum to one. Without probabilities, or with probabilities
+    that add up to zero (every option missing, zero or negative), a label that names an option gives a one-hot target;
+    without such a label, a `ValueError` is raised. Labels are normalized per type: noul takes booleans and
+    "true"/"false", score takes an integer level or its string. Probabilities follow `question.options`.
     """
     options = list(question.options)
     row = gold if isinstance(gold, Mapping) else {"label": gold}
@@ -211,8 +212,7 @@ class DataCollatorForDecision(DataCollatorMixin):
 
         The template must render all questions in one prompt. Targets come from `example["targets"]`, a mapping of
         question name to a row for `normalize_target`, or from `example["gold"]` / `example["answers"]`, a mapping of
-        question name to a gold answer for [`~experimental.decision.data_collator.target_from_gold`]. Either may be a
-        JSON string.
+        question name to a gold answer for [`~experimental.decision.target_from_gold`]. Either may be a JSON string.
         """
         if "request" in example:
             request = example["request"]
@@ -243,6 +243,11 @@ class DataCollatorForDecision(DataCollatorMixin):
         the target probabilities is scored against the label the row gives.
         """
         names = [question.name for question in questions]
+        given = [key for key in ("targets", "gold", "answers") if example.get(key) is not None]
+        if len(given) > 1:
+            raise ValueError(
+                f"A row gives targets in {given}; give them in exactly one of `targets`, `gold`, `answers`"
+            )
         if example.get("targets") is not None:
             rows, convert = _json_value(example["targets"]), lambda row, question: row
             source = "targets"
@@ -262,6 +267,11 @@ class DataCollatorForDecision(DataCollatorMixin):
             if question.name not in rows:
                 raise ValueError(f"`{source}` has no entry for question {question.name!r}")
             row = rows[question.name]
+            if source == "targets" and not isinstance(row, Mapping):
+                raise ValueError(
+                    f"Question {question.name!r}: a target must map target_index, target_probs, p_true or score to its "
+                    f"value, not be {type(row).__name__}"
+                )
             try:
                 target = normalize_target(convert(row, question), question)
             except ValueError as error:

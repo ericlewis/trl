@@ -36,7 +36,8 @@ class RlcdScheduleCallback(TrainerCallback):
         weight (`float`):
             Weight of the RLCD policy term from `start_epoch` on. Must not be negative.
         start_epoch (`float`, *optional*, defaults to `0.0`):
-            Epoch at which RLCD starts. Must not be negative.
+            Epoch at which RLCD starts. Must not be negative, and must be before the end of training (checked when
+            training begins).
         sigmas (`Sequence[float]`, *optional*):
             One noise scale per epoch of the RLCD phase, counted from `start_epoch`: the first applies to
             `[start_epoch, start_epoch + 1)`, and so on, and the last is held for any further epochs. `None` leaves
@@ -88,8 +89,31 @@ class RlcdScheduleCallback(TrainerCallback):
         if changes and state.is_world_process_zero:
             logger.info("RLCD schedule at epoch %s: %s", state.epoch, ", ".join(changes))
 
-    def on_train_begin(self, args, state, control, model=None, **kwargs):
+    @staticmethod
+    def _end_epoch(args, state, train_dataloader) -> float | None:
+        """
+        The epoch training is set to end at (its last step, in batches over the batches of an epoch), or `None` when
+        the state does not tell.
+        """
+        if state.max_steps <= 0:
+            return None
+        try:
+            batches = len(train_dataloader)
+        except TypeError:  # an iterable dataset of unknown length, or no dataloader
+            batches = 0
+        if batches:
+            return state.max_steps * args.gradient_accumulation_steps / batches
+        return float(state.num_train_epochs) or None
+
+    def on_train_begin(self, args, state, control, model=None, train_dataloader=None, **kwargs):
         self._config(model)  # raises for a model without RLCD
+        end = self._end_epoch(args, state, train_dataloader)
+        # A run that is set to end before the phase is a mistake; one that stops early (early stopping) is not
+        if end is not None and self.start_epoch >= end:
+            raise ValueError(
+                f"RLCD starts at epoch {self.start_epoch}, but training ends at epoch {end:g}, so it would never run; "
+                "lower rlcd_start_epoch or train longer"
+            )
         self._apply(state, model)
 
     def on_step_begin(self, args, state, control, model=None, **kwargs):

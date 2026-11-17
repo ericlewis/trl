@@ -311,6 +311,12 @@ class TestDataCollatorForClef:
             ("nullable question", {"state": "s", "questions": {"team": nullable}, "gold": {"team": "zeta"}}),
             ("unusable targets", {**make_row(0, names=("team",)), "gold": {"team": "omega"}}),
             ("unusable targets", {**make_row(0, names=("team",)), "gold": {}}),
+            # A target that is not a mapping, and targets given twice
+            (
+                "unusable targets",
+                {**{k: v for k, v in make_row(0, names=("team",)).items() if k != "gold"}, "targets": {"team": 1}},
+            ),
+            ("unusable targets", {**make_row(0, names=("team",)), "targets": {"team": {"target_index": 1}}}),
         ]
         strict = DataCollatorForClef(tokenizer, decision_config)
         skipping = DataCollatorForClef(tokenizer, decision_config, truncation="skip")
@@ -558,7 +564,8 @@ class TestDataCollatorForClef:
         unknown = {**tied, "gold": {**tied["gold"], "team": {"label": "omega", "probabilities": {"zeta": 1.0}}}}
         assert collator.tokenize(unknown)["hard_labels"] == [1, 1, 2]
         targets = {"refund": {"p_true": 0.5}, "team": {"target_index": 1}, "urgency": {"score": 1.5}}
-        assert collator.tokenize({**make_row(0), "targets": targets})["hard_labels"] == [0, 1, 1]
+        without_gold = {key: value for key, value in make_row(0).items() if key != "gold"}
+        assert collator.tokenize({**without_gold, "targets": targets})["hard_labels"] == [0, 1, 1]
         # A bare label, as `answers`
         answers = {**make_row(0), "answers": {"refund": False, "team": "zeta", "urgency": 2}}
         del answers["gold"]
@@ -1109,7 +1116,8 @@ class TestClefTraining(TrlTestCase):
         callback.on_train_end(None, state, None, model=model)
         # The values in effect at the last step: the weight of the phase, and the last sigma that applied
         assert (model.config.rlcd_weight, model.config.rlcd_sigma) == (0.25, 0.2)
-        # Training that ended before the phase started never trained with RLCD, so the config does not claim it did
+        # Training that stopped before the phase started (early stopping) never trained with RLCD, so the config does
+        # not claim it did
         model = tiny_clef(tokenizer, decision_config)
         callback = RlcdScheduleCallback(0.25, start_epoch=3, sigmas=[0.4])
         callback.on_train_begin(None, state, None, model=model)
@@ -1290,6 +1298,71 @@ class TestClefTraining(TrlTestCase):
         # The settings it already has are fine
         model = build_model(ClefScriptArguments(head_type="joint"), model_args, {"dtype": "float32"})
         assert model.config.head_type == "joint"
+        # So are its head sizes: they are not ignored, and the ones it has are fine
+        with pytest.raises(ValueError, match="hidden_size"):
+            build_model(ClefScriptArguments(head_hidden_size=64), model_args, {"dtype": "float32"})
+        assert build_model(ClefScriptArguments(head_hidden_size=16), model_args, {"dtype": "float32"})
+        # The cosine head's settings do not apply to the joint head
+        with pytest.raises(ValueError, match="cosine_width"):
+            build_model(ClefScriptArguments(cosine_width=16), model_args, {"dtype": "float32"})
+
+    def test_head_settings_that_would_be_ignored_raise(self, tokenizer):
+        AutoModelForCausalLM.from_pretrained(MODEL_ID).save_pretrained(f"{self.tmp_dir}/backbone")
+        for settings in ({"cosine_width": 8}, {"head_type": "joint", "cosine_initial_scale": 5.0}):
+            with pytest.raises(ValueError, match="head_type: cosine"):
+                self.build_from(f"{self.tmp_dir}/backbone", **settings)
+        assert self.build_from(f"{self.tmp_dir}/backbone", head_type="cosine", cosine_width=8).config.cosine_width == 8
+        # rlcd_sigmas sets every epoch's noise scale, so rlcd_sigma would be ignored
+        with pytest.raises(ValueError, match="rlcd_sigma"):
+            self.build_from(f"{self.tmp_dir}/backbone", rlcd_weight=0.25, rlcd_sigma=0.3, rlcd_sigmas=[0.4, 0.1])
+
+    def test_rlcd_on_a_new_head_without_a_schedule_warns(self, tokenizer, decision_config):
+        AutoModelForCausalLM.from_pretrained(MODEL_ID).save_pretrained(f"{self.tmp_dir}/backbone")
+        with pytest.warns(UserWarning, match="after cross-entropy"):
+            self.build_from(f"{self.tmp_dir}/backbone", rlcd_weight=0.25)
+        # Not with a schedule, nor for a checkpoint (the second phase of the recipe)
+        tiny_clef(tokenizer, decision_config).save_pretrained(f"{self.tmp_dir}/clef")
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", message=".*after cross-entropy.*")
+            self.build_from(f"{self.tmp_dir}/backbone", rlcd_weight=0.25, rlcd_start_epoch=1)
+            self.build_from(f"{self.tmp_dir}/clef", rlcd_weight=0.25)
+
+    def test_rlcd_start_at_or_after_the_end_raises(self, tokenizer):
+        # 5 steps of 2 of the 9 training records: training ends at epoch 2
+        for start in (2, 3):
+            with pytest.raises(ValueError, match="never run"):
+                self.run_main(tokenizer, "full", script_kwargs={"rlcd_weight": 0.25, "rlcd_start_epoch": start})
+        trainer, _, _ = self.run_main(tokenizer, "full", script_kwargs={"rlcd_weight": 0.25, "rlcd_start_epoch": 1})
+        assert trainer.model.config.rlcd_weight == 0.25
+
+    def test_max_length_beyond_the_backbone_positions_raises(self, tokenizer):
+        from examples.decisions.clef_typed_decisions import position_limit
+        from transformers import BertModel
+
+        tokenizer = encoder_tokenizer(tokenizer)
+        sizes = {"vocab_size": len(tokenizer) + 2, "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2}
+        set_seed(0)
+        backbone = BertModel(BertConfig(**sizes, num_attention_heads=2, max_position_embeddings=128))
+        assert position_limit(backbone) == 128
+        assert position_limit(AutoModel.from_pretrained(MODEL_ID)) is None  # rotary positions
+        with pytest.raises(ValueError, match="at most 128 positions"):
+            self.run_main(tokenizer, "head", backbone=backbone)  # max_length 400
+        assert not Path(self.tmp_dir, "out").exists()
+
+    def test_missing_template_follows_the_prompt_style(self, tokenizer):
+        from transformers.decision import DecisionConfig as TransformersDecisionConfig
+
+        tokenizer = encoder_tokenizer(tokenizer)
+        model = tiny_clef(tokenizer, None, "bert")
+        model.decision_config = TransformersDecisionConfig()
+        assert model.decision_config.chat_template is None
+        model.save_pretrained(f"{self.tmp_dir}/clef")
+        built = self.build_from(f"{self.tmp_dir}/clef")
+        assert built.config.prompt_style == "plain"
+        assert built.decision_config.chat_template == clef_decision_config("plain").chat_template
+        assert built.decision_config.chat_template != clef_decision_config().chat_template
 
     def test_default_configuration_keeps_its_best_checkpoint(self):
         from trl import TrlParser
@@ -1331,6 +1404,9 @@ class TestClefTraining(TrlTestCase):
 
     def test_attention_implementation_reaches_main(self, tokenizer):
         trainer, _, _ = self.run_main(tokenizer, "head", attn_implementation="eager")
+        # Evaluation batches with its own, non-permuting collator
+        assert trainer.data_collator.permute_fields is True
+        assert trainer.eval_data_collator.permute_fields is False
         assert trainer.model.model.config._attn_implementation == "eager"
         assert trainer.model.config._attn_implementation == "sdpa"
 
@@ -1495,6 +1571,30 @@ class TestClefTraining(TrlTestCase):
         assert "dropped 3 non-backbone tensors" in line
         assert all(key in line for key in PAIR_HEAD)
 
+    def test_sharded_reranker_package_backbone_is_loaded(self, tokenizer):
+        from safetensors.torch import save_file
+
+        tokenizer = ultrabert_tokenizer(tokenizer)
+        backbone = tiny_ultrabert(tokenizer)
+        folder = f"{self.tmp_dir}/reranker"
+        reranker_package(folder, backbone, tokenizer, {**prefixed(backbone, "backbone."), **PAIR_HEAD})
+        # The same tensors in two shards with an index, as large packages store them
+        tensors = {**prefixed(backbone, "backbone."), **PAIR_HEAD}
+        names = sorted(tensors)
+        shards = {"model-00001-of-00002.safetensors": names[::2], "model-00002-of-00002.safetensors": names[1::2]}
+        Path(folder, "model.safetensors").unlink()
+        for shard, keys in shards.items():
+            save_file({key: tensors[key] for key in keys}, f"{folder}/{shard}", metadata={"format": "pt"})
+        weight_map = {key: shard for shard, keys in shards.items() for key in keys}
+        Path(folder, "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": weight_map}))
+        model = self.build_from(folder)
+        expected, built = backbone.state_dict(), model.model.state_dict()
+        assert set(built) == set(expected)
+        for name, value in built.items():
+            assert torch.equal(value, expected[name]), name
+        assert 'backbone weights: prefix "backbone."' in describe(model)
+        assert "dropped 3 non-backbone tensors" in describe(model)
+
     @pytest.mark.parametrize(
         "changes, match",
         [
@@ -1586,7 +1686,7 @@ class TestClefTraining(TrlTestCase):
         folder = reranker_package(
             f"{self.tmp_dir}/reranker", backbone, tokenizer, {**prefixed(backbone, "backbone."), **PAIR_HEAD}
         )
-        script_kwargs = {"head_type": head_type, "cosine_width": 8}
+        script_kwargs = {"head_type": head_type, **({"cosine_width": 8} if head_type == "cosine" else {})}
         trainer, initial, _ = self.run_main(tokenizer, "full", checkpoint=folder, script_kwargs=script_kwargs)
         assert trainer.state.global_step == 5
         out = capsys.readouterr().out
@@ -1859,8 +1959,58 @@ class TestRecordRows(TrlTestCase):
         assert packed_metrics["eval_accuracy"] == pytest.approx(correct.mean(), abs=1e-9)
 
 
+class TestEvaluationBatches(TrlTestCase):
+    """Evaluation batches are never permuted, and records are never dispatched or split across processes."""
+
+    def test_eval_data_collator_never_permutes(self, tokenizer, decision_config):
+        permuting = DataCollatorForClef(tokenizer, decision_config, permute_fields=True, seed=1)
+        evaluating = DataCollatorForClef(tokenizer, decision_config)
+        rows = [make_row(index) for index in range(8)]
+        # Even records that carry their request (tokenized by the permuting collator) are evaluated as they are
+        carried = Dataset.from_list(tokenized(permuting, rows))
+        plain = Dataset.from_list(tokenized(evaluating, rows))
+        assert "request" in carried.column_names
+        trainer, _, _ = make_trainer(
+            self.tmp_dir, tokenizer, decision_config, compute_metrics=compute_calibration_metrics
+        )
+        trainer.data_collator = permuting
+        trainer.eval_data_collator = evaluating
+        reference = trainer.predict(plain)
+        for _ in range(3):
+            np.testing.assert_array_equal(trainer.predict(carried).predictions, reference.predictions)
+        # The training collator still permutes
+        batches = [trainer.data_collator([carried[i] for i in range(8)])["input_ids"] for _ in range(4)]
+        assert any(not torch.equal(batches[0], batch) for batch in batches[1:])
+        assert trainer.get_train_dataloader().collate_fn is not evaluating
+
+    def test_dispatched_or_split_batches_raise(self, tokenizer, decision_config):
+        from accelerate.data_loader import BatchSamplerShard, DataLoaderDispatcher
+        from torch.utils.data import BatchSampler, DataLoader, SequentialSampler
+
+        from trl.experimental.decision.decision_trainer import splits_batches
+
+        data = list(range(8))
+        assert splits_batches(DataLoaderDispatcher(data, batch_size=2), 2)
+        assert not splits_batches(DataLoaderDispatcher(data, batch_size=2), 1)
+        assert not splits_batches(DataLoader(data, batch_size=2), 2)
+        sampler = BatchSamplerShard(BatchSampler(SequentialSampler(data), 4, False), 2, 0, split_batches=True)
+        assert splits_batches(DataLoader(data, batch_sampler=sampler), 2)
+        trainer, _, _ = make_trainer(self.tmp_dir, tokenizer, decision_config)
+        trainer._splits_batches = True
+        with pytest.raises(ValueError, match="dispatched or split"):
+            trainer.train()
+        # The example refuses the settings outright
+        for key in ("dispatch_batches", "split_batches"):
+            args = DecisionConfig(output_dir=self.tmp_dir, use_cpu=True, report_to="none")
+            setattr(args.accelerator_config, key, True)
+            with pytest.raises(ValueError, match=key):
+                from examples.decisions.clef_typed_decisions import build_trainer
+
+                build_trainer(ClefScriptArguments(), args, ClefModelArguments())
+
+
 class TestClefBenchmark(TrlTestCase):
-    """The benchmark runs the example's own training path and reports the numbers of the baseline benchmark."""
+    """The benchmark runs the example's own training path and reports the numbers of the reference benchmark."""
 
     def test_synthetic_benchmark_reports_all_numbers(self):
         from examples.decisions.benchmark_clef import run_benchmark
@@ -1869,7 +2019,7 @@ class TestClefBenchmark(TrlTestCase):
         for key in ("build_seconds", "first_step_seconds", "steady_records_per_second", "eval_seconds"):
             assert math.isfinite(r[key]) and r[key] > 0
         assert r["recipe"]["synthetic"] is True
-        # The fields of the baseline's summary.json, under the same names
+        # The fields of the reference's summary.json, under the same names
         for key in (
             "startup_seconds",
             "trainer_wall_seconds",

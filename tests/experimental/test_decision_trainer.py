@@ -45,8 +45,8 @@ from trl.experimental.decision import (
     DecisionConfig,
     DecisionTrainer,
     compute_calibration_metrics,
+    target_from_gold,
 )
-from trl.experimental.decision.data_collator import target_from_gold
 
 from ..testing_utils import TrlTestCase, require_peft
 
@@ -791,6 +791,48 @@ class TestDataCollatorForDecisionRequests(TrlTestCase):
             }
         )
         assert targets[0] == pytest.approx((0, 0.75, 0.25))
+
+    def test_zero_sum_probabilities_fall_back_to_the_label(self, tokenizer):
+        collator = self.make_collator(tokenizer)
+        _, (refund, team, urgency), _ = collator.prepare_request(
+            {"state": "s", "questions": THREE_QUESTIONS, "targets": THREE_TARGETS}
+        )
+        zero = {"label": "zeta", "probabilities": {"alpha": 0.0, "zeta": -1.0, "omega": 5.0}}
+        assert target_from_gold(zero, team) == {"target_probs": [0.0, 0.0, 1.0]}
+        with pytest.raises(ValueError, match="no usable label or probabilities"):
+            target_from_gold({"probabilities": {"alpha": 0.0}}, team)
+
+    def test_answers_form_of_targets(self, tokenizer):
+        collator = self.make_collator(tokenizer)
+        answers = {"refund": {"noul": 0.75}, "team": "zeta", "urgency": {"label": 1}}
+        _, _, from_answers = collator.prepare_request({"state": "s", "questions": THREE_QUESTIONS, "answers": answers})
+        _, _, from_gold = collator.prepare_request({"state": "s", "questions": THREE_QUESTIONS, "gold": answers})
+        assert from_answers == from_gold
+        assert from_answers[1] == (0.0, 0.0, 1.0) and from_answers[2] == (0.0, 0.0, 1.0, 0.0)
+        _, labels = collator.prepare_labeled_targets(
+            {"answers": json.dumps(answers)},
+            collator.prepare_request({"state": "s", "questions": THREE_QUESTIONS, "answers": answers})[1],
+        )
+        assert labels == [0, 1, 1]
+
+    def test_targets_in_more_than_one_form_raise(self, tokenizer):
+        collator = self.make_collator(tokenizer)
+        gold = {"refund": True, "team": "zeta", "urgency": 2}
+        for other in ({"gold": gold}, {"answers": gold}):
+            with pytest.raises(ValueError, match="exactly one"):
+                collator.prepare_request(
+                    {"state": "s", "questions": THREE_QUESTIONS, "targets": THREE_TARGETS, **other}
+                )
+        with pytest.raises(ValueError, match="exactly one"):
+            collator.prepare_request({"state": "s", "questions": THREE_QUESTIONS, "gold": gold, "answers": gold})
+
+    @pytest.mark.parametrize("target", [1, "zeta", [0.0, 1.0], None])
+    def test_a_target_that_is_not_a_mapping_is_a_value_error(self, tokenizer, target):
+        collator = self.make_collator(tokenizer)
+        with pytest.raises(ValueError, match="'team'"):
+            collator.prepare_request(
+                {"state": "s", "questions": THREE_QUESTIONS, "targets": {**THREE_TARGETS, "team": target}}
+            )
 
     def test_missing_target_names_the_question(self, tokenizer):
         collator = self.make_collator(tokenizer)

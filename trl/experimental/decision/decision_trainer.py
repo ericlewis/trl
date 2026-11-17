@@ -108,6 +108,19 @@ def _to_model_layout(model: PreTrainedModel, state_dict: dict[str, torch.Tensor]
     return converted
 
 
+def splits_batches(dataloader, num_processes: int) -> bool:
+    """Whether `dataloader`, prepared by Accelerate, dispatches or splits its batches across several processes."""
+    from accelerate.data_loader import DataLoaderDispatcher
+
+    if num_processes <= 1:
+        return False
+    if isinstance(dataloader, DataLoaderDispatcher):
+        return True
+    # A split batch sampler (map-style datasets) or a split iterable dataset
+    parts = (dataloader, getattr(dataloader, "batch_sampler", None), getattr(dataloader, "dataset", None))
+    return any(getattr(part, "split_batches", False) is True for part in parts)
+
+
 def pack_rows(rows: torch.Tensor, rows_per_example: torch.Tensor, max_rows: int, fill: float) -> torch.Tensor:
     """
     Pack `rows` (`(num_rows, ...)`), whose first `rows_per_example[0]` rows belong to the first record, the next
@@ -130,7 +143,11 @@ def pack_rows(rows: torch.Tensor, rows_per_example: torch.Tensor, max_rows: int,
 
 
 def unpack_rows(packed: torch.Tensor, rows_per_example: torch.Tensor) -> torch.Tensor:
-    """The rows packed by [`pack_rows`], in record order then row order."""
+    """
+    The rows packed by [`pack_rows`], in record order then row order: the inverse of the record-shaped packing, for
+    `compute_metrics` authors who keep `rows_per_example` and want one row per question (the evaluation itself passes
+    the slots flattened, and the padded ones are `-100` in every cell).
+    """
     slots = torch.arange(packed.shape[1], device=packed.device)
     return packed[slots[None, :] < rows_per_example.to(packed.device)[:, None]]
 
@@ -178,6 +195,9 @@ class DecisionTrainer(_BaseTrainer):
             Prediction preprocessing passed to [`~transformers.Trainer`].
         peft_config (`PeftConfig`, *optional*):
             PEFT configuration used to wrap the model. Configure any trainable head through `modules_to_save`.
+        eval_data_collator (`Callable`, *optional*):
+            Collator of evaluation and prediction batches; defaults to `data_collator`. Give one when the training
+            collator changes its examples (a collator that permutes questions), so that evaluation never does.
     """
 
     loss_is_scaled_for_ga = True
@@ -198,6 +218,7 @@ class DecisionTrainer(_BaseTrainer):
         optimizer_cls_and_kwargs: tuple | None = None,
         preprocess_logits_for_metrics: Callable | None = None,
         peft_config: Any | None = None,
+        eval_data_collator: Callable | None = None,
     ):
         if args is None:
             args = DecisionConfig(output_dir="Decision")
@@ -228,6 +249,9 @@ class DecisionTrainer(_BaseTrainer):
                 raise ImportError("Install `trl[peft]` to use peft_config")
             model = get_peft_model(model, peft_config)
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
+        self.eval_data_collator = eval_data_collator
+        # Whether a dataloader dispatches or splits batches across processes, which breaks records apart
+        self._splits_batches = False
         super().__init__(
             model=model,
             args=args,
@@ -245,6 +269,18 @@ class DecisionTrainer(_BaseTrainer):
         parallelism_config = self.accelerator.parallelism_config
         if parallelism_config is not None and (parallelism_config.cp_enabled or parallelism_config.sp_enabled):
             raise ValueError("DecisionTrainer does not support context or sequence parallelism")
+
+    def _get_dataloader(self, *args, is_training: bool = False, **kwargs):
+        collator = self.data_collator
+        if not is_training and self.eval_data_collator is not None:
+            # The dataloader keeps the collator it is built with
+            self.data_collator = self.eval_data_collator
+        try:
+            dataloader = super()._get_dataloader(*args, is_training=is_training, **kwargs)
+        finally:
+            self.data_collator = collator
+        self._splits_batches |= splits_batches(dataloader, self.accelerator.num_processes)
+        return dataloader
 
     def create_optimizer(self, model=None):
         """
@@ -318,6 +354,12 @@ class DecisionTrainer(_BaseTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         mode = "train" if self.model.training else "eval"
+        if self._splits_batches and inputs.get("rows_per_example") is not None:
+            raise ValueError(
+                "Batches with rows_per_example hold whole records, so they cannot be dispatched or split across "
+                "processes (streaming datasets are dispatched by default). Set accelerator_config to "
+                '{"dispatch_batches": false, "split_batches": false}.'
+            )
         model_inputs = {key: value for key, value in inputs.items() if key not in METADATA_KEYS}
         # Sharded encoders must execute the same number of option chunks on every rank.
         if self.accelerator.num_processes > 1 and inputs.get("option_chunk_size") is not None:
