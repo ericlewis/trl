@@ -19,13 +19,19 @@ from typing import Any
 import numpy as np
 
 
+# Smallest `budget_bytes` honoured by `build_digest`: smaller budgets are clamped to it, so that even the most reduced
+# digest (steps, best step, a few flagged names, drop count) always fits.
+MIN_BUDGET_BYTES = 512
+_MAX_INT = 2**53
+
+
 def json_safe(value: Any, nonfinite: set[str] | None = None, _key: str | None = None) -> Any:
     """
     Convert `value` to something `json.dumps(..., allow_nan=False)` accepts.
 
-    Non-finite floats become `None`; when `nonfinite` is given, the name of the dictionary key they were found under
-    is added to it. Tuples become lists, dictionary keys become strings, NumPy scalars and arrays become Python
-    values, and anything else unknown becomes its `str()`.
+    Non-finite floats become `None`; when `nonfinite` is given, the name of the dictionary key they were found under is
+    added to it. Tuples become lists, dictionary keys become strings, NumPy scalars and arrays become Python values,
+    and anything else unknown becomes its `str()`.
     """
     if value is None or isinstance(value, (bool, str)):
         return value
@@ -48,28 +54,46 @@ def json_safe(value: Any, nonfinite: set[str] | None = None, _key: str | None = 
 
 
 def _finite(value: Any) -> float | None:
+    """`value` as a finite float, or `None` when it is not a number, not finite, or does not fit a float."""
     if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
         return None
-    value = float(value)
+    try:
+        value = float(value)
+    except (OverflowError, ValueError):
+        return None
     return value if math.isfinite(value) else None
+
+
+def _step(value: Any, name: str, nonfinite: set[str]) -> int | None:
+    """A step as a bounded int; garbage (NaN, inf, huge, not a number) becomes `None` and `name` is flagged."""
+    number = _finite(value)
+    if number is None or abs(number) >= _MAX_INT:
+        nonfinite.add(name)
+        return None
+    return int(number)
 
 
 def _slope(points: list[tuple[float, float]]) -> float | None:
     """Least-squares slope of `(step, value)` points, `None` when there are fewer than two distinct steps."""
     if len(points) < 2:
         return None
-    xs = np.array([p[0] for p in points], dtype=np.float64)
-    ys = np.array([p[1] for p in points], dtype=np.float64)
-    xs = xs - xs.mean()
-    denom = float((xs * xs).sum())
-    if denom == 0.0:
-        return None
-    slope = float((xs * (ys - ys.mean())).sum() / denom)
+    with np.errstate(all="ignore"):
+        xs = np.array([p[0] for p in points], dtype=np.float64)
+        ys = np.array([p[1] for p in points], dtype=np.float64)
+        xs = xs - xs.mean()
+        denom = float((xs * xs).sum())
+        if denom == 0.0:
+            return None
+        slope = float((xs * (ys - ys.mean())).sum() / denom)
     return slope if math.isfinite(slope) else None
 
 
 def _size(digest: dict) -> int:
     return len(json.dumps(digest, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+
+
+def _short_names(names: set[str] | list[str], limit: int = 16, width: int = 48) -> list[str]:
+    return [n[:width] for n in sorted(names)[:limit]]
 
 
 def build_digest(
@@ -85,7 +109,8 @@ def build_digest(
     budget_bytes: int = 8192,
 ) -> dict:
     """
-    Summarise the evaluation history of a run as a small, strictly JSON-safe dictionary.
+    Summarise the evaluation history of a run as a small, strictly JSON-safe dictionary. Numeric garbage (NaN, inf,
+    overflow) never raises: it becomes `None` and the name it came from is listed under `"nonfinite"`.
 
     Args:
         history:
@@ -95,8 +120,9 @@ def build_digest(
         max_steps (`int`):
             Planned number of training steps.
         objective (`dict[str, float]`):
-            Weight of each metric in the run's objective. The best step is the evaluation with the highest weighted
-            sum over the objective metrics (evaluations where one is missing or non-finite are skipped).
+            Weight of each metric in the run's objective. The best step is the evaluation with the highest weighted sum
+            over the objective metrics (evaluations where one is missing or non-finite are skipped, as are terms with a
+            non-finite weight).
         scales (`dict[str, float]`):
             Head scales to report, such as the learned temperatures.
         sentinels (`dict[str, bool]`):
@@ -106,43 +132,61 @@ def build_digest(
         last_n (`int`, *optional*, defaults to `8`):
             Number of latest evaluations the per-metric slopes are computed over.
         budget_bytes (`int`, *optional*, defaults to `8192`):
-            Upper bound on the size of the compact JSON encoding. Oldest history entries are dropped first, then the
-            control arm and the slopes, so the bound always holds.
+            Upper bound on the size of the compact JSON encoding, clamped up to `MIN_BUDGET_BYTES` (512). Oldest
+            history entries are dropped first, then the control arm, slopes, current values, scales, sentinels and
+            objective, then the list of flagged names, and finally everything but a few fields, so the bound always
+            holds.
 
     Returns:
         `dict`: keys `step`, `max_steps`, `current`, `best_step`, `best_score`, `slopes`, `confidence_gap`,
         `objective`, `scales`, `sentinels`, `control`, `nonfinite`, `history`, `history_dropped`. The confidence gap is
         the current `confidence_gap` metric when there is one, otherwise `mean_confidence - accuracy`.
     """
+    budget_bytes = max(int(budget_bytes), MIN_BUDGET_BYTES)
     nonfinite: set[str] = set()
     clean = [json_safe(dict(h), nonfinite) for h in history]
-    objective = {str(k): float(v) for k, v in objective.items()}
+    weights: dict[str, float | None] = {}
+    for name, weight in objective.items():
+        weights[str(name)] = _finite(weight)
+        if weights[str(name)] is None:
+            nonfinite.add(str(name))
 
     def score(entry: dict) -> float | None:
+        if not weights:
+            return None
         total = 0.0
-        for name, weight in objective.items():
-            value = _finite(entry.get(name))
-            if value is None:
-                return None
-            total += weight * value
-        return total if objective else None
+        with np.errstate(all="ignore"):
+            for name, weight in weights.items():
+                value = _finite(entry.get(name))
+                if weight is None:
+                    continue
+                if value is None:
+                    return None
+                total += weight * value
+        if not math.isfinite(total):
+            nonfinite.add("objective_score")
+            return None
+        return total
 
     best_step, best_score = None, None
     for entry in clean:
         s = score(entry)
         if s is not None and (best_score is None or s > best_score):
             best_step, best_score = entry.get("step"), s
+    best_score = _finite(best_score)
+    best_step = None if best_step is None else _step(best_step, "step", nonfinite)
 
     current = {k: v for k, v in (clean[-1] if clean else {}).items() if k != "step"}
-    window = clean[-max(int(last_n), 1) :]
+    window = clean[-max(int(last_n) if _finite(last_n) is not None else 8, 1) :]
     slopes: dict[str, float | None] = {}
     for name in sorted({k for e in window for k in e if k != "step"}):
         points = [(_finite(e.get("step")), _finite(e.get(name))) for e in window]
         slopes[name] = _slope([(x, y) for x, y in points if x is not None and y is not None])
 
     gap = _finite(current.get("confidence_gap"))
-    if gap is None and _finite(current.get("mean_confidence")) is not None and _finite(current.get("accuracy")) is not None:
-        gap = current["mean_confidence"] - current["accuracy"]
+    confidence, accuracy = _finite(current.get("mean_confidence")), _finite(current.get("accuracy"))
+    if gap is None and confidence is not None and accuracy is not None:
+        gap = _finite(confidence - accuracy)
 
     control_summary = None
     if control:
@@ -156,16 +200,16 @@ def build_digest(
         }
 
     digest: dict[str, Any] = {
-        "step": int(step),
-        "max_steps": int(max_steps),
+        "step": _step(step, "step", nonfinite),
+        "max_steps": _step(max_steps, "max_steps", nonfinite),
         "current": current,
         "best_step": best_step,
         "best_score": best_score,
         "slopes": slopes,
         "confidence_gap": gap,
-        "objective": objective,
+        "objective": weights,
         "scales": json_safe(scales, nonfinite),
-        "sentinels": json_safe(sentinels),
+        "sentinels": json_safe(sentinels, nonfinite),
         "control": control_summary,
         "nonfinite": [],
         "history": clean,
@@ -177,7 +221,7 @@ def build_digest(
         digest["history_dropped"] = len(clean) - len(digest["history"])
         return digest
 
-    # Drop the oldest history first, in halving chunks so a very long history stays cheap.
+    # Drop the oldest history first, in chunks so a very long history stays cheap.
     finish()
     while _size(digest) > budget_bytes and digest["history"]:
         excess = _size(digest) - budget_bytes
@@ -185,25 +229,24 @@ def build_digest(
         drop = max(min(excess // per_entry, len(digest["history"])), 1)
         digest["history"] = digest["history"][drop:]
         finish()
-    # Then the optional and derived parts, largest first, so the bound holds whatever the caller passed.
+    # Then the other parts, largest-first in practice, so the bound holds whatever the caller passed.
     for key in ("control", "slopes", "current", "scales", "sentinels", "objective"):
         if _size(digest) <= budget_bytes:
             break
         digest[key] = None if key == "control" else {}
     if _size(digest) > budget_bytes:
+        digest["nonfinite"] = _short_names(nonfinite)
+    if _size(digest) > budget_bytes:
         digest = {
             "step": digest["step"],
             "max_steps": digest["max_steps"],
             "best_step": best_step,
-            "nonfinite": [],
+            "nonfinite": _short_names(nonfinite, limit=4, width=24),
             "history": [],
             "history_dropped": len(clean),
             "truncated": True,
         }
-        digest["nonfinite"] = sorted(nonfinite)
-        while _size(digest) > budget_bytes and digest["nonfinite"]:
-            digest["nonfinite"].pop()
-        for fallback in ({"step": digest["step"], "truncated": True}, {"truncated": True}, {}):
+        for fallback in ({"truncated": True}, {}):  # unreachable above the minimum budget; kept as a last resort
             if _size(digest) <= budget_bytes:
                 break
             digest = fallback
