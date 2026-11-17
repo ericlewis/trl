@@ -151,6 +151,24 @@ def _has_weights(directory: str | os.PathLike) -> bool:
     return False
 
 
+def _total_norm(grads: list[torch.Tensor]) -> torch.Tensor:
+    """
+    The 2-norm of all `grads`, on the device of the first, without overflow for any finite gradients: summed in float64
+    where the device has it, else scaled by the largest magnitude first. Non-finite gradients give a non-finite norm.
+    """
+    device = grads[0].device
+    if device.type != "mps":
+        parts = [torch.linalg.vector_norm(g, 2.0, dtype=torch.float64).to(device) for g in grads]
+        return torch.linalg.vector_norm(torch.stack(parts), 2.0)
+
+    def scaled_norm(x: torch.Tensor) -> torch.Tensor:
+        scale = x.abs().amax()
+        safe = torch.where(scale > 0, scale, torch.ones_like(scale))  # a NaN scale stays NaN
+        return safe * torch.linalg.vector_norm(x / safe, 2.0)
+
+    return scaled_norm(torch.stack([scaled_norm(g.float()).to(device) for g in grads]))
+
+
 def _describe(error: BaseException) -> str:
     """`"<type>: <message>"`, at most 500 characters; never raises, even when the message cannot be built."""
     try:
@@ -214,11 +232,13 @@ class JevMonitorCallback(TrainerCallback):
 
     Limits: under FSDP the main process sees only its own shard of the gradients, and under DeepSpeed ZeRO the
     gradients may not be available to callbacks, so the gradient check may see nothing; a zero-dimensional scale
-    parameter that is sharded is not found. The main process may finish up to `finish_timeout` seconds after the
-    others. Resuming does not apply the verdict on the evaluation of the checkpoint's own step. A failed `train()` is
-    detected only when it failed inside a training step: after a failure after `on_step_end` (in an evaluation during
-    training, while saving a checkpoint, logging or in another callback) or while loading a batch, a later standalone
-    `evaluate()` is recorded and sent to the judge as if it were part of training.
+    parameter that is sharded is not found. Gradient norms are read just before the optimizer step, after clipping;
+    under fp16 without clipping (`max_grad_norm=0`) they are still multiplied by the loss scale. The main process may
+    finish up to `finish_timeout` seconds after the others. Resuming does not apply the verdict on the evaluation of
+    the checkpoint's own step. A failed `train()` is detected only when it failed inside a training step: after a
+    failure after `on_step_end` (in an evaluation during training, while saving a checkpoint, logging or in another
+    callback) or while loading a batch, a later standalone `evaluate()` is recorded and sent to the judge as if it were
+    part of training.
 
     Args:
         backend ([`~experimental.decision.jev_monitor.SystemOneClient`] or `Callable[[dict, dict], dict | None]`, *optional*):
@@ -420,7 +440,7 @@ class JevMonitorCallback(TrainerCallback):
             self._job = None
             self._results.clear()
             self._discarded.clear()
-            if self._worker is not None and self._worker.is_alive():
+            if self._worker is not None:  # running: the worker clears this under the lock when it exits
                 return
             self._worker = threading.Thread(target=self._work, name="jev-monitor", daemon=True)
             self._worker.start()
@@ -431,6 +451,8 @@ class JevMonitorCallback(TrainerCallback):
                 while self._job is None and not self._closing:
                     self._cond.wait()
                 if self._job is None:
+                    if self._worker is threading.current_thread():
+                        self._worker = None
                     return
                 generation, step, digest = self._job
                 self._job, self._busy = None, True
@@ -612,7 +634,7 @@ class JevMonitorCallback(TrainerCallback):
             if bad:  # judged in `on_optimizer_step`, once it is known whether the step was taken
                 self._grad_check = {"step": step, "groups": bad}
             elif norms:
-                self._grad_norms = {name: math.sqrt(value) for name, value in norms.items()}
+                self._grad_norms = dict(norms)
                 if self._grad_streak:  # only transitions are recorded
                     self._record("note", step, {"note": "finite_gradients", "after": self._grad_streak})
                 self._grad_streak, self._grad_sentinel = 0, None
@@ -666,20 +688,14 @@ class JevMonitorCallback(TrainerCallback):
         return self._groups
 
     def _gradient_norms(self, model) -> dict[str, float]:
-        """Squared gradient norm of each group: summed on device, then read with one `.item()` per group."""
+        """Gradient norm of each group: computed on device, then read with one `.item()` per group."""
         if model is None:
             return {}
         norms = {}
         for name, params in self._parameter_groups(model).items():
             grads = [p.grad.detach() for p in params if p.grad is not None]
-            if not grads:
-                continue
-            if hasattr(torch.nn.utils, "get_total_norm"):
-                total = torch.nn.utils.get_total_norm(grads, 2.0, error_if_nonfinite=False)
-            else:  # older torch
-                device = grads[0].device
-                total = torch.stack([torch.linalg.vector_norm(g.float()).to(device) for g in grads]).norm()
-            norms[name] = total.float().square().item()
+            if grads:
+                norms[name] = float(_total_norm(grads).item())
         return norms
 
     def _read_scales(self, model) -> dict[str, float]:
@@ -773,10 +789,29 @@ class JevMonitorCallback(TrainerCallback):
             )
         self._high_scales = high
 
+        # One evaluation dataset of several reports `<prefix>_<dataset>_runtime` (the Trainer adds it to every
+        # evaluation): its metrics are matched as `<dataset>_<metric>`, others by exact name, never by a bare suffix
+        # (`reverse_kl` is not `kl`).
+        dataset = next(
+            (
+                key[len(prefix) : -len("_runtime")]
+                for key in metrics
+                if isinstance(key, str)
+                and key.startswith(prefix)
+                and key.endswith("_runtime")
+                and len(key) > len(prefix) + len("_runtime")
+            ),
+            None,
+        )
+        wanted = set(self.metrics)
         entry = {}
         for key, value in metrics.items():
-            name = key[len(prefix) :] if key.startswith(prefix) else None
-            if name and any(name == metric or name.endswith("_" + metric) for metric in self.metrics):
+            name = key[len(prefix) :] if isinstance(key, str) and key.startswith(prefix) else None
+            if not name:
+                continue
+            if name in wanted or (
+                dataset is not None and name.startswith(dataset + "_") and name[len(dataset) + 1 :] in wanted
+            ):
                 entry[name] = value
         entry = json_safe(entry)
         if same_step and self._history and self._history[-1].get("step") == step:

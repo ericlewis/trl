@@ -25,32 +25,57 @@ MIN_BUDGET_BYTES = 512
 _MAX_INT = 2**53
 
 
-def json_safe(value: Any, nonfinite: set[str] | None = None, _key: str | None = None) -> Any:
-    """
-    Convert `value` to something `json.dumps(..., allow_nan=False)` accepts.
+# Containers nested deeper than this are dropped by `json_safe`, so that no encoder or decoder ever recurses too deep
+MAX_DEPTH = 64
+# Integers wider than this are dropped by `json_safe`: they fit no float, and very long ones no JSON encoder
+_MAX_INT_BITS = 1024
 
-    Non-finite floats become `None`; when `nonfinite` is given, the name of the dictionary key they were found under is
-    added to it. Tuples become lists, dictionary keys become strings, NumPy scalars and arrays become Python values,
-    and anything else unknown becomes its `str()`.
+
+def json_safe(value: Any, nonfinite: set[str] | None = None, _key: str | None = None, _depth: int = 0) -> Any:
     """
-    if value is None or isinstance(value, (bool, str)):
-        return value
-    if isinstance(value, (int, np.integer)):
-        return int(value)
-    if isinstance(value, (float, np.floating)):
-        value = float(value)
-        if math.isfinite(value):
-            return value
+    Convert `value` to something `json.dumps(..., allow_nan=False)` accepts, without ever raising.
+
+    Non-finite floats, integers wider than 1024 bits and containers nested more than `MAX_DEPTH` (64) levels deep
+    become `None`; when `nonfinite` is given, the name of the dictionary key they were found under is added to it.
+    Tuples and sets become lists, dictionary keys become strings, NumPy scalars and arrays become Python values, and
+    anything else unknown becomes its `str()` (or `None` if that fails).
+    """
+
+    def dropped():
         if nonfinite is not None and _key is not None:
             nonfinite.add(_key)
         return None
+
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, (int, np.integer)):
+        value = int(value)
+        return value if value.bit_length() <= _MAX_INT_BITS else dropped()
+    if isinstance(value, (float, np.floating)):
+        value = float(value)
+        return value if math.isfinite(value) else dropped()
+    if isinstance(value, (dict, list, tuple, set, frozenset, np.ndarray)) and _depth >= MAX_DEPTH:
+        return dropped()
     if isinstance(value, dict):
-        return {str(k): json_safe(v, nonfinite, str(k)) for k, v in value.items()}
+        out = {}
+        for k, v in value.items():
+            try:
+                name = str(k)
+            except Exception:  # noqa: BLE001 - a key whose `__str__` raises
+                name = f"<{type(k).__name__}>"
+            out[name] = json_safe(v, nonfinite, name, _depth + 1)
+        return out
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [json_safe(v, nonfinite, _key) for v in value]
+        return [json_safe(v, nonfinite, _key, _depth + 1) for v in value]
     if isinstance(value, np.ndarray):
-        return json_safe(value.tolist(), nonfinite, _key)
-    return str(value)
+        try:
+            return json_safe(value.tolist(), nonfinite, _key, _depth)
+        except Exception:  # noqa: BLE001 - an object array whose items cannot be listed
+            return dropped()
+    try:
+        return str(value)
+    except Exception:  # noqa: BLE001 - a `__str__` that raises
+        return None
 
 
 def _finite(value: Any) -> float | None:
@@ -110,7 +135,8 @@ def build_digest(
 ) -> dict:
     """
     Summarise the evaluation history of a run as a small, strictly JSON-safe dictionary. Numeric garbage (NaN, inf,
-    overflow) never raises: it becomes `None` and the name it came from is listed under `"nonfinite"`.
+    overflow, integers wider than 1024 bits) and values nested more than 64 levels deep never raise: they become `None`
+    and the name they came from is listed under `"nonfinite"`.
 
     Args:
         history:

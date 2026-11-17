@@ -556,7 +556,8 @@ def test_unserialisable_state_never_raises(server, client):
         def __str__(self):
             raise RuntimeError("no")
 
-    assert client(key="k").ask({"x": Weird()}, Q) is None
+    assert client(key="k").ask({"x": Weird()}, Q) == GOOD["answers"]  # sent as null, never raised
+    assert json.loads(server.requests[0]["body"])["state"] == {"x": None}
 
 
 def history_of(n):
@@ -753,7 +754,9 @@ def test_ledger_append_never_raises(tmp_path):
     ledger = Ledger(blocker / "sub" / "l.jsonl")  # the parent is a file
     assert ledger.append("ask", 1, {}) is False
     assert ledger.last_error
-    assert ledger.append("ask", 1, {"bad": object()}) in (True, False)  # unserialisable payloads become strings
+    good = Ledger(tmp_path / "good.jsonl")
+    assert good.append("ask", 1, {"bad": object()}) is True  # unserialisable payloads become strings
+    assert good.read()[0]["payload"]["bad"].startswith("<object object")
 
 
 @requires_decision
@@ -1023,11 +1026,11 @@ def test_does_not_block(tmp_path):
     run = Run(callback, tmp_path).begin()
     t0 = time.perf_counter()
     run.evaluate(10, wait=False)
-    assert time.perf_counter() - t0 < 0.2
+    assert time.perf_counter() - t0 < 1.0  # fsync'd ledger writes only: the backend takes 2 s
     assert slow_backend.started.wait(5)
     t0 = time.perf_counter()
     run.evaluate(20, wait=False)  # the first request is still running
-    assert time.perf_counter() - t0 < 0.2
+    assert time.perf_counter() - t0 < 1.0
     t0 = time.perf_counter()
     run.end()  # waits for the worker at most `finish_timeout`
     assert time.perf_counter() - t0 < 1.0
@@ -1654,7 +1657,7 @@ def test_several_evaluations_at_one_step_are_merged(tmp_path):
     callback = monitor(tmp_path, backend, rules=[rule()])
     run = Run(callback, tmp_path).begin()
     first = {"eval_a_loss": 0.5, "eval_a_accuracy": 0.7, "eval_a_runtime": 1.0}
-    second = {"eval_b_loss": 0.6, "eval_b_accuracy": 0.8}
+    second = {"eval_b_loss": 0.6, "eval_b_accuracy": 0.8, "eval_b_runtime": 1.0}
     run.state.global_step = 10
     run.cb.on_evaluate(run.args, run.state, run.control, metrics=first)
     assert backend.started.wait(5)
@@ -2139,3 +2142,93 @@ def test_abandoned_attempt_ends_against_a_slow_drip(server, client):
     for thread in attempts:
         thread.join(2)
     assert not any(t.is_alive() for t in attempts)
+
+
+# -- several datasets and small fixes ---------------------------------------------------------------------------
+
+
+@requires_decision
+def test_metrics_are_matched_by_exact_name_or_dataset(tmp_path):
+    backend = FakeBackend()
+    callback = monitor(tmp_path, backend)
+    run = Run(callback, tmp_path).begin()
+    run.evaluate(10, eval_kl=0.1, eval_reverse_kl=0.3, eval_soft_nll=0.2)  # one dataset: `eval_runtime`
+    run.state.global_step = 20
+    datasets = {
+        "eval_validation_kl": 0.1,
+        "eval_validation_reverse_kl": 0.3,
+        "eval_validation_selection_score": 0.5,
+        "eval_validation_runtime": 1.0,
+    }
+    run.cb.on_evaluate(run.args, run.state, run.control, metrics=datasets)
+    run.end()
+    first, second = (r["payload"]["metrics"] for r in kinds(callback, "eval"))
+    assert "kl" in first and "soft_nll" in first and "reverse_kl" not in first
+    assert set(second) == {"validation_kl", "validation_selection_score"}
+    # `metric_prefix` selects one dataset: its metrics are named as with one dataset, and the objective scores them
+    backend = FakeBackend()
+    callback = monitor(tmp_path / "one", backend, metric_prefix="eval_validation")
+    run = Run(callback, tmp_path / "one").begin()
+    run.state.global_step = 10
+    run.cb.on_evaluate(run.args, run.state, run.control, metrics=datasets)
+    assert callback.wait(5)
+    run.end()
+    assert backend.calls[0]["current"] == {"kl": 0.1, "selection_score": 0.5}
+    assert backend.calls[0]["best_step"] == 10
+
+
+@requires_decision
+def test_large_gradients_are_finite_norms_not_sentinels(tmp_path):
+    model = TinyModel()
+    backend = FakeBackend()
+    callback = monitor(tmp_path, backend, grad_norm_every=1)
+    run = Run(callback, tmp_path, model=model).begin()
+    model.set_grads(1e20)  # its square overflows float32
+    run.optimizer_step(0)
+    run.evaluate(1)
+    run.end()
+    assert kinds(callback, "sentinel") == []
+    assert backend.calls[0]["scales"]["grad_norm_backbone"] == pytest.approx(1e20 * math.sqrt(6.0), rel=1e-5)
+
+
+@requires_decision
+def test_worker_clears_itself_on_exit_and_a_new_run_gets_one(tmp_path):
+    backend = FakeBackend()
+    callback = monitor(tmp_path, backend)
+    Run(callback, tmp_path).begin()
+    worker = callback._worker
+    callback.close()
+    worker.join(5)
+    assert not worker.is_alive() and callback._worker is None
+    run = Run(callback, tmp_path).begin()
+    assert callback._worker is not worker and callback._worker.is_alive()
+    run.evaluate(10)
+    run.end()
+    assert len(backend.calls) == 1
+
+
+def nested(depth):
+    root = current = []
+    for _ in range(depth):
+        current.append([])
+        current = current[0]
+    return root
+
+
+def test_digest_never_raises_on_huge_integers_or_deep_nesting():
+    history = [
+        {"step": 1, "accuracy": 0.5, "huge": 10**5000, "deep": nested(5000)},
+        {"step": 2, "accuracy": 0.6},
+    ]
+    d = build_digest(
+        history, step=2, max_steps=3, objective={"accuracy": 1.0}, scales={"s": -(10**5000)}, sentinels={}
+    )
+    assert len(compact(d).encode()) <= 8192
+    assert d["best_step"] == 2 and "huge" in d["nonfinite"] and "s" in d["nonfinite"]
+    assert d["history"][0]["huge"] is None
+
+
+def test_ledger_accepts_deep_or_huge_payloads(tmp_path):
+    ledger = Ledger(tmp_path / "l.jsonl")
+    assert ledger.append("answer", 1, {"answers": {"junk": nested(5000), "n": 10**5000}}) is True
+    assert ledger.read()[0]["payload"]["answers"]["n"] is None
