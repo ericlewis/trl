@@ -148,6 +148,14 @@ def _has_weights(directory: str | os.PathLike) -> bool:
     return False
 
 
+def _describe(error: BaseException) -> str:
+    """`"<type>: <message>"`, at most 500 characters; never raises, even when the message cannot be built."""
+    try:
+        return f"{type(error).__name__}: {error}"[:500]
+    except Exception:  # noqa: BLE001
+        return type(error).__name__[:500]
+
+
 def _is_nonfinite_number(value: Any) -> bool:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
@@ -182,22 +190,25 @@ class JevMonitorCallback(TrainerCallback):
     `log(100)` is recorded, never a reason to stop.
 
     Only the main process talks to the judge and writes files. The decision to stop is sent from it to every process
-    with `broadcast`, so all processes stop at the same step. Evaluations outside `train()`, or whose metrics do not
-    carry `metric_prefix`, are ignored; an evaluation that comes after a training step began and before it ended means
-    `train()` failed, and ends the monitor's run. Several evaluations at one step (a dict of evaluation datasets) are
-    merged into one record of that step, their metrics named without the prefix (`<dataset>_<metric>`); the judge is
-    sent the merged digest if its request has not started yet, else the digest of the first. Set `metric_prefix` (for
-    example `"eval_validation"`) to watch one dataset only. When training resumes, ledger records after the resumed
-    step are dropped and the streaks are rebuilt from the rest. No hook raises into the Trainer: errors are recorded in
-    the ledger.
+    with `broadcast`, so all processes stop at the same step. A stop is attempted at most once per step, and not at an
+    evaluation after which training ends anyway (`should_training_stop` already set, as at `max_steps`): that is
+    recorded as a `note`. Evaluations outside `train()`, or whose metrics do not carry `metric_prefix`, are ignored; an
+    evaluation that comes after a training step began and before it ended (or the pass ended) most likely follows a
+    `train()` that failed inside that step, and is ignored with a `note`; the monitor stays on. Several evaluations at
+    one step (a dict of evaluation datasets) are merged into one record of that step, their metrics named without the
+    prefix (`<dataset>_<metric>`); the judge is sent the merged digest if its request has not started yet, else the
+    digest of the first. Set `metric_prefix` (for example `"eval_validation"`) to watch one dataset only. When training
+    resumes, ledger records after the resumed step are dropped and the streaks are rebuilt from the rest. No hook
+    raises into the Trainer: errors are recorded in the ledger.
 
     Limits: under FSDP the main process sees only its own shard of the gradients, and under DeepSpeed ZeRO the
     gradients may not be available to callbacks, so the gradient check may see nothing; a zero-dimensional scale
     parameter that is sharded is not found. The main process may finish up to `finish_timeout` seconds after the
     others. Resuming does not apply the verdict on the evaluation of the checkpoint's own step. A reused output
-    directory keeps the earlier ledger records up to the step training starts or resumes from. An evaluation is
-    recognised as outside training only once a training step has begun, so a failure while loading a batch is not
-    detected until the next evaluation is followed by no training.
+    directory keeps the earlier ledger records up to the step training starts or resumes from. A failed `train()` is
+    detected only when it failed inside a training step: after a failure after `on_step_end` (in an evaluation during
+    training, while saving a checkpoint, logging or in another callback) or while loading a batch, a later standalone
+    `evaluate()` is recorded and sent to the judge as if it were part of training.
 
     Args:
         backend ([`~experimental.decision.jev_monitor.SystemOneClient`] or `Callable[[dict, dict], dict | None]`, *optional*):
@@ -350,6 +361,7 @@ class JevMonitorCallback(TrainerCallback):
         self._grad_streak = 0
         self._grad_sentinel: dict | None = None
         self._armed = True  # no training step has begun without ending since the last one ended
+        self._attempted_step: int | None = None  # the step a stop was last attempted at, on every process
         self._last_eval_step: int | None = None
         self._high_scales: set[str] = set()
         self._control_warned = False
@@ -375,7 +387,7 @@ class JevMonitorCallback(TrainerCallback):
             step = int(step)
         except (TypeError, ValueError, OverflowError):
             step = 0
-        self._record("error", step, {"where": where, "error": f"{type(error).__name__}: {error}"[:500]})
+        self._record("error", step, {"where": where, "error": _describe(error)})
 
     # -- worker ------------------------------------------------------------------------------------------------
 
@@ -469,7 +481,10 @@ class JevMonitorCallback(TrainerCallback):
                 self.ledger = Ledger(Path(args.output_dir) / "jev_monitor" / "ledger.jsonl")
             if not self._rank0:
                 return
-            self._resume(step)
+            try:
+                self._resume(step)
+            except Exception as e:  # noqa: BLE001 - the run is watched even if the earlier ledger cannot be read
+                self._error("resume", step, e)
             if self._ask is not None:
                 self._start_worker()
             self._record(
@@ -514,6 +529,11 @@ class JevMonitorCallback(TrainerCallback):
         self._armed = False
 
     def on_step_end(self, args, state, control, **kwargs):
+        self._armed = True
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        # A pass can end inside an accumulation window (an iterable dataset, or a stop flag set mid-window): the step
+        # it began never ends, yet training goes on to the epoch-end evaluation.
         self._armed = True
 
     def on_pre_optimizer_step(self, args, state, control, model=None, **kwargs):
@@ -614,19 +634,34 @@ class JevMonitorCallback(TrainerCallback):
         prefix = self.metric_prefix + "_"
         if not any(isinstance(key, str) and key.startswith(prefix) for key in metrics):
             return
-        if not self._armed:  # a training step began and never ended: `train()` failed, this evaluation is outside it
-            self._training = False
-            self.close()
+        step = int(getattr(state, "global_step", 0) or 0)
+        if not self._armed:
+            # A training step began and never ended: `train()` most likely failed inside it and this evaluation is
+            # outside training. It is ignored, and the monitor stays on: the next step that ends re-arms it.
+            self._record(
+                "note",
+                step,
+                {
+                    "note": "evaluation_ignored",
+                    "reason": "a training step began and did not end, so this evaluation may be outside train()",
+                },
+            )
             return
-        step = int(state.global_step)
         proposal = None
         if self._rank0:
             try:
                 proposal = self._observe(args, state, metrics, step, kwargs.get("model"))
             except Exception as e:  # noqa: BLE001
                 self._error("on_evaluate", step, e)
-        if self.mode == "enforce":
-            self._decide(args, control, step, proposal)
+        if self.mode != "enforce" or self._attempted_step == step:
+            return  # a stop is attempted at most once per step (several evaluation datasets)
+        if getattr(control, "should_training_stop", False):
+            # The run ends after this evaluation anyway (max_steps, or another callback): no checkpoint, no stop.
+            # Every process sees the same flag, so all skip the broadcast alike.
+            if proposal is not None:
+                self._record("note", step, {"note": "stop_not_needed", "proposal": proposal})
+            return
+        self._decide(args, control, step, proposal)
 
     def on_train_end(self, args, state, control, **kwargs):
         if not self._training:
@@ -818,12 +853,18 @@ class JevMonitorCallback(TrainerCallback):
             return
         if not isinstance(decision, dict) or self._stopped:
             return
+        self._attempted_step = step
         checkpoint = decision.get("checkpoint")
         if not isinstance(checkpoint, str) or not checkpoint:
-            checkpoint = str(Path(args.output_dir) / f"monitor-stop-{step}")
+            checkpoint = f"{getattr(args, 'output_dir', '.')}/monitor-stop-{step}"
         saved, error = self._save(checkpoint)
-        if saved and self._rank0 and not _has_weights(checkpoint):
-            saved, error = False, f"save_model wrote no weights file to {checkpoint}"
+        if saved and self._rank0:
+            # Nothing on the main process may raise before the second broadcast: the others wait in it
+            try:
+                if not _has_weights(checkpoint):
+                    saved, error = False, f"save_model wrote no weights file to {checkpoint}"
+            except Exception as e:  # noqa: BLE001 - an unreadable checkpoint is not a saved one
+                saved, error = False, f"cannot check the checkpoint: {type(e).__name__}: {e}"[:500]
         try:
             saved = self._broadcast(saved if self._rank0 else None)
         except Exception as e:  # noqa: BLE001

@@ -1660,7 +1660,220 @@ def test_evaluation_after_a_failed_train_is_ignored(tmp_path):
     run.optimizer_step(9)
     run.evaluate(10)
     run.cb.on_step_begin(run.args, run.state, run.control)  # the next step raises: no on_step_end, no on_train_end
-    count, calls = len(kinds(callback)), len(backend.calls)
+    before, calls = kinds(callback), len(backend.calls)
     run.evaluate(10)  # a standalone trainer.evaluate() afterwards
     run.evaluate(10)
-    assert len(kinds(callback)) == count and len(backend.calls) == calls
+    assert kinds(callback) == before + ["note", "note"] and len(backend.calls) == calls
+    assert callback._worker is not None and callback._worker.is_alive()  # nothing was closed
+
+
+# -- never raise into training, never switch the monitor off ----------------------------------------------------
+
+
+class Regression(torch.nn.Module):
+    """A one-layer model the Trainer can train on CPU in milliseconds, with no download."""
+
+    def __init__(self):
+        super().__init__()
+        self.layer = torch.nn.Linear(4, 1)
+
+    def forward(self, x, labels=None):
+        y = self.layer(x).squeeze(-1)
+        return {"loss": ((y - labels) ** 2).mean(), "logits": y}
+
+
+class Rows(torch.utils.data.Dataset):
+    def __init__(self, n=8):
+        self.n = n
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, i):
+        return {"x": torch.full((4,), float(i) / self.n), "labels": torch.tensor(float(i % 2))}
+
+
+class Stream(torch.utils.data.IterableDataset):
+    def __init__(self, n):
+        self.n = n
+
+    def __iter__(self):
+        for i in range(self.n):
+            yield {"x": torch.full((4,), float(i) / self.n), "labels": torch.tensor(float(i % 2))}
+
+
+def tiny_trainer(tmp_path, train_dataset=None, eval_dataset=None, callbacks=(), **kwargs):
+    from transformers import Trainer, TrainingArguments
+
+    defaults = {
+        "per_device_train_batch_size": 2,
+        "eval_strategy": "epoch",
+        "save_strategy": "no",
+        "report_to": [],
+        "use_cpu": True,
+        "logging_steps": 1,
+        "disable_tqdm": True,
+        "num_train_epochs": 3,
+    }
+    args = TrainingArguments(output_dir=str(tmp_path), **{**defaults, **kwargs})
+    return Trainer(
+        model=Regression(),
+        args=args,
+        train_dataset=Rows() if train_dataset is None else train_dataset,
+        eval_dataset=Rows() if eval_dataset is None else eval_dataset,
+        callbacks=list(callbacks),
+    )
+
+
+class WaitFor:
+    """A callback that runs before the monitor's `on_evaluate` and waits for the pending verdict."""
+
+    def __new__(cls, callback):
+        from transformers import TrainerCallback
+
+        class _Wait(TrainerCallback):
+            def on_evaluate(self, *args, **kwargs):
+                callback.wait(5)
+
+        return _Wait()
+
+
+@requires_decision
+def test_checkpoint_check_error_is_recorded_and_both_ranks_go_on(tmp_path, monkeypatch):
+    from trl.experimental.decision.jev_monitor import callback as callback_module
+
+    def walk_error(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(callback_module, "_has_weights", walk_error)
+    wire = Wire()
+    kwargs = {"rules": [rule()], "mode": "enforce", "patience": 1}
+    cb0 = monitor(tmp_path / "r0", FakeBackend(), broadcast=wire.rank0, trainer=FakeTrainer(), **kwargs)
+    cb1 = monitor(tmp_path / "r1", FakeBackend(), broadcast=wire.other, trainer=FakeTrainer(), **kwargs)
+    run0 = Run(cb0, tmp_path / "r0").begin()
+    run1 = Run(cb1, tmp_path / "r1", rank0=False).begin()
+    for step in (10, 20):
+        assert not run0.evaluate(step)
+        assert not run1.evaluate(step)  # it received the second broadcast: it would wait forever otherwise
+    run0.end()
+    run1.end()
+    assert wire.sent[1]["reason"] == "rule" and wire.sent[2] is False
+    errors = [r["payload"] for r in kinds(cb0, "error")]
+    assert any("PermissionError" in e["error"] for e in errors)
+    assert not (tmp_path / "r0" / "monitor" / "intervened.json").exists()
+
+
+@requires_decision
+def test_checkpoint_check_error_never_reaches_a_real_trainer(tmp_path, monkeypatch):
+    from trl.experimental.decision.jev_monitor import JevMonitorCallback, StopRule
+    from trl.experimental.decision.jev_monitor import callback as callback_module
+
+    def walk_error(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(callback_module, "_has_weights", walk_error)
+    callback = JevMonitorCallback(
+        lambda state, questions: stop_answer(0.99), CQ, mode="enforce", stop_when=[StopRule("stop")], patience=1
+    )
+    trainer = tiny_trainer(tmp_path, callbacks=[WaitFor(callback)])
+    callback.attach(trainer)
+    trainer.train()  # does not raise
+    assert trainer.state.global_step == 12
+    assert any("PermissionError" in r["payload"]["error"] for r in kinds(callback, "error"))
+
+
+@requires_decision
+def test_real_trainer_streaming_epoch_evaluations_are_watched(tmp_path):
+    from trl.experimental.decision.jev_monitor import JevMonitorCallback
+
+    seen = []
+    callback = JevMonitorCallback(lambda state, questions: seen.append(state["step"]) or stop_answer(0.1), CQ)
+    # 5 batches of 2 per pass with accumulation 2: every pass ends inside a window (a step begun, never ended)
+    trainer = tiny_trainer(
+        tmp_path, train_dataset=Stream(10), callbacks=[WaitFor(callback)], gradient_accumulation_steps=2, max_steps=6
+    )
+    callback.attach(trainer)
+    trainer.train()
+    assert [r["step"] for r in kinds(callback, "eval")] == [2, 4, 6]
+    assert seen == [2, 4, 6]
+    assert [r["payload"]["for_step"] for r in kinds(callback, "verdict")] == [2, 4]
+
+
+@requires_decision
+def test_epoch_end_rearms(tmp_path):
+    backend = FakeBackend()
+    callback = monitor(tmp_path, backend)
+    run = Run(callback, tmp_path).begin()
+    run.cb.on_step_begin(run.args, run.state, run.control)  # the last, partial window of a pass
+    run.cb.on_epoch_end(run.args, run.state, run.control)
+    run.evaluate(10)
+    run.end()
+    assert [r["step"] for r in kinds(callback, "eval")] == [10] and len(backend.calls) == 1
+
+
+@requires_decision
+def test_disarmed_evaluation_is_ignored_with_a_note_and_closes_nothing(tmp_path):
+    backend = FakeBackend()
+    callback = monitor(tmp_path, backend)
+    run = Run(callback, tmp_path).begin()
+    run.cb.on_step_begin(run.args, run.state, run.control)
+    run.evaluate(10)
+    run.evaluate(10)
+    assert backend.calls == [] and kinds(callback, "eval") == []
+    notes = kinds(callback, "note")
+    assert len(notes) == 2 and all(n["payload"]["note"] == "evaluation_ignored" for n in notes)
+    assert "step" in notes[0]["payload"]["reason"]
+    # The monitor is still on: the next step that ends re-arms it
+    run.cb.on_step_end(run.args, run.state, run.control)
+    run.evaluate(20)
+    run.end()
+    assert [r["step"] for r in kinds(callback, "eval")] == [20] and len(backend.calls) == 1
+
+
+@requires_decision
+def test_resume_failure_still_starts_the_worker(tmp_path, monkeypatch):
+    first = monitor(tmp_path, FakeBackend())
+    run = Run(first, tmp_path).begin()
+    run.evaluate(10)
+    run.end()
+
+    def full_disk(self, step):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(Ledger, "truncate_after", full_disk)
+    backend = FakeBackend()
+    second = monitor(tmp_path, backend)
+    run = Run(second, tmp_path).begin(step=10)
+    run.evaluate(20)
+    run.end()
+    assert [state["step"] for state in backend.calls] == [20]
+    records = second.ledger.read()
+    assert any(r["kind"] == "error" and r["payload"]["where"] == "resume" for r in records)
+    assert sum(r["kind"] == "start" for r in records) == 2
+
+
+@requires_decision
+def test_a_stop_is_attempted_at_most_once_per_step(tmp_path):
+    trainer = FakeTrainer(fail=True)
+    callback = monitor(tmp_path, FakeBackend(), rules=[rule()], mode="enforce", patience=1, trainer=trainer)
+    run = Run(callback, tmp_path).begin()
+    run.evaluate(10)
+    run.evaluate(20)
+    run.evaluate(20)  # a second evaluation dataset at the same step
+    run.end()
+    assert trainer.saved == [str(tmp_path / "monitor-stop-20")]
+
+
+@requires_decision
+def test_no_stop_at_the_final_evaluation(tmp_path):
+    trainer = FakeTrainer()
+    callback = monitor(tmp_path, FakeBackend(), rules=[rule()], mode="enforce", patience=1, trainer=trainer)
+    run = Run(callback, tmp_path, max_steps=20).begin()
+    run.evaluate(10)
+    run.control.should_training_stop = True  # max_steps reached: the run ends after this evaluation anyway
+    run.evaluate(20)
+    run.end()
+    assert trainer.saved == [] and not (tmp_path / "monitor" / "intervened.json").exists()
+    assert not (tmp_path / "monitor-stop-20").exists()
+    (note,) = [n for n in kinds(callback, "note") if n["payload"]["note"] == "stop_not_needed"]
+    assert note["step"] == 20 and note["payload"]["proposal"]["reason"] == "rule"
