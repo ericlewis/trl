@@ -1,0 +1,79 @@
+# Train a Clef decision head and its KLM-1.6 backbone together on typed decisions.
+# Use mode: head or mode: lora (with use_peft and lora_* settings) to leave the backbone frozen.
+# model_name_or_path can also be an encoder (BERT, ModernBERT, UltraBERT, a reranker): it then reads its first token
+# with the plain prompt; set global_pooling (last/first) and prompt_style (chatml/plain) to override the choice.
+# Backbone weights are never newly initialised and remote code is never run: a remote-code package such as the
+# UltraBERT reranker (weights under backbone.) loads its backbone from the one prefix that holds all of it, or fails.
+model_name_or_path: MinimaLabs/KLM-1.6
+dataset_name: LocalLLaMA/typed-decisions
+dataset_config: all
+output_dir: output/clef-typed-decisions
+# float32 weights with bf16 autocast (bf16: true below): KLM's fused CUDA kernels only run on float32 parameters
+dtype: float32
+# attn_implementation (e.g. flash_attention_2) switches the backbone (only) to flash attention
+# attn_implementation: flash_attention_2
+mode: full
+# joint, or cosine for the small cosine head (cosine_width, cosine_initial_scale)
+head_type: joint
+# Laya's RLCD ("Reinforcement Learning for Calibrated Decisions"), a community recipe, in training only. It is meant as
+# a second phase after cross-entropy training; unset settings keep the config's values (weight 0, sigma 0.4, 32 samples).
+# rlcd_normalize_advantage: true with rlcd_samples: 4 is Laya's original objective.
+# Recipe 1, two runs: train with cross-entropy (as above), then start this example again from the saved checkpoint with
+# a fresh optimizer (no resume_from_checkpoint), and RLCD on from the first step:
+# model_name_or_path: output/clef-typed-decisions
+# output_dir: output/clef-typed-decisions-rlcd
+# rlcd_weight: 0.25
+# rlcd_sigma: 0.4
+# rlcd_samples: 32
+# rlcd_normalize_advantage: false
+# Recipe 2, one run: cross-entropy first, RLCD from epoch rlcd_start_epoch on with rlcd_weight, and one noise scale per
+# epoch of the RLCD phase (Laya's schedule; the last is held for later epochs). The model starts with weight 0.
+# num_train_epochs: 5
+# rlcd_weight: 0.25
+# rlcd_start_epoch: 1
+# rlcd_sigmas: [0.4, 0.3, 0.2, 0.1]
+# Jev monitor (off by default): a judge behind a System One API is sent a digest of the evaluation metrics, never
+# training data, and its verdicts are recorded in <output_dir>/jev_monitor/ledger.jsonl. A preset's API key is read
+# from its environment variable (TYPESAFE_API_KEY, OPENROUTER_API_KEY); a URL is asked without a key. advise only
+# records; enforce may also stop training. It never changes saving or evaluation.
+# jev_monitor: typesafe
+# jev_monitor_model: jev-1.13.0
+# jev_monitor_mode: advise
+max_length: 2048
+# state cuts the end of an over-length record's state to fit, as Clef does, and skips records too long without it;
+# skip drops over-length records instead, and error stops at the first one
+truncation: state
+permute_fields: true
+validation_fraction: 0.05
+# max_train_samples samples training rows with seed; the holdout and max_eval_samples use eval_sample_seed (0), so
+# runs with different seeds evaluate on the same rows. Never the first rows of a split.
+# max_eval_samples: 256
+per_device_train_batch_size: 32
+per_device_eval_batch_size: 32
+gradient_accumulation_steps: 1
+# LocalLLaMA/typed-decisions has 1,200 rows: with the 5% holdout and batches of 32, an epoch is 36 steps
+num_train_epochs: 3
+learning_rate: 0.0001
+# The head, new or small next to the backbone, trains faster
+head_learning_rate: 0.0003
+optim: adamw_torch
+weight_decay: 0.0
+max_grad_norm: 1.0
+lr_scheduler_type: cosine
+warmup_steps: 10
+gradient_checkpointing: false
+logging_steps: 10
+# Three evaluations per epoch; save_strategy: best saves a checkpoint at every evaluation that improves on
+# metric_for_best_model, so the best one is always on disk, and load_best_model_at_end restores it after training
+eval_strategy: steps
+eval_steps: 12
+save_strategy: best
+save_total_limit: 1
+load_best_model_at_end: true
+metric_for_best_model: eval_selection_score
+greater_is_better: true
+bf16: true
+seed: 3407
+report_to: none
+project: clef-typed-decisions
+trackio_static_space_id: false

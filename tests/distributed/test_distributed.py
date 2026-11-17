@@ -15,8 +15,10 @@
 import json
 import os
 import subprocess
+from importlib.util import find_spec
 from pathlib import Path
 
+import accelerate
 import pytest
 import torch
 import transformers
@@ -49,6 +51,13 @@ from ..testing_utils import TrlTestCase, require_torch_multi_accelerator
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def has_clef_training() -> bool:
+    """Whether Transformers trains Clef natively: its loss is registered (Clef itself, #50058, has none)."""
+    from transformers.loss.loss_utils import LOSS_MAPPING
+
+    return "ClefForDecision" in LOSS_MAPPING
+
+
 def run_command(command: list[str], env: dict[str, str]) -> None:
     result = subprocess.run(command, env=env, cwd=ROOT)
     assert result.returncode == 0
@@ -68,6 +77,74 @@ def get_launch_args(lazy_shared_datadir):
 
 @require_torch_multi_accelerator
 class TestDistributed(TrlTestCase):
+    @pytest.mark.parametrize(
+        "config",
+        [
+            "ddp",
+            pytest.param(
+                "zero2",
+                marks=pytest.mark.xfail(
+                    Version(transformers.__version__) == Version("5.1.0"),
+                    reason="Upstream incompatibility: deepspeed and transformers==5.1.0 (see transformers#43780)",
+                ),
+            ),
+            pytest.param(
+                "zero3",
+                marks=pytest.mark.xfail(
+                    Version(transformers.__version__) == Version("5.1.0"),
+                    reason="Upstream incompatibility: deepspeed and transformers==5.1.0 (see transformers#43780)",
+                ),
+            ),
+            pytest.param(
+                "fsdp2",
+                marks=pytest.mark.skipif(
+                    Version(accelerate.__version__) < Version("1.16.0.dev0"),
+                    reason="FSDP2 FP32 loss outputs require Accelerate #4403",
+                ),
+            ),
+        ],
+    )
+    @pytest.mark.skipif(find_spec("transformers.models.jeva") is None, reason="Requires Transformers decision models")
+    def test_decision(self, config, get_launch_args):
+        # fmt: off
+        run_command(
+            [
+                "torchrun", "--nnodes", "1", "--nproc_per_node", "2",
+                "examples/decisions/jeva_banking77.py",
+                "--output_dir", self.tmp_dir,
+                "--model_name_or_path", "trl-internal-testing/tiny-LlamaForCausalLM-3.2",
+                "--mode", "full",
+                "--max_train_samples", "8",
+                "--max_eval_samples", "5",
+                "--num_options", "3",
+                "--per_device_train_batch_size", "1",
+                "--per_device_eval_batch_size", "1",
+                "--gradient_accumulation_steps", "2",
+                "--option_chunk_size", "2",
+                "--max_steps", "2",
+                "--logging_steps", "1",
+                "--eval_strategy", "steps",
+                "--eval_steps", "2",
+                "--bf16", "true",
+                "--attn_implementation", "sdpa",
+                "--report_to", "none",
+                *get_launch_args(config),
+            ],
+            os.environ.copy(),
+        )
+        # fmt: on
+
+        with open(os.path.join(self.tmp_dir, "eval_results.json")) as f:
+            metrics = json.load(f)
+        assert metrics["eval_candidate_loss"] + metrics["eval_coverage_loss"] == pytest.approx(
+            metrics["eval_loss"], rel=1e-4
+        )
+        for name in ("choice_accuracy", "null_precision", "null_recall", "null_rate"):
+            assert 0 <= metrics[f"eval_{name}"] <= 1
+        for name in ("brier", "null_brier", "entropy"):
+            assert metrics[f"eval_{name}"] >= 0
+        assert metrics["eval_choice_accuracy"] == metrics["eval_accuracy"]
+
     @pytest.mark.parametrize(
         "test_file", ["test_async_grpo_trainer.py", "experimental/test_async_distillation_trainer.py"]
     )
@@ -515,6 +592,92 @@ class TestDistributed(TrlTestCase):
             os.environ.copy(),
         )
         # fmt: on
+
+
+@pytest.mark.skipif(
+    find_spec("transformers.models.clef") is None or not has_clef_training(),
+    reason="Requires a Transformers build with Clef training support (native loss and batched forward) on top of #50058",
+)
+class TestDecisionRecordRows(TrlTestCase):
+    """Two CPU processes evaluate records with different numbers of questions exactly like one process does."""
+
+    def run_processes(self, num_processes):
+        output_dir = os.path.join(self.tmp_dir, str(num_processes))
+        # fmt: off
+        command = [
+            "torchrun", "--standalone", "--nproc_per_node", str(num_processes),
+            "tests/distributed/data/decision_clef_ragged.py", output_dir,
+        ]
+        # fmt: on
+        # A hang in a collective fails the test instead of blocking it
+        result = subprocess.run(command, env=os.environ.copy(), cwd=ROOT, timeout=600)
+        assert result.returncode == 0
+        with open(os.path.join(output_dir, "metrics.json")) as f:
+            return json.load(f)
+
+    def test_clef_ragged_records(self):
+        single, double = self.run_processes(1), self.run_processes(2)
+        assert (single["num_processes"], double["num_processes"]) == (1, 2)
+        # 9 records holding 3 + 1 + 2 + 1 + 3 + 2 + 1 + 2 + 3 questions; the last batch of two processes is smaller
+        assert single["eval_questions"] == double["eval_questions"] == 18
+        # Ties in the targets are scored against the gold label of each question, gathered with its record
+        assert single["eval_ties"] == double["eval_ties"] == 3
+        for key in ("eval_accuracy", "eval_selection_score"):
+            assert double[key] == pytest.approx(single[key], abs=1e-6), key
+        # The other calibration metrics, and the trainer's own metrics, count every question once, too
+        names = ["kl", "brier", "ece", "mean_confidence", "soft_nll", "confidence_gap"]
+        names += ["candidate_loss", "choice_accuracy", "candidate_accuracy", "entropy"]
+        for name in names:
+            assert double[f"eval_{name}"] == pytest.approx(single[f"eval_{name}"], abs=1e-5), name
+        assert single["train_steps"] == double["train_steps"] == 3
+
+
+@pytest.mark.skipif(find_spec("transformers.decision") is None, reason="Requires transformers.decision")
+class TestJevMonitorTwoProcesses(TrlTestCase):
+    """Two CPU processes under the Jev monitor in enforce mode: the stop is decided on rank 0 and broadcast."""
+
+    def run_processes(self, scenario):
+        # fmt: off
+        command = [
+            "torchrun", "--standalone", "--nproc_per_node", "2",
+            "tests/distributed/data/jev_monitor_enforce.py", self.tmp_dir, scenario,
+        ]
+        # fmt: on
+        # A rank left waiting in a broadcast fails the test instead of blocking it
+        result = subprocess.run(command, env=os.environ.copy(), cwd=ROOT, timeout=300)
+        assert result.returncode == 0
+        ranks = []
+        for rank in (0, 1):
+            with open(os.path.join(self.tmp_dir, f"rank{rank}.json")) as f:
+                ranks.append(json.load(f))
+        assert [r["world_size"] for r in ranks] == [2, 2]
+        records = []
+        with open(os.path.join(self.tmp_dir, "monitor0", "ledger.jsonl")) as f:
+            records = [json.loads(line) for line in f]
+        return ranks, records
+
+    def test_enforced_stop(self):
+        ranks, records = self.run_processes("stop")
+        # Evaluations at 2, 4, 6: the verdicts on 2 and 4 agree (patience 2), so both ranks stop at 6
+        assert [r["global_step"] for r in ranks] == [6, 6]
+        assert ranks[0]["judge_calls"] == [2, 4, 6] and ranks[1]["judge_calls"] == []
+        # Only rank 0 writes the ledger, intervened.json and the checkpoint
+        assert not os.path.exists(os.path.join(self.tmp_dir, "monitor1"))
+        assert [r["writes_checkpoints"] for r in ranks] == [True, False]
+        (intervened,) = [r for r in records if r["kind"] == "intervened"]
+        assert intervened["step"] == 6 and intervened["payload"]["reason"] == "rule"
+        with open(os.path.join(self.tmp_dir, "monitor0", "intervened.json")) as f:
+            assert json.load(f)["step"] == 6
+        checkpoint = Path(self.tmp_dir) / "monitor-stop-6"
+        assert any(p.suffix == ".safetensors" and p.stat().st_size > 0 for p in checkpoint.iterdir())
+
+    def test_checkpoint_check_error_on_rank_0(self):
+        ranks, records = self.run_processes("walk_error")
+        # Rank 0 cannot check the checkpoint: the stop is not enforced, and both ranks train to the end together
+        assert [r["global_step"] for r in ranks] == [12, 12]
+        assert any(r["kind"] == "error" and "PermissionError" in r["payload"]["error"] for r in records)
+        assert not any(r["kind"] == "intervened" for r in records)
+        assert not os.path.exists(os.path.join(self.tmp_dir, "monitor0", "intervened.json"))
 
 
 @require_torch_multi_accelerator

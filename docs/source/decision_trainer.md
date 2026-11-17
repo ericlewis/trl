@@ -1,0 +1,390 @@
+# DecisionTrainer
+
+`DecisionTrainer` trains decision models using their supervised loss. Transformers owns the architecture, checkpoint format, and objective; TRL handles optimization, distributed training, and metrics. The model returns a mean `loss` and candidate `logits`. Model-specific token layouts and batching live in example collators. The library provides `DataCollatorForDecision` for shared request preparation and target normalization.
+
+## Usage
+
+Pass a configured model and a collator matching its forward inputs:
+
+```python
+from trl.experimental.decision import DecisionConfig, DecisionTrainer
+
+trainer = DecisionTrainer(
+    model=model,
+    args=DecisionConfig(output_dir="decision-output"),
+    train_dataset=dataset,
+    processing_class=tokenizer,
+    data_collator=collator,
+)
+trainer.train()
+trainer.save_model()
+trainer.end()
+```
+
+The trainer preserves which parameters are trainable. Freeze the backbone or prepare adapters before constructing it. Alternatively, pass `peft_config` to wrap the whole model through PEFT; configure `modules_to_save` for any head that should remain trainable. Resume with the same model and adapter setup. The Jeva example saves a native base checkpoint before wrapping it with PEFT, so the adapter can be reloaded with its decision head.
+
+## Jeva example
+
+The [BANKING77 example](https://github.com/huggingface/trl/tree/main/examples/decisions) provides Jeva's model construction and a 1,000-step LoRA configuration with a stratified validation split:
+
+```bash
+python examples/decisions/jeva_banking77.py --config examples/decisions/jeva_banking77.yaml
+```
+
+> [!TIP]
+> This example currently requires [Transformers #50614](https://github.com/huggingface/transformers/pull/50614). CLM and JEV use their own Transformers PRs linked below.
+
+Jeva's `--mode` selects head, LoRA, or full training. Its token limits, truncation policy, and option chunk size are example arguments, rather than trainer settings.
+
+Requests use Transformers' `state` / `questions` schema, with one question per training row. The example stores requests as JSON strings to preserve candidate names and order in Arrow datasets. Targets are separate:
+
+| Field | Meaning |
+|---|---|
+| `target_index` | Zero-based option index, or `None` for a nullable choice. |
+| `target_probs` | Null probability, then one probability per option. |
+| `p_true` | Probability of true for a `noul` question. |
+| `score` | Numeric score, interpolated between rubric levels. |
+
+A row with several questions rendered into one prompt (a template that reads `questions`, such as Clef's) goes through
+`prepare_request`, which returns the inputs, the questions in template order and one target per question. Targets come
+from `targets` (`{question_name: {"target_index" | "target_probs" | "p_true" | "score": ...}}`), or from `gold` /
+`answers`, where each entry is a bare label or `{"label", "probabilities", "noul"}`. `target_from_gold` turns the
+latter into `target_probs` in the question's option order. A template that renders one prompt per question is rejected.
+
+Positional targets (`target_index`, `target_probs`) index the options in the order the template gives them, which is
+not always the order of the request: Clef's template sorts choice options by key, so with criteria `{"zeta": ...,
+"alpha": ...}`, `target_index: 0` is `alpha`. Prefer `gold` / `answers`, which name the option, so the target follows
+it whatever the order.
+
+Choice questions use a `criteria` mapping and may set `allow_null=True`. Score questions use a `criteria` list and
+may supply numeric `values`. The [Jeva example collator](https://github.com/huggingface/trl/blob/main/examples/decisions/jeva_banking77.py)
+uses Transformers' template to prepare separate state and option spans. It subclasses `DataCollatorForDecision`,
+which delegates request rendering to `model.decision_config.prepare_inputs`. Preprocess once with
+`dataset.map(collator.tokenize, remove_columns=dataset.column_names)` so batches only need padding.
+
+
+## CLM example
+
+The [typed-decisions example](https://github.com/huggingface/trl/tree/main/examples/decisions) trains
+CLM projection heads on a frozen SmolLM2-135M encoder. It requires [Transformers #50649](https://github.com/huggingface/transformers/pull/50649).
+
+```bash
+python examples/decisions/clm_typed_decisions.py --config examples/decisions/clm_typed_decisions.yaml
+```
+
+The [CLM example collator](https://github.com/huggingface/trl/blob/main/examples/decisions/clm_typed_decisions.py) reuses the request schema above and packs each batch into one prompt with a pool of distinct
+candidates. Soft targets supervise a bidirectional contrastive loss. Validation holds out source-row IDs before
+expanding their questions. `eval_accuracy` uses each question's own candidates; contrastive negatives are local
+to each device's batch. Context parallelism is unsupported for this example.
+
+## Clef example
+
+Clef answers every question of a record in one prompt: the model reads the state once and scores the options of all
+questions jointly. It requires a Transformers build with Clef training support (Clef's native loss and batched forward,
+head choice and RLCD) on top of [Transformers #50058](https://github.com/huggingface/transformers/pull/50058), which
+adds Clef without them. The [Clef
+example](https://github.com/huggingface/trl/blob/main/examples/decisions/clef_typed_decisions.py) trains it on
+`LocalLLaMA/typed-decisions`, with KLM-1.6 as the backbone by default:
+
+```bash
+python examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
+```
+
+The configuration trains the head at `head_learning_rate` (`3e-4`, the backbone at `1e-4`), evaluates with
+`compute_calibration_metrics` every 12 steps (three times per 36-step epoch of the default dataset, for 3 epochs)
+and keeps the checkpoint with the best `eval_selection_score`: `save_strategy: best` saves a checkpoint at each
+evaluation that improves on it, so the best one is on disk, and `load_best_model_at_end` restores it after training.
+
+`mode` selects head-only, LoRA, or full training. LoRA puts adapters on the backbone and trains the head in full; the
+output is the merged native checkpoint, with the adapter alone in `adapter/`. A Clef checkpoint is loaded as it is; any
+other model becomes the backbone of a new head. A causal LM reads its last token with Clef's ChatML prompt; a
+bidirectional encoder (BERT, ModernBERT, or a reranker, unwrapped to its base model) reads its first token with the
+plain prompt between `[CLS]` and `[SEP]`. `global_pooling` (`last` or `first`) and `prompt_style` (`chatml` or `plain`)
+override that choice, and `head_type: cosine` (with `cosine_width` and `cosine_initial_scale`) selects the small cosine
+head; the script prints the resolved setup at start-up. UltraBERT (`model_type: ultrabert`) is such an encoder; its
+tokenizer has no `[CLS]`, so the plain prompt starts with its `<|endoftext|>` and ends with its `<|sep|>`. The script
+never newly initialises backbone weights and never runs remote code (`trust_remote_code` is refused): a checkpoint that
+stores its backbone under a key prefix, such as a remote-code reranker package with `backbone.<name>` weights, has its
+backbone read from its safetensors under the one prefix that holds every weight with its shape, its other tensors
+dropped, and the start-up line names the source (`direct` or `prefix "backbone."`) and the dropped tensors. Weights
+that no single prefix provides, or several prefixes that each do, raise a `ValueError`; so do per-layer
+`attention_windows` or `rope_theta` lists in such a package's `config.json` that differ within a kind of layer, which
+Transformers' UltraBERT config would read as one value per kind. `max_train_samples` limits the training split to a
+random sample drawn with `seed`, not to its first rows; the evaluation holdout and `max_eval_samples` are drawn with
+`eval_sample_seed` (0 by default), so runs with different seeds evaluate on the same records. Samples are drawn before
+tokenization, so skipped records can leave fewer than asked for (the build report shows how many). The configuration
+keeps the weights in float32 with `bf16: true`, since KLM's fused CUDA kernels only run on float32 parameters. Loss
+settings given for a Clef checkpoint are checked as a new `ClefConfig` checks them. Each row holds `state` (a record,
+or its JSON string, which is decoded so that the prompt renders the record), `questions` and the targets of all of its
+questions, either `targets` (per question `target_index`, `target_probs`, `p_true` or `score`) or `gold` / `answers`
+(per question a label or probabilities), in exactly one of these forms. The example collator `DataCollatorForClef`
+reads the request itself (its `tokenize` decodes the JSON columns and renders the one prompt) and the targets with
+`DataCollatorForDecision.prepare_labeled_targets`, which also gives the gold label of each question. It returns one row
+of `labels` and `option_mask` per question, with the questions of all records of a batch one after the other. Nullable
+questions raise: Clef has no coverage output. `truncation` has three modes. With `error`, a prompt longer than
+`max_length`, an invalid request, a nullable question or unusable targets raise. With `skip`, such a record is dropped
+and counted by reason in the build report the script prints (rows, questions, skipped by reason, truncated). With
+`state`, the configuration's choice and what Clef itself does, an over-length record keeps its whole prompt but the end
+of its state, cut so that the prompt is exactly `max_length` tokens: the questions, options and targets are never cut,
+and the build report counts these records as `truncated`. A record too long even without its state is skipped (`schema
+longer than max_length`), as are invalid records. With `permute_fields`, each training batch re-renders its prompts
+with the questions in a new random order, each keeping its target (and cut the same way); evaluation never does.
+Activation checkpointing (`gradient_checkpointing: true`) covers the backbone and the head. A BERT-style encoder loaded
+as the backbone keeps its pooler, which Clef never reads, so the pooler's parameters get no gradient: DDP then fails
+unless `ddp_find_unused_parameters: true`, which does not combine with activation checkpointing; train such a backbone
+with `mode: head` or `lora`, or on one process, or without activation checkpointing. The collator returns
+`rows_per_example`, so the example also runs on several processes, and evaluates with its own collator, which never
+permutes:
+
+```bash
+torchrun --nproc_per_node=2 \
+    examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
+```
+
+`label_smoothing`, `brier_weight` and `ordinal_weight` set the terms of Clef's native loss. `rlcd_weight` adds the RLCD
+policy term, described next.
+
+### RLCD
+
+RLCD is Laya's "Reinforcement Learning for Calibrated Decisions", adapted from
+[Laya](https://github.com/NandhaKishorM/laya) (Apache-2.0). It is a community recipe, not an official Cloudflare
+objective, and is normally run as a second phase after cross-entropy training: noisy samples of the option logits are
+rewarded by a strictly proper scoring rule, and a REINFORCE term with a per-question mean baseline joins the supervised
+loss, which the phase keeps. `rlcd_sigma`, `rlcd_samples` and `rlcd_normalize_advantage` tune it; each setting left
+unset keeps the value of the model's config. The term applies in training only, so `eval_loss` is always the
+deterministic supervised loss. Its defaults (sigma 0.4, 32 samples, advantages not divided by their standard deviation;
+`0.25` is the suggested weight) are a revised variant of Laya's objective; `rlcd_normalize_advantage: true` with
+`rlcd_samples: 4` reproduces Laya's original.
+
+There are two ways to run it:
+
+1. **Two runs (recommended).** Train with cross-entropy, then start the example again with `model_name_or_path` set to
+   the saved Clef checkpoint, another `output_dir`, and `rlcd_weight` set. The second run loads the checkpoint as its
+   starting weights and trains with a fresh optimizer (do not pass `resume_from_checkpoint`); its first evaluation
+   reproduces the final `eval_loss` of the first run. The paired RLCD experiments used this recipe.
+2. **One run.** Cross-entropy first, RLCD from a given epoch: set `rlcd_weight` (the weight of the phase, which must
+   be positive), `rlcd_start_epoch` and `rlcd_sigmas`. The model is built with `rlcd_weight` 0, and
+   [`~trl.experimental.decision.RlcdScheduleCallback`] switches it on at `rlcd_start_epoch`. `rlcd_weight` without
+   either schedule setting turns RLCD on from the first step, which on a new head logs a warning.
+   `rlcd_start_epoch` must be before the end of the run, and `rlcd_sigma` cannot be combined with `rlcd_sigmas`; both
+   raise.
+
+`rlcd_sigmas` anneals the noise per epoch of the RLCD phase, counted from `rlcd_start_epoch`: Laya's schedule
+`[0.4, 0.3, 0.2, 0.1]` uses sigma 0.4 in the first epoch of the phase, 0.3 in the second, and so on, and the last value
+is held for later epochs. The values are a function of the epoch alone, so a resumed run and every process of a
+distributed run agree, and when training ends the model's config keeps the weight and sigma in effect at the last step,
+so the saved checkpoint records what it was trained with (a run that stops early, before `rlcd_start_epoch`, keeps
+weight 0).
+With `load_best_model_at_end`, the restored weights may come from an earlier phase than the saved config records.
+
+```yaml
+num_train_epochs: 5
+rlcd_weight: 0.25
+rlcd_start_epoch: 1
+rlcd_sigmas: [0.4, 0.3, 0.2, 0.1]
+```
+
+### Jev monitor
+
+[`~trl.experimental.decision.JevMonitorCallback`] lets a decision model behind a System One API (the judge) watch a
+training run. At every evaluation during training it sends the judge a digest of the evaluation metrics (current
+values, recent slopes, the best step so far, learned logit scales, gradient norms and sentinel flags), never training
+data, and asks it a few typed questions about the run. The request runs in a background thread: training never waits
+for it. The verdict on one evaluation is applied at the next one; one that has not arrived by then is recorded as
+missing and discarded. Everything is recorded in `<output_dir>/jev_monitor/ledger.jsonl`, by the main process only,
+including the digest sent with each request (in its `answer` or `late` record). The main process also logs: the first
+failure of the judge (such as a missing API key or an unreachable endpoint) and the first failure to write the ledger,
+once each, and every enforced stop and failed save.
+
+- `advise` (the default) only records the verdicts, and what it would have done.
+- `enforce` may stop training, and does nothing else: when a `StopRule` held for `patience` consecutive verdicts, when
+  an evaluation metric is NaN or infinite, or at the next evaluation once gradients were non-finite on
+  `patience_gradients` (2) consecutive checks of optimizer steps that were taken. A step skipped after an fp16
+  loss-scale overflow is normal and only noted; a clean check clears the gradient sentinel, and only the changes are
+  recorded. Before stopping, every process calls `trainer.save_model` to `<output_dir>/monitor-stop-<step>`
+  (collective under FSDP and DeepSpeed). The stop is enforced only if the main process then finds a non-empty weights
+  file there and records the stop, in the ledger or in `jev_monitor/intervened.json` (it writes both); otherwise
+  training goes on, and the reason is recorded and logged. Every process stops at the same step. A stop is attempted
+  at most once per step, and not at an evaluation after which training ends anyway (at `max_steps`, for example):
+  that is only noted. `enforce` needs `attach(trainer)`.
+
+The monitor never changes saving or evaluation. API keys are read from the environment at request time (a preset's
+variable, such as `TYPESAFE_API_KEY`), never from arguments or files; surrounding whitespace is stripped, and a key that
+still contains whitespace is refused. A key is sent only over HTTPS or to a loopback host, and a loopback host is never
+reached through a proxy. Evaluations outside `train()` are ignored.
+
+A resumed run keeps the ledger records up to the step it resumes from, and rebuilds the history and the streaks from
+them; a streak ends at a recorded stop, so a run resumed after a stop is stopped again only by new verdicts. The later
+records are moved, not deleted, to a new file beside the ledger (`ledger.moved-<time>.jsonl`), as is an
+`intervened.json` of a later step (`intervened.moved-<time>.json`), and a `note` record says where. A run that starts
+from step 0 in a reused output directory moves all the earlier records aside the same way.
+
+With a dict of evaluation datasets, the evaluations of one step are merged into the history of that step (metrics
+named `<dataset>_<metric>`), but the judge's request for the step has usually already been sent with the first
+evaluation, and covers the first dataset only; a `note` in the ledger and a warning say so, once per run. Set
+`metric_prefix` (for example `eval_validation`) to watch one dataset: its metrics are then named as with a single
+dataset, and the default objective (`selection_score`) scores them. Metrics are matched by exact name, never by a
+suffix of another name (`reverse_kl` is not `kl`).
+
+Limits: under FSDP the main process sees only its own shard of the gradients, and under DeepSpeed ZeRO the gradients
+may not be available to callbacks, so the gradient check may see nothing; a sharded zero-dimensional scale parameter is
+not found. Gradient norms are read just before the optimizer step, after clipping; under fp16 without clipping
+(`max_grad_norm: 0`) they are still multiplied by the loss scale. The main process may finish up to `finish_timeout`
+(5 s) after the other processes. Resuming does not apply the verdict on the evaluation of the checkpoint's own step.
+An evaluation that comes while a training step is unfinished (after `train()` failed inside a step) is ignored with a
+`note`. A `train()` that failed elsewhere (in an evaluation during training, while saving a checkpoint, while logging,
+in another callback, or while loading a batch) is not detected, so a later standalone `evaluate()` is recorded and sent
+to the judge.
+
+```python
+from trl.experimental.decision import JevMonitorCallback, StopRule
+from trl.experimental.decision.jev_monitor import SystemOneClient
+
+monitor = JevMonitorCallback(
+    SystemOneClient("typesafe"),
+    mode="enforce",
+    stop_when=[StopRule("stop", threshold=0.9)],
+    patience=3,
+).attach(trainer)
+trainer.train()
+```
+
+In the Clef example, set `jev_monitor` to a client preset (`typesafe`, `openrouter`, `local`) or an endpoint URL (asked
+without a key), with `jev_monitor_model` and `jev_monitor_mode`; it is off by default and adds no stop rules:
+
+```yaml
+jev_monitor: typesafe
+jev_monitor_mode: advise
+```
+
+## JEV
+
+JEV uses [Transformers #50586](https://github.com/huggingface/transformers/pull/50586). Use the
+[JEV training script](https://github.com/huggingface/trl/blob/main/examples/decisions/jev.py) with the model's tokenizer and `decision_config`, and set both `per_device_train_batch_size` and
+`per_device_eval_batch_size` to `1`. Disable gradient checkpointing for the current JEV implementation. Each row contains one question; use accumulation for more decisions per update.
+The script prepares packed option targets and uses Transformers' `default_data_collator` for JEV's native KL and ordinal RPS loss. Predictions are padded per-question
+probabilities, like the other collators. Nullable decisions are unsupported.
+
+## Labels and metrics
+
+Collators may return integer class labels or soft target distributions. Pass `option_mask` when padding candidate sets. With `allow_null`, target distributions contain null first and the model may return `coverage_logits`. Nullable decisions require a coverage output. `is_choice` can exclude binary and score rows from choice accuracy.
+
+The trainer logs candidate loss, choice and candidate accuracy, Brier score, and entropy. `loss` and `eval_loss` are the native training objective; the reported candidate cross-entropy can differ from it. Null and coverage metrics are logged when present; auxiliary loss is logged only when returned by the model. Metrics aggregate across ranks and accumulation steps, and evaluation removes padded examples. `compute_metrics` receives predicted probabilities and the original labels, with `-100` marking padded candidate columns.
+
+A collator whose records each produce several rows (such as one per question) returns `rows_per_example`, a
+`LongTensor` with the number of consecutive rows of each record, adding up to the number of rows. The trainer removes
+it before calling the model, and packs every per-row tensor it gathers across processes by record, so that each rank
+sends the same shape and the padding of the last evaluation batch is removed in records. `compute_metrics` then
+receives, per record, `max_rows` question slots in order (`max_rows` is the largest number of rows of a record in that
+evaluation batch, over all processes), flattened to `(num_slots, num_options)`: the slots a record does not use are
+`-100` in every cell, and dropping them gives the rows in record order, then row order. Without `rows_per_example`,
+predictions keep one row per example.
+
+A collator may also return `hard_labels`, the gold label of each row as an option index, next to target
+distributions in `labels`. The trainer removes it before calling the model and packs it by record like the labels;
+`compute_metrics` then receives `label_ids` as the pair `(labels, hard_labels)`. `DataCollatorForClef` returns it: the
+option a row's gold `label` (or `target_index`) names, else the target's first most probable option. Accuracy is
+counted against it, so a tie in the target probabilities is scored against the label the row gives.
+
+To get one row per question back from the record-shaped arrays (keeping `rows_per_example` yourself), use
+`trl.experimental.decision.decision_trainer.unpack_rows`, the inverse of the packing; or drop the slots that are `-100`
+in every cell. Records are never dispatched or split across processes: the trainer raises when a dataloader does so
+(streaming datasets are dispatched by default), so set `accelerator_config` to
+`{"dispatch_batches": false, "split_batches": false}`.
+
+`eval_loss` is the mean of the batch losses weighted by the records of each batch, so it shifts slightly with the
+evaluation batch size and the number of processes when records have different numbers of questions; the per-question
+metrics do not. `eval_choice_accuracy` counts only choice questions with a one-hot target;
+`compute_calibration_metrics` counts every question.
+
+`compute_calibration_metrics` can be passed as `compute_metrics` as it is. It reports, per question, `accuracy`
+(against the gold label when `label_ids` carries one, else against the target's first most probable option), `kl` (from
+the target distribution), `brier`, `ece`, `mean_confidence`, `soft_nll`, `confidence_gap` (mean confidence minus
+accuracy) and `selection_score` (`accuracy - kl_weight * kl - brier_weight * brier`, with both weights `0.25` by
+default), a single number to select checkpoints with `metric_for_best_model: eval_selection_score`.
+
+## Head learning rate
+
+Set `head_learning_rate` to train the parameters outside the model's backbone (its `base_model`), such as a decision
+head, at their own rate while the backbone keeps `learning_rate`. Adapters inside the backbone train at
+`learning_rate`. Zero-dimensional parameters, such as logit scales and gates, are never decayed.
+
+## Distributed training
+
+DDP, DeepSpeed ZeRO, and FSDP2 use the usual Trainer configuration. FSDP2 currently requires Accelerate main,
+included in the example script dependencies. Context and sequence parallelism are unsupported: the current model
+readouts need complete sequences. Tensor and masked expert parallelism use Transformers' `distributed_config`
+when loading a complete checkpoint. Token-dispatch expert parallelism is not supported by Trainer.
+
+The trainer normalizes the native mean loss by decision count across ranks and accumulation steps. It does not
+add MoE router regularization; auxiliary losses must come from the model itself. CLM's contrastive negatives remain
+local to each microbatch.
+
+## Inference
+
+Use the model's Transformers inference API. For the LoRA example, load the saved native `base_model` and its adapter with PEFT, then call `merge_and_unload()` before creating the decision pipeline. Saved Jeva checkpoints work with the decision pipeline:
+
+```python
+from transformers import AutoModelForDecision, AutoTokenizer, pipeline
+
+model = AutoModelForDecision.from_pretrained("decision-output")
+tokenizer = AutoTokenizer.from_pretrained("decision-output")
+decide = pipeline("decision", model=model, tokenizer=tokenizer)
+answers = decide(request)
+```
+
+## DecisionConfig
+
+[[autodoc]] experimental.decision.DecisionConfig
+
+## DecisionTrainer
+
+[[autodoc]] experimental.decision.DecisionTrainer
+
+## DataCollatorForDecision
+
+[[autodoc]] experimental.decision.DataCollatorForDecision
+    - prepare_example
+    - prepare_request
+    - prepare_targets
+    - prepare_labeled_targets
+
+## target_from_gold
+
+[[autodoc]] experimental.decision.target_from_gold
+
+## compute_calibration_metrics
+
+[[autodoc]] experimental.decision.compute_calibration_metrics
+
+## RlcdScheduleCallback
+
+[[autodoc]] experimental.decision.RlcdScheduleCallback
+
+## JevMonitorCallback
+
+[[autodoc]] experimental.decision.JevMonitorCallback
+    - attach
+    - wait
+    - close
+
+## StopRule
+
+[[autodoc]] experimental.decision.StopRule
+
+## SystemOneClient
+
+[[autodoc]] experimental.decision.jev_monitor.SystemOneClient
+    - ask
+    - reset
+
+## build_digest
+
+[[autodoc]] experimental.decision.jev_monitor.build_digest
+
+## Ledger
+
+[[autodoc]] experimental.decision.jev_monitor.Ledger
+    - append
+    - read
+    - truncate_after
