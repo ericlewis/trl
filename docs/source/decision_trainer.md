@@ -101,6 +101,15 @@ torchrun --nproc_per_node=2 \
     examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
 ```
 
+`label_smoothing`, `brier_weight` and `ordinal_weight` set the terms of Clef's native loss, and `rlcd_weight` adds its
+RLCD policy term, adapted from [Laya](https://github.com/NandhaKishorM/laya) (Apache-2.0): noisy samples of the option
+logits are rewarded by a strictly proper scoring rule, and a REINFORCE term with a per-question mean baseline joins the
+supervised loss. `rlcd_sigma`, `rlcd_samples` and `rlcd_normalize_advantage` tune it; each setting left unset keeps the
+value of the model's config. The term applies in training only, so `eval_loss` stays the deterministic supervised
+loss. Its defaults (sigma 0.4, 32 samples, advantages not divided by their standard deviation; `0.25` is the suggested
+weight) are a revised variant of Laya's objective; `rlcd_normalize_advantage: true` with `rlcd_samples: 4` reproduces
+Laya's original. These loss terms are a community recipe, not an official Cloudflare objective.
+
 ## JEV
 
 JEV uses [Transformers #50586](https://github.com/huggingface/transformers/pull/50586). Use the

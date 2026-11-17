@@ -27,7 +27,8 @@ Train a Clef decision model on typed decisions: one prompt per record, every que
 reads its last token with the ChatML prompt; a bidirectional encoder (BERT, ModernBERT, or a reranker, unwrapped to
 its base model) reads its first token with the plain prompt between [CLS] and [SEP]. `global_pooling` and
 `prompt_style` override that choice; `head_type: cosine` (with `cosine_width`, `cosine_initial_scale`) selects the
-small cosine head instead of the joint one. The resolved setup is printed at start-up.
+small cosine head instead of the joint one. The resolved setup is printed at start-up. `rlcd_weight` (with
+`rlcd_sigma`, `rlcd_samples`, `rlcd_normalize_advantage`) adds Clef's RLCD policy term to the training loss.
 
 python examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
 
@@ -320,6 +321,21 @@ class ClefScriptArguments(ScriptArguments):
     label_smoothing: float | None = field(default=None, metadata={"help": "Loss label smoothing. Defaults to 0."})
     brier_weight: float | None = field(default=None, metadata={"help": "Weight of the Brier score. Defaults to 0."})
     ordinal_weight: float | None = field(default=None, metadata={"help": "Weight of the ordinal term. Defaults to 0."})
+    rlcd_weight: float | None = field(
+        default=None, metadata={"help": "Weight of the RLCD policy term, applied in training only. Defaults to 0."}
+    )
+    rlcd_sigma: float | None = field(
+        default=None, metadata={"help": "Standard deviation of the RLCD noise on the logits. Defaults to 0.4."}
+    )
+    rlcd_samples: int | None = field(
+        default=None, metadata={"help": "Noisy samples per question of the RLCD term. Defaults to 32."}
+    )
+    rlcd_normalize_advantage: bool | None = field(
+        default=None,
+        metadata={
+            "help": "Divide the RLCD advantages by their standard deviation (Laya's original). Defaults to False."
+        },
+    )
     max_length: int = field(default=2048, metadata={"help": "Maximum prompt token length."})
     truncation: str = field(
         default="error", metadata={"help": "Over-length or invalid records: error, or skip and count them."}
@@ -381,7 +397,15 @@ def build_model(script_args, model_args, model_kwargs):
     name, revision = model_args.model_name_or_path, model_args.model_revision
     losses = {
         key: getattr(script_args, key)
-        for key in ("label_smoothing", "brier_weight", "ordinal_weight")
+        for key in (
+            "label_smoothing",
+            "brier_weight",
+            "ordinal_weight",
+            "rlcd_weight",
+            "rlcd_sigma",
+            "rlcd_samples",
+            "rlcd_normalize_advantage",
+        )
         if getattr(script_args, key) is not None
     }
     head_settings = {

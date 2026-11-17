@@ -418,6 +418,16 @@ class TestClefTraining(TrlTestCase):
         batch = collator([val[i] for i in range(4)])
         assert max_logit_difference(again, trainer.model, batch) == 0.0
 
+    def test_rlcd_eval_is_deterministic(self, tokenizer, decision_config):
+        model = tiny_clef(tokenizer, decision_config)
+        model.config.rlcd_weight, model.config.rlcd_samples = 0.25, 8
+        trainer, _, _ = make_trainer(self.tmp_dir, tokenizer, decision_config, model=model)
+        first = trainer.evaluate()["eval_loss"]
+        assert trainer.evaluate()["eval_loss"] == first
+        # The random policy term is a training term only: evaluation gives the supervised loss
+        model.config.rlcd_weight = 0.0
+        assert trainer.evaluate()["eval_loss"] == first
+
     def test_build_report_counts_skipped_records_by_reason(self, tokenizer, decision_config, capsys):
         invalid_request = {"state": "s", "questions": {"team": {"type": "bogus"}}, "gold": {"team": "zeta"}}
         unusable_gold = {**make_row(0, names=("team",)), "gold": {"team": "omega"}}
@@ -637,6 +647,20 @@ class TestClefTraining(TrlTestCase):
         out = capsys.readouterr().out
         assert f"global_pooling={expected['global_pooling']}, prompt_style={expected['prompt_style']}" in out
         self.check_saved_model(trainer, tokenizer, **expected)
+
+    def test_main_passes_rlcd_settings(self, tokenizer):
+        script_kwargs = {"rlcd_weight": 0.25, "rlcd_samples": 8}
+        trainer, initial, _ = self.run_main(
+            tokenizer, "full", training_kwargs={"logging_steps": 1}, script_kwargs=script_kwargs
+        )
+        assert trainer.state.global_step == 5
+        losses = [entry["loss"] for entry in trainer.state.log_history if "loss" in entry]
+        assert losses and all(np.isfinite(loss) for loss in losses)
+        assert (initial.config.rlcd_weight, initial.config.rlcd_samples) == (0.25, 8)
+        # The settings left unset keep the config's defaults
+        self.check_saved_model(
+            trainer, tokenizer, rlcd_weight=0.25, rlcd_samples=8, rlcd_sigma=0.4, rlcd_normalize_advantage=False
+        )
 
     def test_checkpoint_head_settings_cannot_change(self, tokenizer, decision_config):
         tiny_clef(tokenizer, decision_config).save_pretrained(f"{self.tmp_dir}/clef")
