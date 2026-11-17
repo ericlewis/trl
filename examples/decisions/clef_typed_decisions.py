@@ -37,7 +37,6 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 from datasets import Features, Sequence, Value, load_dataset
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForDecision, AutoTokenizer, set_seed
@@ -46,7 +45,12 @@ from transformers.decision import Question
 from transformers.utils import cached_file
 
 from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config
-from trl.experimental.decision import DataCollatorForDecision, DecisionConfig, DecisionTrainer
+from trl.experimental.decision import (
+    DataCollatorForDecision,
+    DecisionConfig,
+    DecisionTrainer,
+    compute_calibration_metrics,
+)
 
 
 def clef_decision_config():
@@ -347,10 +351,6 @@ def prepare_split(dataset, collator, training_args, desc):
     return tokenized, report
 
 
-def compute_metrics(prediction):
-    return {"accuracy": float(np.mean(prediction.predictions.argmax(-1) == prediction.label_ids.argmax(-1)))}
-
-
 def main(script_args, training_args, model_args):
     if training_args.world_size > 1:
         raise ValueError(
@@ -425,7 +425,7 @@ def main(script_args, training_args, model_args):
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
         data_collator=collator,
-        compute_metrics=compute_metrics,
+        compute_metrics=compute_calibration_metrics,
     )
     result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     if lora_backbone is not None:

@@ -41,10 +41,17 @@ from transformers.loss.loss_utils import LOSS_MAPPING
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from transformers.models.clef.configuration_clef import CLEF_TEMPLATE
 
-from trl.experimental.decision import DataCollatorForDecision, DecisionConfig, DecisionTrainer
+from trl.experimental.decision import (
+    DataCollatorForDecision,
+    DecisionConfig,
+    DecisionTrainer,
+    compute_calibration_metrics,
+)
 from trl.experimental.decision.data_collator import target_from_gold
 
 from ..testing_utils import TrlTestCase, require_peft
+from .test_decision_clef import lora_clef, tiny_clef
+from .test_decision_clef import make_trainer as make_clef_trainer
 
 
 HAS_JEVA = "jeva" in CONFIG_MAPPING
@@ -814,3 +821,228 @@ class TestDataCollatorForDecisionRequests(TrlTestCase):
         collator = self.make_collator(tokenizer, per_question=True)
         with pytest.raises(ValueError, match="one prompt"):
             collator.prepare_request({"state": "s", "questions": THREE_QUESTIONS, "targets": THREE_TARGETS})
+
+
+def optimizer_settings(optimizer):
+    """The learning rate and weight decay of each parameter of an optimizer, by parameter id."""
+    lr = {id(p): group["lr"] for group in optimizer.param_groups for p in group["params"]}
+    wd = {id(p): group["weight_decay"] for group in optimizer.param_groups for p in group["params"]}
+    return lr, wd
+
+
+class TestHeadLearningRate(TrlTestCase):
+    def clef_trainer(self, tokenizer, model, **kwargs):
+        from examples.decisions.clef_typed_decisions import clef_decision_config
+
+        trainer, _, _ = make_clef_trainer(self.tmp_dir, tokenizer, clef_decision_config(), model=model, **kwargs)
+        return trainer
+
+    def test_head_learning_rate_groups(self, tokenizer):
+        from examples.decisions.clef_typed_decisions import clef_decision_config
+
+        model = tiny_clef(tokenizer, clef_decision_config())
+        trainer = self.clef_trainer(tokenizer, model, head_learning_rate=1e-3, learning_rate=1e-4, weight_decay=0.05)
+        opt = trainer.create_optimizer()
+        lr, wd = optimizer_settings(opt)
+        backbone = {id(p) for p in model.base_model.parameters()}
+        assert backbone and any(i not in backbone for i in lr)
+        assert all(lr[i] == (1e-4 if i in backbone else 1e-3) for i in lr)
+        # Clef's scales and gate are zero-dimensional: never decayed
+        scalars = [p for p in model.parameters() if p.requires_grad and p.dim() == 0]
+        assert scalars
+        assert all(wd[id(p)] == 0.0 for p in scalars)
+        decayed = set(trainer.get_decay_parameter_names(model))
+        for name, p in model.named_parameters():
+            if p.requires_grad and p.dim() > 0:
+                assert wd[id(p)] == (0.05 if name in decayed else 0.0), name
+        assert any(value == 0.05 for value in wd.values())
+        assert len(lr) == sum(p.requires_grad for p in model.parameters())
+        assert len(opt.param_groups) == 4
+
+    def test_optimizer_unchanged_without_head_lr(self, tokenizer):
+        from examples.decisions.clef_typed_decisions import clef_decision_config
+        from transformers import Trainer
+
+        model = tiny_clef(tokenizer, clef_decision_config())
+        trainer = self.clef_trainer(tokenizer, model, learning_rate=1e-4, weight_decay=0.05)
+        assert trainer.args.head_learning_rate is None
+
+        def groups(optimizer):
+            return [
+                (sorted(id(p) for p in group["params"]), group["lr"], group["weight_decay"])
+                for group in optimizer.param_groups
+            ]
+
+        ours = groups(trainer.create_optimizer())
+        trainer.optimizer = None
+        reference = groups(Trainer.create_optimizer(trainer))
+        assert ours == reference
+
+    @require_peft
+    def test_head_lr_with_peft(self, tokenizer):
+        from examples.decisions.clef_typed_decisions import clef_decision_config
+
+        # Adapters inside the backbone of Clef, the head trained in full next to them
+        model = lora_clef(tokenizer, clef_decision_config())
+        trainer = self.clef_trainer(tokenizer, model, head_learning_rate=1e-3, learning_rate=1e-4)
+        lr, _ = optimizer_settings(trainer.create_optimizer())
+        trainable = {name: p for name, p in model.named_parameters() if p.requires_grad}
+        assert len(lr) == len(trainable)
+        lora = [name for name in trainable if "lora_" in name]
+        assert lora and all(lr[id(trainable[name])] == 1e-4 for name in lora)
+        head = [name for name in trainable if name.startswith(("embeddings.", "encoder.", "scorer."))]
+        assert head and all(lr[id(trainable[name])] == 1e-3 for name in head)
+        assert set(lora) | set(head) == set(trainable)
+
+        # The whole model wrapped by PEFT, the head in `modules_to_save`
+        from peft import LoraConfig
+
+        peft_config = LoraConfig(r=2, target_modules=["q_proj", "v_proj"], task_type="SEQ_CLS")
+        encoded = tokenizer(["A refund", "A delivery"])
+        trainer = DecisionTrainer(
+            model=make_classification_model(),
+            args=DecisionConfig(
+                output_dir=self.tmp_dir,
+                use_cpu=True,
+                bf16=False,
+                learning_rate=1e-4,
+                head_learning_rate=1e-3,
+                report_to="none",
+            ),
+            train_dataset=Dataset.from_dict({**encoded, "labels": [0, 1]}),
+            processing_class=tokenizer,
+            data_collator=DataCollatorWithPadding(tokenizer),
+            peft_config=peft_config,
+        )
+        lr, _ = optimizer_settings(trainer.create_optimizer())
+        trainable = {name: p for name, p in trainer.model.named_parameters() if p.requires_grad}
+        assert len(lr) == len(trainable)
+        for name, p in trainable.items():
+            assert lr[id(p)] == (1e-4 if "lora_" in name else 1e-3), name
+        assert any("score" in name for name in trainable)
+
+
+def naive_calibration_metrics(rows, bins=15, kl_weight=0.25, brier_weight=0.25):
+    """Every metric by an explicit float64 loop over questions given as (probabilities, target) lists."""
+    accuracy = kl = brier = nll = confidence_total = 0.0
+    confidences, corrects = [], []
+    for probabilities, target in rows:
+        probabilities = [float(p) for p in probabilities]
+        target = [float(t) for t in target]
+        predicted = max(range(len(probabilities)), key=lambda i: probabilities[i])
+        gold = max(range(len(target)), key=lambda i: target[i])
+        confidence = probabilities[predicted]
+        correct = float(predicted == gold)
+        accuracy += correct
+        confidence_total += confidence
+        confidences.append(confidence)
+        corrects.append(correct)
+        for p, t in zip(probabilities, target, strict=True):
+            brier += (p - t) ** 2
+            if t > 0:
+                nll -= t * np.log(p)
+                kl += t * (np.log(t) - np.log(p))
+    n = len(rows)
+    ece = 0.0
+    for b in range(bins):
+        members = [i for i, c in enumerate(confidences) if min(int(c * bins), bins - 1) == b]
+        ece += abs(sum(corrects[i] for i in members) - sum(confidences[i] for i in members))
+    metrics = {
+        "accuracy": accuracy / n,
+        "kl": kl / n,
+        "brier": brier / n,
+        "ece": ece / n,
+        "mean_confidence": confidence_total / n,
+        "soft_nll": nll / n,
+    }
+    metrics["confidence_gap"] = metrics["mean_confidence"] - metrics["accuracy"]
+    metrics["selection_score"] = metrics["accuracy"] - kl_weight * metrics["kl"] - brier_weight * metrics["brier"]
+    return metrics
+
+
+def ragged_questions(seed=0, count=40, max_options=4, soft=True):
+    """Questions of 1 to `max_options` options: their probabilities and target distributions."""
+    generator = np.random.default_rng(seed)
+    rows = []
+    for index in range(count):
+        width = 1 + index % max_options
+        logits = generator.normal(size=width) * 2
+        probabilities = np.exp(logits) / np.exp(logits).sum()
+        if soft and index % 3 == 0:
+            target = generator.dirichlet(np.ones(width))
+        else:
+            target = np.eye(width)[generator.integers(width)]
+        rows.append((probabilities, target))
+    return rows
+
+
+def padded(rows, max_options=4):
+    predictions = np.full((len(rows), max_options), -100.0)
+    labels = np.full((len(rows), max_options), -100.0)
+    for i, (probabilities, target) in enumerate(rows):
+        predictions[i, : len(probabilities)] = probabilities
+        labels[i, : len(target)] = target
+    return predictions, labels
+
+
+class EvalPrediction:
+    def __init__(self, predictions, label_ids):
+        self.predictions, self.label_ids = predictions, label_ids
+
+
+class TestCalibrationMetrics:
+    def test_calibration_metrics_match_naive(self):
+        rows = ragged_questions()
+        metrics = compute_calibration_metrics(EvalPrediction(*padded(rows)))
+        expected = naive_calibration_metrics(rows)
+        assert set(metrics) == set(expected)
+        for key, value in expected.items():
+            assert metrics[key] == pytest.approx(value, abs=1e-9), key
+        weighted = compute_calibration_metrics(EvalPrediction(*padded(rows)), bins=7, kl_weight=0.5, brier_weight=1.0)
+        for key, value in naive_calibration_metrics(rows, bins=7, kl_weight=0.5, brier_weight=1.0).items():
+            assert weighted[key] == pytest.approx(value, abs=1e-9), key
+
+    def test_calibration_metrics_integer_labels(self):
+        rows = ragged_questions(soft=False)
+        predictions, labels = padded(rows)
+        indices = np.array([int(np.argmax(target)) for _, target in rows])
+        from_indices = compute_calibration_metrics(EvalPrediction(predictions, indices))
+        from_distributions = compute_calibration_metrics(EvalPrediction(predictions, labels))
+        expected = naive_calibration_metrics(rows)
+        for key, value in expected.items():
+            assert from_indices[key] == pytest.approx(value, abs=1e-9), key
+            assert from_distributions[key] == pytest.approx(value, abs=1e-9), key
+        # An index of -100 is a question to ignore
+        ignored = compute_calibration_metrics(EvalPrediction(predictions, np.concatenate([indices[:-1], [-100]])))
+        for key, value in naive_calibration_metrics(rows[:-1]).items():
+            assert ignored[key] == pytest.approx(value, abs=1e-9), key
+        with pytest.raises(ValueError, match="option"):
+            compute_calibration_metrics(EvalPrediction(predictions[:1], np.array([3])))  # the first has one option
+
+    def test_calibration_metrics_single_option_question(self):
+        rows = [(np.array([1.0]), np.array([1.0]))] + ragged_questions(count=5)
+        metrics = compute_calibration_metrics(EvalPrediction(*padded(rows)))
+        for key, value in naive_calibration_metrics(rows).items():
+            assert metrics[key] == pytest.approx(value, abs=1e-9), key
+        only = compute_calibration_metrics(EvalPrediction(*padded(rows[:1])))
+        assert only["accuracy"] == 1.0 and only["mean_confidence"] == 1.0
+        assert only["kl"] == pytest.approx(0.0, abs=1e-12) and only["brier"] == 0.0 and only["ece"] == 0.0
+
+    def test_calibration_metrics_reject_nan(self):
+        predictions, labels = padded(ragged_questions(count=6))
+        predictions[3, 0] = np.nan
+        with pytest.raises(ValueError, match="finite"):
+            compute_calibration_metrics(EvalPrediction(predictions, labels))
+        predictions, labels = padded(ragged_questions(count=6))
+        predictions[3, 1] = np.inf  # the fourth question has four options
+        with pytest.raises(ValueError, match="finite"):
+            compute_calibration_metrics(EvalPrediction(predictions, labels))
+
+    def test_selection_score_weights(self):
+        rows = ragged_questions()
+        metrics = compute_calibration_metrics(EvalPrediction(*padded(rows)), kl_weight=0, brier_weight=0)
+        assert metrics["selection_score"] == metrics["accuracy"]
+        default = compute_calibration_metrics(EvalPrediction(*padded(rows)))
+        assert default["selection_score"] == pytest.approx(
+            default["accuracy"] - 0.25 * default["kl"] - 0.25 * default["brier"], abs=1e-12
+        )

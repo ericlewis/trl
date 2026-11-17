@@ -15,6 +15,7 @@
 from .data_collator import DataCollatorForDecision
 from .decision_config import DecisionConfig
 from .decision_trainer import DecisionTrainer
+from .metrics import compute_calibration_metrics
 
 
-__all__ = ["DataCollatorForDecision", "DecisionConfig", "DecisionTrainer"]
+__all__ = ["DataCollatorForDecision", "DecisionConfig", "DecisionTrainer", "compute_calibration_metrics"]

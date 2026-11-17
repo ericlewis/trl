@@ -83,6 +83,9 @@ questions jointly. It requires [Transformers #50058](https://github.com/huggingf
 python examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
 ```
 
+The configuration trains the head at `head_learning_rate` (`3e-4`, the backbone at `1e-4`), evaluates with
+`compute_calibration_metrics` and keeps the checkpoint with the best `eval_selection_score`.
+
 `mode` selects head-only, LoRA, or full training. LoRA puts adapters on the backbone and trains the head in full; the output is the merged native checkpoint, with the adapter alone in `adapter/`. A Clef checkpoint is loaded as it is; any other causal LM becomes the
 backbone of a new head. Each row holds `state`, `questions` and the targets of all of its questions, either `targets`
 (per question `target_index`, `target_probs`, `p_true` or `score`) or `gold` / `answers` (per question a label or
@@ -107,6 +110,17 @@ probabilities, like the other collators. Nullable decisions are unsupported.
 Collators may return integer class labels or soft target distributions. Pass `option_mask` when padding candidate sets. With `allow_null`, target distributions contain null first and the model may return `coverage_logits`. Nullable decisions require a coverage output. `is_choice` can exclude binary and score rows from choice accuracy.
 
 The trainer logs candidate loss, choice and candidate accuracy, Brier score, and entropy. `loss` and `eval_loss` are the native training objective; the reported candidate cross-entropy can differ from it. Null and coverage metrics are logged when present; auxiliary loss is logged only when returned by the model. Metrics aggregate across ranks and accumulation steps, and evaluation removes padded examples. `compute_metrics` receives predicted probabilities and the original labels, with `-100` marking padded candidate columns.
+
+`compute_calibration_metrics` can be passed as `compute_metrics` as it is. It reports, per question, `accuracy`, `kl`
+(from the target distribution), `brier`, `ece`, `mean_confidence`, `soft_nll`, `confidence_gap` (mean confidence minus
+accuracy) and `selection_score` (`accuracy - kl_weight * kl - brier_weight * brier`, with both weights `0.25` by
+default), a single number to select checkpoints with `metric_for_best_model: eval_selection_score`.
+
+## Head learning rate
+
+Set `head_learning_rate` to train the parameters outside the model's backbone (its `base_model`), such as a decision
+head, at their own rate while the backbone keeps `learning_rate`. Adapters inside the backbone train at
+`learning_rate`. Zero-dimensional parameters, such as logit scales and gates, are never decayed.
 
 ## Distributed training
 
@@ -145,3 +159,7 @@ answers = decide(request)
 [[autodoc]] experimental.decision.DataCollatorForDecision
     - prepare_example
     - prepare_request
+
+## compute_calibration_metrics
+
+[[autodoc]] experimental.decision.compute_calibration_metrics
