@@ -1,4 +1,4 @@
-# Train a Clef decision head and its KLM-1.6 backbone together on typed decisions.
+# Train a Clef decision head (the small cosine head) and its KLM-1.6 backbone together on typed decisions.
 # Use mode: head or mode: lora (with use_peft and lora_* settings) to leave the backbone frozen.
 # model_name_or_path can also be an encoder (BERT, ModernBERT, UltraBERT, a reranker): it then reads its first token
 # with the plain prompt; set global_pooling (last/first) and prompt_style (chatml/plain) to override the choice.
@@ -13,8 +13,11 @@ dtype: float32
 # attn_implementation (e.g. flash_attention_2) switches the backbone (only) to flash attention
 # attn_implementation: flash_attention_2
 mode: full
-# joint, or cosine for the small cosine head (cosine_width, cosine_initial_scale)
-head_type: joint
+# The head of a new model. cosine: two small projections (cosine_width, cosine_initial_scale) score each option by its
+# cosine with its question; far fewer parameters than the joint head and faster steps. joint: Clef's original head, the
+# model's own default (with head_hidden_size and the other head_* sizes). A Clef checkpoint keeps the head it was saved
+# with: when model_name_or_path is a checkpoint with a joint head, set this to joint or remove the line.
+head_type: cosine
 # Laya's RLCD ("Reinforcement Learning for Calibrated Decisions"), a community recipe, in training only. It is meant as
 # a second phase after cross-entropy training; unset settings keep the config's values (weight 0, sigma 0.4, 32 samples).
 # rlcd_normalize_advantage: true with rlcd_samples: 4 is Laya's original objective.

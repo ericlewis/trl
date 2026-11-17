@@ -29,7 +29,8 @@ Train a Clef decision model on typed decisions: one prompt per record, every que
 reads its last token with the ChatML prompt; a bidirectional encoder (BERT, ModernBERT, or a reranker, unwrapped to
 its base model) reads its first token with the plain prompt between [CLS] and [SEP]. `global_pooling` and
 `prompt_style` override that choice; `head_type: cosine` (with `cosine_width`, `cosine_initial_scale`) selects the
-small cosine head instead of the joint one. The resolved setup is printed at start-up. `rlcd_weight` (with
+small cosine head instead of the joint one, and is what the example's configuration trains. The resolved setup is
+printed at start-up. `rlcd_weight` (with
 `rlcd_sigma`, `rlcd_samples`, `rlcd_normalize_advantage`) adds Clef's RLCD policy term to the training loss. RLCD is
 meant as a second phase after cross-entropy training: start this script again from the saved checkpoint with
 `rlcd_weight` set, or in one run give `rlcd_start_epoch` and/or `rlcd_sigmas` (one noise scale per epoch of the RLCD
@@ -444,7 +445,8 @@ class ClefScriptArguments(ScriptArguments):
     head_type: str | None = field(
         default=None,
         metadata={
-            "help": "Decision head of a new model: joint (the default) or cosine. A Clef checkpoint keeps its own head."
+            "help": "Decision head of a new model: joint (the model's default) or cosine (what the example's "
+            "configuration sets). A Clef checkpoint keeps its own head."
         },
     )
     global_pooling: str | None = field(

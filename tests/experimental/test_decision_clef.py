@@ -1381,6 +1381,18 @@ class TestClefTraining(TrlTestCase):
         assert args.eval_strategy == "steps" and args.eval_steps < steps_per_epoch
         assert args.warmup_steps < args.eval_steps and total_steps // args.eval_steps >= 6
 
+    def test_default_configuration_trains_the_cosine_head(self):
+        from trl import TrlParser
+
+        parser = TrlParser((ClefScriptArguments, DecisionConfig, ClefModelArguments))
+        path = Path(__file__).resolve().parents[2] / "examples/decisions/clef_typed_decisions.yaml"
+        script_args, _, _ = parser.parse_args_and_config(["--config", str(path)])
+        # The shipped configuration picks the small cosine head, with its default width and scale
+        assert script_args.head_type == "cosine"
+        assert script_args.cosine_width is None and script_args.cosine_initial_scale is None
+        # Without a configuration, the script leaves the model's own default (the joint head) alone
+        assert ClefScriptArguments().head_type is None
+
     @pytest.mark.parametrize("attention", ["eager", "sdpa"])
     def test_attention_implementation_reaches_the_model(self, tokenizer, decision_config, attention):
         # A new head on a backbone, and a Clef checkpoint, both get the attention that was asked for

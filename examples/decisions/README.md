@@ -39,7 +39,10 @@ record, so each row needs `state`, `questions` and the targets of every question
 python examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
 ```
 
-The configuration trains the head at `head_learning_rate` (`3e-4`, the backbone at `1e-4`), evaluates with
+The configuration trains the small cosine head (`head_type: cosine`: two projections that score each option by its
+cosine with its question); `head_type: joint` selects Clef's original joint head, which is the model's own default
+and what the script builds when no `head_type` is given. A Clef checkpoint keeps the head it was saved with. It trains
+the head at `head_learning_rate` (`3e-4`, the backbone at `1e-4`), evaluates with
 `compute_calibration_metrics` every 12 steps (three times per 36-step epoch of the default dataset, for 3 epochs)
 and keeps the checkpoint with the best `eval_selection_score`: `save_strategy: best` saves a checkpoint at each
 evaluation that improves on it, so the best one is on disk, and `load_best_model_at_end` restores it after training.

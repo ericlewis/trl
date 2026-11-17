@@ -100,8 +100,9 @@ output is the merged native checkpoint, with the adapter alone in `adapter/`. A 
 other model becomes the backbone of a new head. A causal LM reads its last token with Clef's ChatML prompt; a
 bidirectional encoder (BERT, ModernBERT, or a reranker, unwrapped to its base model) reads its first token with the
 plain prompt between `[CLS]` and `[SEP]`. `global_pooling` (`last` or `first`) and `prompt_style` (`chatml` or `plain`)
-override that choice, and `head_type: cosine` (with `cosine_width` and `cosine_initial_scale`) selects the small cosine
-head; the script prints the resolved setup at start-up. UltraBERT (`model_type: ultrabert`) is such an encoder; its
+override that choice. `head_type` picks the head of a new model: `cosine` (with `cosine_width` and
+`cosine_initial_scale`), the small cosine head that the example's configuration trains, or `joint`, Clef's original
+head and the model's own default; the script prints the resolved setup at start-up. UltraBERT (`model_type: ultrabert`) is such an encoder; its
 tokenizer has no `[CLS]`, so the plain prompt starts with its `<|endoftext|>` and ends with its `<|sep|>`. The script
 never newly initialises backbone weights and never runs remote code (`trust_remote_code` is refused): a checkpoint that
 stores its backbone under a key prefix, such as a remote-code reranker package with `backbone.<name>` weights, has its
