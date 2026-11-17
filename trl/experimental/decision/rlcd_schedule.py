@@ -29,8 +29,8 @@ class RlcdScheduleCallback(TrainerCallback):
     Before `start_epoch` the model's `config.rlcd_weight` is 0, so training is plain cross-entropy; from `start_epoch`
     on it is `weight`. The values are a function of `state.epoch` alone, read at the start of every step, so a resumed
     run and every process of a distributed run use the same ones. The model applies the RLCD term in training only, so
-    evaluation stays the supervised loss. When training ends, the final values are left on the config, so the saved
-    model records the recipe.
+    evaluation stays the supervised loss. When training ends, the config keeps the values in effect at the last step,
+    so the saved model records what it was trained with: a run that stops before `start_epoch` keeps weight 0.
 
     Args:
         weight (`float`):
@@ -57,7 +57,6 @@ class RlcdScheduleCallback(TrainerCallback):
         self.weight = float(weight)
         self.start_epoch = float(start_epoch)
         self.sigmas = sigmas
-        self._applied_sigma = None
 
     def values(self, epoch: float | None) -> tuple[float, float | None]:
         """The weight and the noise scale (`None`: not set by the schedule) at `epoch`; `None` counts as 0."""
@@ -79,8 +78,6 @@ class RlcdScheduleCallback(TrainerCallback):
     def _apply(self, state, model):
         config = self._config(model)
         weight, sigma = self.values(state.epoch)
-        if sigma is not None:
-            self._applied_sigma = sigma
         changes = []
         if config.rlcd_weight != weight:
             changes.append(f"rlcd_weight {config.rlcd_weight} -> {weight}")
@@ -97,9 +94,3 @@ class RlcdScheduleCallback(TrainerCallback):
 
     def on_step_begin(self, args, state, control, model=None, **kwargs):
         self._apply(state, model)
-
-    def on_train_end(self, args, state, control, model=None, **kwargs):
-        config = self._config(model)
-        config.rlcd_weight = self.weight
-        if self._applied_sigma is not None:
-            config.rlcd_sigma = self._applied_sigma

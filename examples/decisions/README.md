@@ -84,8 +84,8 @@ supervised loss. Two ways to run it:
 2. **One run.** `rlcd_weight` with `rlcd_start_epoch` and/or `rlcd_sigmas`: cross-entropy until `rlcd_start_epoch`, then
    RLCD with `rlcd_weight`, and the noise scale annealed per epoch of the phase (`rlcd_sigmas: [0.4, 0.3, 0.2, 0.1]` is
    Laya's schedule; the last value is held). The weight must be positive; the model is built with weight 0 and the
-   schedule follows the epoch alone, so resuming and several processes agree. The final weight and last sigma are left
-   on the saved config.
+   schedule follows the epoch alone, so resuming and several processes agree. The saved config keeps the weight and
+   sigma in effect at the last step (weight 0 if training stopped before `rlcd_start_epoch`).
 
 `benchmark_clef.py` times this training path: it builds the model, data and trainer with the example's own
 `build_trainer`, trains `--steps` steps without evaluating or saving, evaluates once, and prints a JSON summary (also

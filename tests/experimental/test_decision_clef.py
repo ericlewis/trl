@@ -1066,14 +1066,15 @@ class TestClefTraining(TrlTestCase):
         self.drive(callback, model, [0.5, 1.5, 3.5])
         assert model.config.rlcd_sigma == 0.2
         callback.on_train_end(None, state, None, model=model)
-        # The weight of the recipe, and the last sigma that applied
+        # The values in effect at the last step: the weight of the phase, and the last sigma that applied
         assert (model.config.rlcd_weight, model.config.rlcd_sigma) == (0.25, 0.2)
-        # Training that ended before the phase started still records the recipe's weight
+        # Training that ended before the phase started never trained with RLCD, so the config does not claim it did
         model = tiny_clef(tokenizer, decision_config)
         callback = RlcdScheduleCallback(0.25, start_epoch=3, sigmas=[0.4])
+        callback.on_train_begin(None, state, None, model=model)
         self.drive(callback, model, [0.0, 1.0])
         callback.on_train_end(None, state, None, model=model)
-        assert (model.config.rlcd_weight, model.config.rlcd_sigma) == (0.25, ClefConfig().rlcd_sigma)
+        assert (model.config.rlcd_weight, model.config.rlcd_sigma) == (0.0, ClefConfig().rlcd_sigma)
 
     def test_invalid_arguments(self):
         for kwargs in (

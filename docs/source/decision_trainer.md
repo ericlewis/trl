@@ -135,8 +135,9 @@ There are two ways to run it:
 `rlcd_sigmas` anneals the noise per epoch of the RLCD phase, counted from `rlcd_start_epoch`: Laya's schedule
 `[0.4, 0.3, 0.2, 0.1]` uses sigma 0.4 in the first epoch of the phase, 0.3 in the second, and so on, and the last value
 is held for later epochs. The values are a function of the epoch alone, so a resumed run and every process of a
-distributed run agree, and when training ends the final weight and the last sigma are left on the model's config, so the
-saved checkpoint records the recipe.
+distributed run agree, and when training ends the model's config keeps the weight and sigma in effect at the last step,
+so the saved checkpoint records what it was trained with (a run that stops before `rlcd_start_epoch` keeps weight 0).
+With `load_best_model_at_end`, the restored weights may come from an earlier phase than the saved config records.
 
 ```yaml
 num_train_epochs: 5
