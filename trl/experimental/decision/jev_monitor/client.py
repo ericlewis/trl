@@ -94,16 +94,20 @@ class SystemOneClient:
     """
     Minimal client of a System One decision endpoint that never raises into the caller.
 
-    The API key is read from an environment variable at request time and is never accepted as an argument, logged or
-    included in `last_error`. A key is only sent over HTTPS, or to a loopback host; requests that carry a key ignore
-    the proxy settings of the environment unless `use_env_proxies=True`. Redirects are never followed.
+    The API key is read from an environment variable at request time, without surrounding whitespace, and is never
+    accepted as an argument, logged or included in `last_error`; a key that contains whitespace is refused. A key is
+    only sent over HTTPS, or to a loopback host; requests that carry a key ignore the proxy settings of the environment
+    unless `use_env_proxies=True`, and requests to a loopback host always ignore them. Redirects are never followed.
 
     `ask` returns within `timeout * (retries + 1) + 3` seconds whatever the network does: every attempt runs in a
-    daemon thread the caller stops waiting for at its deadline, and an abandoned attempt touches no shared state.
+    daemon thread the caller stops waiting for at its deadline, and an abandoned attempt touches no shared state. Each
+    socket operation of an attempt is bounded by `timeout` and the body is read as it arrives, against the attempt's
+    deadline, so an abandoned attempt normally ends about `timeout` seconds after it began (name resolution is the
+    exception); one `ask` can leave up to `retries + 1` of them behind, a half-open probe included.
 
     After `breaker_threshold` consecutive failed calls the breaker opens and `ask` returns `None` without any request.
-    Once `breaker_cooldown` seconds have passed it is half open: exactly one probe request is allowed; success closes
-    the breaker, failure opens it for another cooldown.
+    Once `breaker_cooldown` seconds have passed it is half open: exactly one probe call is allowed, which makes up to
+    `retries + 1` requests like any other; its success closes the breaker, its failure opens it for another cooldown.
 
     Args:
         preset (`str`, *optional*):
@@ -125,7 +129,8 @@ class SystemOneClient:
         breaker_cooldown (`float`, *optional*, defaults to `300.0`):
             Seconds the breaker stays open before a probe is allowed.
         use_env_proxies (`bool`, *optional*, defaults to `False`):
-            Honour `HTTP(S)_PROXY` for requests that carry a key. Requests without a key always honour them.
+            Honour `HTTP(S)_PROXY` for requests that carry a key. Requests without a key honour them, except to a
+            loopback host.
     """
 
     _BACKOFF = 0.25  # seconds, doubled per retry
@@ -222,7 +227,8 @@ class SystemOneClient:
     # -- requests ------------------------------------------------------------------------------------------------
 
     def _key(self) -> str | None:
-        return (os.environ.get(self.api_key_env) or None) if self.api_key_env else None
+        """The key, without surrounding whitespace (a trailing newline is common in files the variable is read from)."""
+        return (os.environ.get(self.api_key_env, "").strip() or None) if self.api_key_env else None
 
     def _redact(self, text: str) -> str:
         key = self._key()
@@ -267,14 +273,19 @@ class SystemOneClient:
             self._fail(f"invalid request: {e}")
             return None
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
-        opener = self._opener_env
+        parsed = urllib.parse.urlparse(self.url)
+        loopback = _is_loopback(parsed.hostname)
+        # A loopback host is never reached through a proxy: over plain HTTP the proxy would see the key
+        opener = self._opener_direct if loopback else self._opener_env
         if self.api_key_env:
             key = self._key()
             if not key:
                 self._fail(f"environment variable {self.api_key_env} is not set")
                 return None
-            parsed = urllib.parse.urlparse(self.url)
-            if parsed.scheme != "https" and not _is_loopback(parsed.hostname):
+            if any(c.isspace() for c in key):  # never quoted: redaction could not find all of it
+                self.last_error = f"the key in environment variable {self.api_key_env} contains whitespace"
+                return None
+            if parsed.scheme != "https" and not loopback:
                 self._fail("refusing to send an API key over plain HTTP to a non-loopback host")
                 return None
             headers["Authorization"] = f"Bearer {key}"
@@ -349,7 +360,9 @@ class SystemOneClient:
             while True:
                 if time.monotonic() > deadline:
                     raise _Rejected("response too slow")
-                chunk = response.read(min(65536, self.max_response_bytes + 1 - total))
+                # `read1` returns what has arrived (one read of the socket), so a slow drip cannot hold the
+                # attempt past its deadline the way `read(n)`, which waits for all `n` bytes, would
+                chunk = response.read1(min(65536, self.max_response_bytes + 1 - total))
                 if not chunk:
                     break
                 chunks.append(chunk)

@@ -493,11 +493,34 @@ def test_env_proxies_are_ignored_for_keyed_requests_by_default(server, other_ser
     assert len(server.requests) == 1 and other_server.requests == []
 
 
-def test_env_proxies_are_used_when_asked(server, other_server, client, monkeypatch):
+@pytest.mark.parametrize("key", [None, "k"])
+def test_loopback_never_goes_through_a_proxy(server, other_server, client, monkeypatch, key):
+    # Even when asked to honour proxies: a key sent to a loopback host over HTTP would reach the proxy in clear text
     monkeypatch.setenv("http_proxy", other_server.base)
-    c = client(key="k", use_env_proxies=True)
+    c = client(key=key, use_env_proxies=True)
+    if key is None:
+        c.api_key_env = None
     assert c.ask({}, Q) == GOOD["answers"]
-    assert server.requests == [] and len(other_server.requests) == 1
+    assert len(server.requests) == 1 and other_server.requests == []
+
+
+@requires_decision
+@pytest.mark.parametrize(
+    ("use_env_proxies", "key", "expected"), [(True, "k", "env"), (False, "k", "direct"), (False, None, "env")]
+)
+def test_proxy_choice_for_a_remote_host(monkeypatch, use_env_proxies, key, expected):
+    if key is not None:
+        monkeypatch.setenv(ENV, key)
+    c = SystemOneClient(
+        url="https://judge.example.com/v1",
+        model="m",
+        api_key_env=ENV if key else None,
+        use_env_proxies=use_env_proxies,
+    )
+    openers = []
+    monkeypatch.setattr(c, "_post", lambda body, headers, opener: openers.append(opener))
+    c.ask({}, Q)
+    assert openers == [c._opener_env if expected == "env" else c._opener_direct]
 
 
 def test_key_is_redacted_from_errors(server, client, monkeypatch):
@@ -2081,3 +2104,38 @@ def test_persistent_nonfinite_gradients_record_transitions_only(tmp_path):
     assert [r["payload"]["consecutive"] for r in kinds(callback, "sentinel")] == [1, 2]
     (cleared,) = [r for r in kinds(callback, "note") if r["payload"]["note"] == "finite_gradients"]
     assert cleared["step"] == 11 and cleared["payload"]["after"] == 10
+
+
+# -- client hardening -------------------------------------------------------------------------------------------
+
+
+def test_key_surrounding_whitespace_is_stripped(server, client):
+    c = client(key="  k-with-newline\n")
+    assert c.ask({}, Q) == GOOD["answers"]
+    assert server.requests[0]["headers"]["Authorization"] == "Bearer k-with-newline"
+
+
+@requires_decision
+def test_key_with_inner_whitespace_is_refused_and_never_leaks(server, client, tmp_path):
+    c = client(key="tok3nhead tok3ntail")
+    assert c.ask({}, Q) is None
+    assert server.requests == []
+    assert ENV in c.last_error and "whitespace" in c.last_error and "tok3n" not in c.last_error
+    # Nor through the monitor, which writes the client's error into its ledger
+    callback = monitor(tmp_path, c)
+    run = Run(callback, tmp_path).begin()
+    run.evaluate(10)
+    run.end()
+    assert kinds(callback, "answer") and "tok3n" not in callback.ledger.path.read_text()
+
+
+def test_abandoned_attempt_ends_against_a_slow_drip(server, client):
+    server.respond(("drip_body",))  # one byte every 50 ms, never the whole body
+    c = client(key="k", timeout=0.3, retries=0)
+    before = set(threading.enumerate())
+    assert c.ask({}, Q) is None
+    attempts = [t for t in set(threading.enumerate()) - before if t.name == "systemone-request"]
+    # The server is still dripping: the attempt stops at its own deadline instead of waiting for 64 KiB
+    for thread in attempts:
+        thread.join(2)
+    assert not any(t.is_alive() for t in attempts)
