@@ -33,6 +33,7 @@ from examples.decisions.clef_typed_decisions import (
     describe,
     load_backbone,
     prepare_split,
+    sample_rows,
 )
 from examples.decisions.clef_typed_decisions import main as clef_main
 from transformers import (
@@ -143,7 +144,10 @@ def ultrabert_tokenizer(tokenizer):
 
 
 def tiny_ultrabert(tokenizer):
-    """A tiny UltraBERT: two local layers of radius 8 and a global one, each kind with its own RoPE base."""
+    """
+    A tiny UltraBERT: two local layers of radius 8 and a global one, each kind with its own RoPE base. The bases are
+    not the config's defaults, so a config read without them would differ.
+    """
     from transformers import UltrabertConfig, UltrabertModel
 
     set_seed(0)
@@ -155,6 +159,10 @@ def tiny_ultrabert(tokenizer):
         num_attention_heads=2,
         layer_types=["sliding_attention", "sliding_attention", "full_attention"],
         sliding_window=8,
+        rope_parameters={
+            "sliding_attention": {"rope_type": "default", "rope_theta": 1234.0},
+            "full_attention": {"rope_type": "default", "rope_theta": 98765.0},
+        },
         pad_token_id=tokenizer.pad_token_id,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
@@ -175,11 +183,11 @@ PAIR_HEAD = {
 }
 
 
-def reranker_package(folder, backbone, tokenizer, tensors):
+def reranker_package(folder, backbone, tokenizer, tensors, **config_changes):
     """
     A folder laid out like the UltraBERT reranker package: its config as its remote code writes it (per-layer
     `attention_windows` and `rope_theta`, the `UltrabertForReranking` architecture, an `auto_map` to code files that
-    are not there), `tensors` as its `model.safetensors`, and the tokenizer.
+    are not there) with `config_changes`, `tensors` as its `model.safetensors`, and the tokenizer.
     """
     from safetensors.torch import save_file
 
@@ -196,6 +204,7 @@ def reranker_package(folder, backbone, tokenizer, tensors):
         attention_windows=[window if kind == "sliding_attention" else None for kind in layer_types],
         rope_theta=[rope_parameters[kind]["rope_theta"] for kind in layer_types],
     )
+    config.update(config_changes)
     Path(folder, "config.json").write_text(json.dumps(config), encoding="utf-8")
     save_file(tensors, f"{folder}/model.safetensors", metadata={"format": "pt"})
     tokenizer.save_pretrained(folder)
@@ -945,6 +954,34 @@ class TestClefTraining(TrlTestCase):
             trainer, tokenizer, rlcd_weight=0.25, rlcd_samples=8, rlcd_sigma=0.4, rlcd_normalize_advantage=False
         )
 
+    def test_sample_rows_draws_a_seeded_random_subset(self):
+        dataset = Dataset.from_list([{"index": index} for index in range(100)])
+        first, again, other = (sample_rows(dataset, 10, seed)["index"] for seed in (3407, 3407, 1))
+        assert len(first) == len(set(first)) == 10
+        assert first == again
+        assert first != other and set(first) != set(other)
+        # Not the first rows of the split
+        assert set(first) != set(range(10))
+        # Asking for as many rows as there are, or more, or for no limit, keeps the split as it is
+        for count in (100, 500, None):
+            assert sample_rows(dataset, count, 1)["index"] == list(range(100))
+        assert len(sample_rows(dataset, 0, 1)) == 0
+
+    def test_main_samples_the_limited_splits(self, tokenizer):
+        from datasets import load_dataset
+
+        script_kwargs = {"max_train_samples": 5, "max_eval_samples": 2}
+        trainer, _, _ = self.run_main(tokenizer, "head", {"seed": 11}, script_kwargs=script_kwargs)
+        # The splits main trains and evaluates on are the seeded samples of its splits, tokenized
+        records = load_dataset("json", data_files=f"{self.tmp_dir}/train.jsonl")["train"]
+        split = records.train_test_split(test_size=0.25, seed=11)
+        collator = DataCollatorForClef(tokenizer, trainer.model.decision_config, max_length=400, truncation="skip")
+        for dataset, name, count in ((trainer.train_dataset, "train", 5), (trainer.eval_dataset, "test", 2)):
+            sampled = sample_rows(split[name], count, 11)
+            expected = [collator.tokenize(row) for row in sampled]
+            assert dataset["input_ids"] == [row["input_ids"] for row in expected if not row["skip"]]
+            assert sampled["state"] != split[name].select(range(count))["state"]
+
     def test_checkpoint_head_settings_cannot_change(self, tokenizer, decision_config):
         tiny_clef(tokenizer, decision_config).save_pretrained(f"{self.tmp_dir}/clef")
         model_args = ClefModelArguments(model_name_or_path=f"{self.tmp_dir}/clef", dtype="float32")
@@ -1100,12 +1137,44 @@ class TestClefTraining(TrlTestCase):
         assert text_config.layer_types == ["sliding_attention", "sliding_attention", "full_attention"]
         assert text_config.sliding_window == 8
         assert text_config.rope_parameters == backbone.config.rope_parameters
+        bases = {kind: parameters["rope_theta"] for kind, parameters in text_config.rope_parameters.items()}
+        assert bases == {"sliding_attention": 1234.0, "full_attention": 98765.0}
         assert (model.config.global_pooling, model.config.prompt_style) == ("first", "plain")
         line = describe(model)
         assert "prefix" in line and "backbone." in line
         assert 'backbone weights: prefix "backbone."' in line
         assert "dropped 3 non-backbone tensors" in line
         assert all(key in line for key in PAIR_HEAD)
+
+    @pytest.mark.parametrize(
+        "changes, match",
+        [
+            ({}, None),
+            ({"attention_windows": [8, 8, None], "rope_theta": [1234.0, 1234.0, 98765.0]}, None),
+            ({"attention_windows": [8, 4, None]}, "attention_windows"),
+            ({"rope_theta": [1234.0, 4321.0, 98765.0]}, "rope_theta"),
+            ({"attention_windows": [8, None, None], "rope_theta": [1234.0, 98765.0, 5.0]}, "rope_theta"),
+            # One base too many, which the native config drops
+            ({"rope_theta": [1234.0, 1234.0, 98765.0, 98765.0]}, "rope_theta"),
+        ],
+    )
+    def test_collapsed_per_layer_settings_raise(self, tokenizer, monkeypatch, changes, match):
+        # The native config keeps one window and one RoPE base per kind of layer: lists that vary within a kind would
+        # load another architecture without a word
+        tokenizer = ultrabert_tokenizer(tokenizer)
+        backbone = tiny_ultrabert(tokenizer)
+        tensors = {**prefixed(backbone, "backbone."), **PAIR_HEAD}
+        folder = reranker_package(f"{self.tmp_dir}/reranker", backbone, tokenizer, tensors, **changes)
+        if match is None:
+            model = self.build_from(folder)
+            assert type(model.model).__name__ == "UltrabertModel"
+            return
+        with pytest.raises(ValueError, match=match) as error:
+            self.build_from(folder)
+        assert "per layer" in str(error.value)
+        self.no_training(monkeypatch)
+        with pytest.raises(ValueError, match=match):
+            self.run_main(tokenizer, "full", checkpoint=folder)
 
     def test_missing_backbone_weights_raise(self, tokenizer, monkeypatch):
         tokenizer = ultrabert_tokenizer(tokenizer)

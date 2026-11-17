@@ -366,8 +366,12 @@ class ClefScriptArguments(ScriptArguments):
     validation_fraction: float = field(
         default=0.05, metadata={"help": "Fraction of records held out when there is no evaluation split."}
     )
-    max_train_samples: int | None = field(default=None, metadata={"help": "Limit training records."})
-    max_eval_samples: int | None = field(default=None, metadata={"help": "Limit evaluation records."})
+    max_train_samples: int | None = field(
+        default=None, metadata={"help": "Limit training records to a random sample of this many, drawn with seed."}
+    )
+    max_eval_samples: int | None = field(
+        default=None, metadata={"help": "Limit evaluation records to a random sample of this many, drawn with seed."}
+    )
 
     mode: str = field(default="full", metadata={"help": "Train head, lora, or full model."})
     head_type: str | None = field(
@@ -546,6 +550,45 @@ def repair_backbone(name, backbone, missing, revision=None) -> BackboneWeights:
     return BackboneWeights(f'prefix "{prefix}"', sorted(key for key in shapes if key not in used))
 
 
+def check_per_layer_settings(name, config, revision=None):
+    """
+    Refuse a checkpoint whose `config.json` lists `attention_windows` or `rope_theta` per layer (as remote-code
+    UltraBERT packages do) with values that differ within a kind of layer, or with a length other than the number of
+    layers. Transformers' native config reads such lists as one window and one RoPE base per kind of layer (`null`
+    windows are global layers), so it would build another architecture without a warning.
+    """
+    path = cached_file(name, "config.json", revision=revision, _raise_exceptions_for_missing_entries=False)
+    if path is None:
+        return
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    lists = {key: raw[key] for key in ("attention_windows", "rope_theta") if isinstance(raw.get(key), list)}
+    if not lists:
+        return
+    kinds = getattr(config, "layer_types", None)
+    if kinds is None:  # the kinds the windows give, or else one kind
+        windows = lists.get("attention_windows")
+        kinds = ["full_attention" if window is None else "sliding_attention" for window in windows or []]
+        kinds = kinds or ["all"] * len(lists["rope_theta"])
+    for key, values in lists.items():
+        if len(values) != len(kinds):
+            raise ValueError(
+                f"{name} sets {key} per layer for {len(values)} layers, but has {len(kinds)}; refusing to guess "
+                "which value each layer takes"
+            )
+        for kind in dict.fromkeys(kinds):
+            found = list(dict.fromkeys(value for value, other in zip(values, kinds, strict=False) if other == kind))
+            if len(found) > 1:
+                raise ValueError(
+                    f"{name} sets {key} per layer with different values within its {kind} layers ({found}): "
+                    "Transformers reads one value per kind of layer, so it would build another architecture"
+                )
+            if key == "attention_windows" and (found[0] is None) != (kind == "full_attention"):
+                raise ValueError(
+                    f"{name} sets {key} per layer with {found[0]} for its {kind} layers, which does not match "
+                    "the kind of these layers"
+                )
+
+
 def load_backbone(name, config, model_kwargs):
     """
     The backbone of a new head, the table its `lm_head` starts from, and where its weights came from: the base model of
@@ -557,6 +600,7 @@ def load_backbone(name, config, model_kwargs):
     (see `repair_backbone`), or a `ValueError` is raised. Remote code is never run.
     """
     model_kwargs = without_remote_code(model_kwargs)
+    check_per_layer_settings(name, config, revision=model_kwargs.get("revision"))
     architectures = config.architectures or []
     if is_causal(config):
         loaded, info = AutoModelForCausalLM.from_pretrained(name, output_loading_info=True, **model_kwargs)
@@ -692,6 +736,16 @@ def describe(model) -> str:
     )
 
 
+def sample_rows(dataset, count, seed):
+    """
+    `count` rows of `dataset` drawn at random with `seed`, the same for the same seed; the whole dataset when `count`
+    is `None` or not smaller. The first rows of a split are not a fair sample of it: datasets are often sorted.
+    """
+    if count is None or count >= len(dataset):
+        return dataset
+    return dataset.shuffle(seed=seed).select(range(count))
+
+
 def prepare_split(dataset, collator, training_args, desc):
     """Tokenize once, drop the skipped records, and report what was built."""
     features = {
@@ -777,10 +831,8 @@ def main(script_args, training_args, model_args):
         train_dataset, eval_dataset = split["train"], split["test"]
     else:
         eval_dataset = dataset[script_args.dataset_test_split]
-    if script_args.max_train_samples is not None:
-        train_dataset = train_dataset.select(range(min(script_args.max_train_samples, len(train_dataset))))
-    if script_args.max_eval_samples is not None:
-        eval_dataset = eval_dataset.select(range(min(script_args.max_eval_samples, len(eval_dataset))))
+    train_dataset = sample_rows(train_dataset, script_args.max_train_samples, training_args.seed)
+    eval_dataset = sample_rows(eval_dataset, script_args.max_eval_samples, training_args.seed)
 
     # Training batches permute the questions; evaluation never does, so it has its own collator
     collator_kwargs = {"max_length": script_args.max_length, "truncation": script_args.truncation}

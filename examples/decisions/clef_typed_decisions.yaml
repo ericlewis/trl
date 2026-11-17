@@ -8,7 +8,10 @@ model_name_or_path: MinimaLabs/KLM-1.6
 dataset_name: LocalLLaMA/typed-decisions
 dataset_config: all
 output_dir: output/clef-typed-decisions
-dtype: bfloat16
+# float32 weights with bf16 autocast (bf16: true below): KLM's fused CUDA kernels only run on float32 parameters
+dtype: float32
+# attn_implementation (e.g. flash_attention_2) switches the backbone to flash attention
+# attn_implementation: flash_attention_2
 mode: full
 # joint, or cosine for the small cosine head (cosine_width, cosine_initial_scale)
 head_type: joint
@@ -24,6 +27,8 @@ max_length: 2048
 truncation: state
 permute_fields: true
 validation_fraction: 0.05
+# max_train_samples / max_eval_samples limit a split to a random sample drawn with seed, not its first rows
+# max_eval_samples: 256
 per_device_train_batch_size: 32
 per_device_eval_batch_size: 32
 gradient_accumulation_steps: 1

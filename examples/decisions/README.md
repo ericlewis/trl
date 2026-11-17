@@ -52,7 +52,12 @@ state so the prompt is exactly `max_length` tokens, never touching its questions
 is too long even without its state; `skip` drops over-length records; `error` stops at the first one. `skip` and
 `state` also skip invalid records. `permute_fields` shuffles the question order of training batches only (a permuted
 prompt is cut the same way). The script prints a build report of rows, questions, skipped records by reason, and
-records whose state was cut (`truncated`). Nullable questions and activation checkpointing are unsupported. The collator returns `rows_per_example`, the
+records whose state was cut (`truncated`). `max_train_samples` and `max_eval_samples` limit a split to a random sample
+drawn with `seed` (the same rows for the same seed), never to its first rows, which are often not representative. A
+remote-code package whose `config.json` lists `attention_windows` or `rope_theta` per layer must keep one value per
+kind of layer, since Transformers' UltraBERT config reads them that way; other lists raise rather than silently change
+the architecture. The configuration keeps the weights in float32 and trains in bf16 autocast, since KLM's fused CUDA
+kernels only run on float32 parameters; `attn_implementation` selects flash attention. Nullable questions and activation checkpointing are unsupported. The collator returns `rows_per_example`, the
 number of questions of each record, so `DecisionTrainer` gathers whole records and the example runs on several
 processes:
 
