@@ -15,11 +15,15 @@
 # Jeva: System One Models from First Principles
 # Copyright 2026 Qi Li and Xinchao Wang.
 
+import json
+import os
 from collections import defaultdict
 from collections.abc import Callable
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+import safetensors.torch
 import torch
 import torch.nn.functional as F
 from accelerate.utils import recursively_apply
@@ -32,7 +36,7 @@ from transformers import (
     TrainerCallback,
     set_seed,
 )
-from transformers.utils import is_peft_available
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, is_peft_available, is_sagemaker_mp_enabled
 
 from ...trainer.base_trainer import _BaseTrainer
 from .decision_config import DecisionConfig
@@ -40,6 +44,52 @@ from .decision_config import DecisionConfig
 
 if is_peft_available():
     from peft import get_peft_model
+
+
+def _to_model_layout(model: PreTrainedModel, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """
+    Convert a state dict saved by `model.save_pretrained` back to the keys and tensors of `model`.
+
+    Saving reverts the model's weight conversions (renamings, fused projections, ...) to the layout of its original
+    checkpoints; this applies them again, with the same conversions saving used, without loading anything into the
+    model. Keys that no conversion matches are kept as they are.
+    """
+    from transformers.conversion_mapping import get_model_conversion_mapping
+    from transformers.core_model_loading import (
+        PrefixChange,
+        WeightConverter,
+        WeightRenaming,
+        dot_natural_key,
+        rename_source_key,
+    )
+
+    # The conversions `revert_weight_conversion` reverts when saving
+    conversions = getattr(model, "_weight_conversions", None)
+    if conversions is None:
+        conversions = get_model_conversion_mapping(model, add_legacy=False)
+        conversions = [conversion for conversion in conversions if not isinstance(conversion, PrefixChange)]
+    if not conversions:
+        return state_dict
+    renamings = [conversion for conversion in conversions if isinstance(conversion, WeightRenaming)]
+    converters = [conversion for conversion in conversions if isinstance(conversion, WeightConverter)]
+    converter_by_pattern = {pattern: converter for converter in converters for pattern in converter.source_patterns}
+    expected = model.state_dict()
+    transforms = {}
+    for key, tensor in sorted(state_dict.items(), key=lambda item: dot_natural_key(item[0])):
+        target, pattern = rename_source_key(key, renamings, converters, model.base_model_prefix, expected)
+        if target not in expected and key in expected:
+            target, pattern = key, None
+        if pattern is None:
+            transform = transforms.setdefault(target, WeightRenaming(key, target))
+            pattern = key
+        else:
+            transform = transforms.setdefault(target, deepcopy(converter_by_pattern[pattern]))
+        transform.add_tensor(target, key, pattern, tensor)
+    converted = {}
+    for target, transform in transforms.items():
+        for name, value in transform.convert(target, model=model, config=model.config).items():
+            converted[name] = value[0] if isinstance(value, list) else value
+    return converted
 
 
 class DecisionTrainer(_BaseTrainer):
@@ -287,6 +337,51 @@ class DecisionTrainer(_BaseTrainer):
         logs.update(metrics)
         super().log(logs, start_time)
         self._metrics[mode].clear()
+
+    def _load_decision_checkpoint(self, model, checkpoint: str) -> bool:
+        """
+        Load the full safetensors checkpoint `checkpoint` into `model` through the model's own weight conversions, then
+        check that every weight was restored. [`~transformers.Trainer`] loads the saved state dict as it is, without
+        strict matching, so the weights of a model saved in another layout (such as the head of Clef) silently keep
+        their current values. Returns `False` for checkpoints left to [`~transformers.Trainer`]: adapters of a PEFT
+        model, DeepSpeed, FSDP, SageMaker, or `.bin` weights.
+        """
+        if (
+            self.is_deepspeed_enabled
+            or self.is_fsdp_enabled
+            or is_sagemaker_mp_enabled()
+            or not isinstance(model, PreTrainedModel)
+        ):
+            return False
+        index_file = os.path.join(checkpoint, SAFE_WEIGHTS_INDEX_NAME)
+        if os.path.isfile(os.path.join(checkpoint, SAFE_WEIGHTS_NAME)):
+            files = [os.path.join(checkpoint, SAFE_WEIGHTS_NAME)]
+        elif os.path.isfile(index_file):
+            with open(index_file) as file:
+                files = sorted({os.path.join(checkpoint, name) for name in json.load(file)["weight_map"].values()})
+        else:
+            return False
+        state_dict = {}
+        for file in files:
+            state_dict.update(safetensors.torch.load_file(file, device="cpu"))
+        result = model.load_state_dict(_to_model_layout(model, state_dict), strict=False)
+        # Tied weights are saved once, and loading their source restores them
+        tied = set(getattr(model, "all_tied_weights_keys", None) or {})
+        missing = [key for key in result.missing_keys if key not in tied]
+        if missing or result.unexpected_keys:
+            raise RuntimeError(
+                f"The checkpoint {checkpoint} does not match the model: missing keys {missing}, unexpected keys "
+                f"{result.unexpected_keys}"
+            )
+        return True
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        if not self._load_decision_checkpoint(self.model if model is None else model, resume_from_checkpoint):
+            super()._load_from_checkpoint(resume_from_checkpoint, model)
+
+    def _load_best_model(self):
+        if not self._load_decision_checkpoint(self.model, self.state.best_model_checkpoint):
+            super()._load_best_model()
 
     def _save_checkpoint(self, model, trial):
         model_name = (

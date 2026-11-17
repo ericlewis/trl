@@ -280,6 +280,7 @@ def make_trainer(tmp_dir, tokenizer, decision_config, **kwargs):
         report_to="none",
     )
     peft_config = kwargs.pop("peft_config", None)
+    compute_metrics = kwargs.pop("compute_metrics", None)
     model = kwargs.pop("model", None) or tiny_clef(tokenizer, decision_config)
     trainer = DecisionTrainer(
         model=model,
@@ -288,6 +289,7 @@ def make_trainer(tmp_dir, tokenizer, decision_config, **kwargs):
         eval_dataset=val,
         processing_class=tokenizer,
         data_collator=collator,
+        compute_metrics=compute_metrics,
         peft_config=peft_config,
     )
     return trainer, collator, val
@@ -454,3 +456,132 @@ class TestClefTraining(TrlTestCase):
         monkeypatch.setattr(DecisionConfig, "world_size", property(lambda self: 2))
         with pytest.raises(ValueError, match="single-process"):
             self.run_main(tokenizer, "head")
+
+
+def lora_clef(tokenizer, decision_config):
+    """The tiny Clef with LoRA adapters on its backbone and the head trained in full, as in the example's lora mode."""
+    from peft import LoraConfig, get_peft_model
+
+    model = tiny_clef(tokenizer, decision_config)
+    model.model.requires_grad_(False)
+    model.lm_head.requires_grad_(False)
+    lora_config = LoraConfig(r=4, target_modules=["q_proj", "v_proj"], task_type="FEATURE_EXTRACTION")
+    model.model = get_peft_model(model.model, lora_config)
+    return model
+
+
+def checkpoint_state_dict(checkpoint, model):
+    """
+    The weights of a checkpoint in the layout of `model`, read without the trainer: every key that
+    `AutoModelForDecision.from_pretrained` loads (it converts the saved head layout), and the keys a PEFT backbone
+    stores as they are in the file.
+    """
+    from safetensors.torch import load_file
+
+    loaded = AutoModelForDecision.from_pretrained(checkpoint).state_dict()
+    raw = load_file(f"{checkpoint}/model.safetensors")
+    expected = {}
+    for name in model.state_dict():
+        if name in loaded:
+            expected[name] = loaded[name]
+        else:
+            assert name in raw, f"{name} is not in the checkpoint"
+            expected[name] = raw[name]
+    return expected
+
+
+def max_state_difference(model_or_state, expected, prefixes=None):
+    state = model_or_state if isinstance(model_or_state, dict) else model_or_state.state_dict()
+    differences = [
+        (value.detach().cpu().float() - expected[name].float()).abs().max().item()
+        for name, value in state.items()
+        if prefixes is None or name.startswith(prefixes)
+    ]
+    assert differences
+    return max(differences)
+
+
+HEAD = ("embeddings.", "encoder.", "scorer.")
+
+
+class TestClefCheckpointRestore(TrlTestCase):
+    """The head of Clef is saved in the layout of the original checkpoints; loading a checkpoint must convert it back."""
+
+    def ranked_trainer(self, tokenizer, decision_config, model, **kwargs):
+        # The metric ranks earlier evaluations higher, so the best checkpoint is the first one, not the last
+        evaluations = []
+
+        def compute_metrics(prediction):
+            evaluations.append(None)
+            return {"rank": -len(evaluations)}
+
+        args = dict(
+            max_steps=6,
+            eval_steps=2,
+            save_strategy="steps",
+            save_steps=2,
+            metric_for_best_model="eval_rank",
+            greater_is_better=True,
+            compute_metrics=compute_metrics,
+        )
+        trainer, _, _ = make_trainer(self.tmp_dir, tokenizer, decision_config, model=model, **{**args, **kwargs})
+        return trainer
+
+    def check_best_model_is_restored(self, tokenizer, decision_config, model):
+        from transformers.testing_utils import CaptureLogger
+        from transformers.utils import logging
+
+        trainer = self.ranked_trainer(tokenizer, decision_config, model, load_best_model_at_end=True)
+        with CaptureLogger(logging.get_logger("transformers")) as captured:
+            trainer.train()
+        assert trainer.state.best_model_checkpoint == f"{self.tmp_dir}/checkpoint-2"
+        assert "missing keys" not in captured.out and "unexpected keys" not in captured.out, captured.out
+        best = checkpoint_state_dict(f"{self.tmp_dir}/checkpoint-2", trainer.model)
+        last = checkpoint_state_dict(f"{self.tmp_dir}/checkpoint-6", trainer.model)
+        # The head trained on after the best step, so restoring the best checkpoint changes it
+        assert max_state_difference(trainer.model, last, HEAD) > 0
+        assert max_state_difference(trainer.model, best, HEAD) == 0.0
+        assert max_state_difference(trainer.model, best) == 0.0
+
+    def check_resume_loads_checkpoint(self, tokenizer, decision_config, make_model):
+        from transformers.testing_utils import CaptureLogger
+        from transformers.utils import logging
+
+        # Both models are built first: training adds the template's tokens to the tokenizer
+        first, model = make_model(), make_model()
+        self.ranked_trainer(tokenizer, decision_config, first, max_steps=4).train()
+        checkpoint = f"{self.tmp_dir}/checkpoint-2"
+        # A fresh model, perturbed so that nothing of it matches the checkpoint by chance
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.add_(1.0)
+        trainer = self.ranked_trainer(tokenizer, decision_config, model, max_steps=3, eval_strategy="no")
+        expected = checkpoint_state_dict(checkpoint, trainer.model)
+        assert max_state_difference(trainer.model, expected, HEAD) > 0
+        # The weights right after the trainer loads the checkpoint, before it trains on
+        loaded = {}
+        load = trainer._load_from_checkpoint
+
+        def load_and_record(*args, **kwargs):
+            load(*args, **kwargs)
+            loaded.update({name: value.detach().clone() for name, value in trainer.model.state_dict().items()})
+
+        trainer._load_from_checkpoint = load_and_record
+        with CaptureLogger(logging.get_logger("transformers")) as captured:
+            trainer.train(resume_from_checkpoint=checkpoint)
+        assert "missing keys" not in captured.out and "unexpected keys" not in captured.out, captured.out
+        assert max_state_difference(loaded, expected) == 0.0
+
+    def test_load_best_model_at_end_restores_head_and_backbone(self, tokenizer, decision_config):
+        self.check_best_model_is_restored(tokenizer, decision_config, tiny_clef(tokenizer, decision_config))
+
+    @require_peft
+    def test_load_best_model_at_end_with_lora_backbone(self, tokenizer, decision_config):
+        self.check_best_model_is_restored(tokenizer, decision_config, lora_clef(tokenizer, decision_config))
+
+    def test_resume_from_checkpoint_loads_head_and_backbone(self, tokenizer, decision_config):
+        self.check_resume_loads_checkpoint(tokenizer, decision_config, lambda: tiny_clef(tokenizer, decision_config))
+
+    @require_peft
+    def test_resume_from_checkpoint_with_lora_backbone(self, tokenizer, decision_config):
+        self.check_resume_loads_checkpoint(tokenizer, decision_config, lambda: lora_clef(tokenizer, decision_config))
