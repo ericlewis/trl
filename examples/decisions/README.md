@@ -38,10 +38,11 @@ record, so each row needs `state`, `questions` and the targets of every question
 python examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
 ```
 
-`mode` selects `head`, `lora` or `full` training; a Clef checkpoint is loaded as it is and any other causal LM becomes
+`mode` selects `head`, `lora` or `full` training (LoRA puts adapters on the backbone and trains the head in full; the output is the merged native checkpoint, with the adapter alone in `adapter/`); a Clef checkpoint is loaded as it is and any other causal LM becomes
 a new head's backbone. `max_length` with `truncation: error|skip` handles over-length prompts, and `permute_fields`
 shuffles the question order of training batches only. The script prints a build report of rows, questions and skipped
-records. Nullable questions and activation checkpointing are unsupported.
+records. Nullable questions and activation checkpointing are unsupported, and the example is single-process for now; the script
+stops with an error when it detects more than one process.
 
 ## JEV: prepared decision requests
 

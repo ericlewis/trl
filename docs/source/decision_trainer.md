@@ -83,7 +83,7 @@ questions jointly. It requires [Transformers #50058](https://github.com/huggingf
 python examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
 ```
 
-`mode` selects head-only, LoRA, or full training. A Clef checkpoint is loaded as it is; any other causal LM becomes the
+`mode` selects head-only, LoRA, or full training. LoRA puts adapters on the backbone and trains the head in full; the output is the merged native checkpoint, with the adapter alone in `adapter/`. A Clef checkpoint is loaded as it is; any other causal LM becomes the
 backbone of a new head. Each row holds `state`, `questions` and the targets of all of its questions, either `targets`
 (per question `target_index`, `target_probs`, `p_true` or `score`) or `gold` / `answers` (per question a label or
 probabilities), through `DataCollatorForDecision.prepare_request`. The example collator `DataCollatorForClef` returns
@@ -91,7 +91,8 @@ one row of `labels` and `option_mask` per question, with the questions of all re
 Nullable questions raise: Clef has no coverage output. A prompt longer than `max_length` raises, or with
 `truncation: skip` is dropped and counted in the build report the script prints (rows, questions, skipped with the
 reasons, truncated). With `permute_fields`, each training batch re-renders its prompts with the questions in a new
-random order, each keeping its target; evaluation never does. The model does not support activation checkpointing.
+random order, each keeping its target; evaluation never does. The model does not support activation checkpointing. The example is single-process for now: the number of questions
+per batch differs between ranks, so the script raises when it detects more than one process.
 
 ## JEV
 

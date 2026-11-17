@@ -25,8 +25,8 @@ Train a Clef decision model on typed decisions: one prompt per record, every que
 
 python examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
 
-torchrun --nproc_per_node=2 \
-    examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
+This example is single-process for now: the number of questions per batch differs between ranks, and the trainer does
+not yet gather per-question tensors across ranks.
 """
 
 import json
@@ -47,11 +47,6 @@ from transformers.utils import cached_file
 
 from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config
 from trl.experimental.decision import DataCollatorForDecision, DecisionConfig, DecisionTrainer
-
-
-# The modules of the Clef head. In LoRA mode they are trained in full next to the adapters.
-HEAD_MODULES = ["embeddings", "encoder", "scorer"]
-HEAD_PATTERN = r"(?:embeddings|encoder|scorer)(?:\..*)?"
 
 
 def clef_decision_config():
@@ -357,6 +352,11 @@ def compute_metrics(prediction):
 
 
 def main(script_args, training_args, model_args):
+    if training_args.world_size > 1:
+        raise ValueError(
+            "The Clef example is single-process for now: the questions of a batch differ between ranks, and the "
+            f"trainer does not yet gather them (world size {training_args.world_size}). Run it without torchrun."
+        )
     set_seed(training_args.seed)
     if script_args.mode not in {"head", "lora", "full"}:
         raise ValueError("mode must be head, lora, or full")
@@ -374,24 +374,22 @@ def main(script_args, training_args, model_args):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    peft_config = None
     if script_args.mode == "full":
         model.requires_grad_(True)
     else:
         model.model.requires_grad_(False)
         model.lm_head.requires_grad_(False)
+    lora_backbone = None
     if script_args.mode == "lora":
         peft_config = get_peft_config(model_args)
         if peft_config is None:
             raise ValueError("mode='lora' requires use_peft=True")
-        peft_config.modules_to_save = HEAD_MODULES
-        peft_config.exclude_modules = HEAD_PATTERN
-        # A freshly initialized head needs a native base checkpoint for adapter reloads.
-        base_path = str(Path(training_args.output_dir).resolve() / "base_model")
-        if training_args.should_save:
-            model.save_pretrained(base_path)
-        training_args.distributed_state.wait_for_everyone()
-        model.config._name_or_path = base_path
+        from peft import get_peft_model
+
+        # Adapters go on the backbone only. The head is trained in full next to them as ordinary parameters: PEFT's
+        # `modules_to_save` matches names by suffix, so it cannot cleanly wrap the head's `scorer` (and its
+        # `residual_scorer`) and the resulting adapter does not reload.
+        model.model = lora_backbone = get_peft_model(model.model, peft_config)
 
     dataset = load_dataset(
         script_args.dataset_name, name=script_args.dataset_config, revision=script_args.dataset_revision
@@ -428,9 +426,14 @@ def main(script_args, training_args, model_args):
         processing_class=tokenizer,
         data_collator=collator,
         compute_metrics=compute_metrics,
-        peft_config=peft_config,
     )
     result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+    if lora_backbone is not None:
+        # The adapter alone, for the original backbone, then merged into the backbone: the output is a native Clef
+        # checkpoint that `AutoModelForDecision` and the decision pipeline load as they are
+        if training_args.should_save:
+            lora_backbone.save_pretrained(Path(training_args.output_dir) / "adapter")
+        model.model = lora_backbone.merge_and_unload()
     trainer.save_model(training_args.output_dir)
     trainer.save_metrics("train", result.metrics)
     if training_args.eval_strategy != "no":
@@ -440,6 +443,7 @@ def main(script_args, training_args, model_args):
     if training_args.push_to_hub:
         trainer.push_to_hub(dataset_name=script_args.dataset_name)
     trainer.end()
+    return trainer
 
 
 if __name__ == "__main__":
