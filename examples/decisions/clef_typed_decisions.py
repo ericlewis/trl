@@ -1069,6 +1069,16 @@ def build_trainer(script_args, training_args, model_args) -> ClefRun:
     eval_collator = DataCollatorForClef(tokenizer, model.decision_config, **collator_kwargs)
     train_dataset, train_report = prepare_split(train_dataset, collator, training_args, "train")
     eval_dataset, eval_report = prepare_split(eval_dataset, eval_collator, training_args, "eval")
+    # Say so here when nothing is left, rather than fail later in the sampler of an empty dataset
+    splits = [("training", train_dataset, train_report)]
+    if training_args.eval_strategy != "no":
+        splits.append(("evaluation", eval_dataset, eval_report))
+    for name, split, report in splits:
+        if len(split) == 0:
+            raise ValueError(
+                f"No {name} record is left: all {report['rows']} were skipped ({report['skipped']}). Raise max_length "
+                f"(now {script_args.max_length}) if the prompts are longer than it, or check the rows."
+            )
 
     trainer = DecisionTrainer(
         model=model,

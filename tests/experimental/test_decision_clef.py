@@ -872,7 +872,7 @@ class TestClefTraining(TrlTestCase):
         with open(f"{self.tmp_dir}/train.jsonl", "w") as file:
             for row in rows:
                 file.write(json.dumps({key: json.dumps(value) for key, value in row.items()}) + "\n")
-        script_args = ClefScriptArguments(
+        script_settings = dict(
             dataset_name=self.tmp_dir,
             dataset_config=None,
             validation_fraction=0.25,
@@ -885,8 +885,8 @@ class TestClefTraining(TrlTestCase):
             max_length=400,
             truncation="skip",
             permute_fields=True,
-            **(script_kwargs or {}),
         )
+        script_args = ClefScriptArguments(**{**script_settings, **(script_kwargs or {})})
         training_args = dict(
             output_dir=f"{self.tmp_dir}/out",
             use_cpu=True,
@@ -906,6 +906,11 @@ class TestClefTraining(TrlTestCase):
         set_seed(training_args.seed)
         initial = build_model(script_args, model_args, {"dtype": "float32", "revision": None})
         return trainer, initial, backbone
+
+    def test_main_says_when_no_record_fits(self, tokenizer):
+        # Every record is longer than max_length: the run stops with the count and the reason, not in the sampler
+        with pytest.raises(ValueError, match=r"No training record is left.*max_length"):
+            self.run_main(tokenizer, "head", script_kwargs={"max_length": 8})
 
     def check_saved_model(self, trainer, tokenizer, **expected):
         """The saved output reloads with the expected config and exactly the logits of the trained model."""
