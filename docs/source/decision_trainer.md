@@ -157,13 +157,25 @@ missing and discarded. Everything is recorded in `<output_dir>/jev_monitor/ledge
 
 - `advise` (the default) only records the verdicts, and what it would have done.
 - `enforce` may stop training, and does nothing else: when a `StopRule` held for `patience` consecutive verdicts, when
-  an evaluation metric is NaN or infinite, or at the next evaluation after non-finite gradients. It first saves the
-  model to `<output_dir>/monitor-stop-<step>` and writes `jev_monitor/intervened.json`; if the save fails, training
-  goes on. Every process stops at the same step. `enforce` needs `attach(trainer)`.
+  an evaluation metric is NaN or infinite, or at the next evaluation once gradients were non-finite on
+  `patience_gradients` (2) consecutive checks of optimizer steps that were taken. A step skipped after an fp16
+  loss-scale overflow is normal and only noted; a clean check clears the gradient sentinel. Before stopping, every
+  process calls `trainer.save_model` to `<output_dir>/monitor-stop-<step>` (collective under FSDP and DeepSpeed), and
+  the stop is enforced, with `jev_monitor/intervened.json`, only if the main process finds a non-empty weights file
+  there; otherwise training goes on and the reason is recorded. Every process stops at the same step. `enforce` needs
+  `attach(trainer)`.
 
 The monitor never changes saving or evaluation. API keys are read from the environment at request time (a preset's
 variable, such as `TYPESAFE_API_KEY`), never from arguments or files. Evaluations outside `train()` are ignored, and a
-resumed run drops the ledger records after its checkpoint.
+resumed run drops the ledger records after its checkpoint. With a dict of evaluation datasets, the evaluations of one
+step are merged into one record (metrics named `<dataset>_<metric>`); set `metric_prefix` (for example
+`eval_validation`) to watch one dataset only.
+
+Limits: under FSDP the main process sees only its own shard of the gradients, and under DeepSpeed ZeRO the gradients
+may not be available to callbacks, so the gradient check may see nothing; a sharded zero-dimensional scale parameter is
+not found. The main process may finish up to `finish_timeout` (5 s) after the other processes. Resuming does not apply
+the verdict on the evaluation of the checkpoint's own step, and a reused output directory keeps the earlier ledger
+records up to the step training resumes from.
 
 ```python
 from trl.experimental.decision import JevMonitorCallback, StopRule

@@ -15,6 +15,7 @@
 import importlib.util
 import json
 import math
+import os
 import threading
 import time
 import urllib.request
@@ -764,9 +765,11 @@ class FakeBackend:
         self.answers = stop_answer(1.0) if answers is None else answers
         self.delay, self.gate, self.error = delay, gate, error
         self.calls = []
+        self.started = threading.Event()  # set when a request has reached the backend
 
     def __call__(self, state, questions):
         self.calls.append(state)
+        self.started.set()
         if self.gate is not None:
             self.gate.wait(5)
         if self.delay:
@@ -777,10 +780,13 @@ class FakeBackend:
 
 
 class FakeTrainer:
-    def __init__(self, control=None, fail=False):
+    """Records saves; writes a weights file unless `write=False`; its accelerator says whether a step was skipped."""
+
+    def __init__(self, control=None, fail=False, write=True):
         self.callback_handler = type("Handler", (), {"callbacks": []})()
+        self.accelerator = type("Accelerator", (), {"optimizer_step_was_skipped": False})()
         self.saved, self.stop_flag_at_save = [], []
-        self.control, self.fail = control, fail
+        self.control, self.fail, self.write = control, fail, write
 
     def add_callback(self, callback):
         self.callback_handler.callbacks.append(callback)
@@ -791,6 +797,10 @@ class FakeTrainer:
             self.stop_flag_at_save.append(self.control.should_training_stop)
         if self.fail:
             raise OSError("disk full")
+        if self.write:
+            os.makedirs(output_dir, exist_ok=True)
+            with open(os.path.join(output_dir, "model.safetensors"), "wb") as f:
+                f.write(b"weights")
 
 
 class TinyModel(torch.nn.Module):
@@ -814,11 +824,12 @@ class TinyModel(torch.nn.Module):
 class Run:
     """Drives one callback through the events of a training run, as the Trainer would."""
 
-    def __init__(self, callback, tmp_path, *, rank0=True, max_steps=100, logging_steps=10, model=None):
+    def __init__(self, callback, tmp_path, *, rank0=True, max_steps=100, logging_steps=10, model=None, fp16=False):
         from transformers import TrainerControl, TrainerState
 
         self.cb, self.model = callback, model
-        self.args = type("Args", (), {"output_dir": str(tmp_path), "logging_steps": logging_steps})()
+        args = {"output_dir": str(tmp_path), "logging_steps": logging_steps, "fp16": fp16}
+        self.args = type("Args", (), args)()
         self.state = TrainerState(max_steps=max_steps, is_world_process_zero=rank0)
         self.control = TrainerControl()
 
@@ -835,8 +846,13 @@ class Run:
         return self.control.should_training_stop
 
     def optimizer_step(self, step):
+        """One optimizer step from global step `step`: the hooks around `optimizer.step()`, as the Trainer calls them."""
         self.state.global_step = step
+        self.cb.on_step_begin(self.args, self.state, self.control)
         self.cb.on_pre_optimizer_step(self.args, self.state, self.control, model=self.model)
+        self.cb.on_optimizer_step(self.args, self.state, self.control, model=self.model)
+        self.state.global_step = step + 1
+        self.cb.on_step_end(self.args, self.state, self.control)
 
     def end(self):
         self.cb.on_train_end(self.args, self.state, self.control, model=self.model)
@@ -935,7 +951,7 @@ def test_advise_never_changes_control(tmp_path):
 
     unchanged(run.begin)
     for step in (10, 20, 30, 40):
-        model.set_grads(float("inf") if step == 30 else 0.5)
+        model.set_grads(float("inf") if step in (20, 30) else 0.5)
         loss = float("nan") if step == 40 else 0.5
         unchanged(lambda step=step: run.optimizer_step(step - 1))
         unchanged(lambda step=step, loss=loss: run.evaluate(step, eval_loss=loss))
@@ -979,6 +995,7 @@ def test_does_not_block(tmp_path):
     t0 = time.perf_counter()
     run.evaluate(10, wait=False)
     assert time.perf_counter() - t0 < 0.2
+    assert slow_backend.started.wait(5)
     t0 = time.perf_counter()
     run.evaluate(20, wait=False)  # the first request is still running
     assert time.perf_counter() - t0 < 0.2
@@ -995,6 +1012,7 @@ def test_nothing_written_after_training(tmp_path):
     callback = monitor(tmp_path, backend, finish_timeout=0.05)
     run = Run(callback, tmp_path).begin()
     run.evaluate(10, wait=False)
+    assert backend.started.wait(5)
     run.end()
     before = callback.ledger.read()
     assert before[-1]["kind"] == "end"
@@ -1033,6 +1051,7 @@ def test_late_verdict_is_recorded_missing(tmp_path):
     callback = monitor(tmp_path, backend, rules=[rule()], mode="enforce", patience=1, trainer=trainer)
     run = Run(callback, tmp_path).begin()
     assert not run.evaluate(10, wait=False)
+    assert backend.started.wait(5)  # the worker took the request for 10
     assert not run.evaluate(20, wait=False)  # the verdict for 10 is still running
     (missing,) = kinds(callback, "missing")
     assert missing["step"] == 20 and missing["payload"]["for_step"] == 10
@@ -1263,13 +1282,14 @@ def test_sentinels(tmp_path):
     model.set_grads(0.5)
     run0.optimizer_step(4)
     model.backbone.weight.grad[0, 0] = float("nan")
-    run0.optimizer_step(9)
-    run1.optimizer_step(9)
-    (sentinel,) = kinds(cb0, "sentinel")
-    assert sentinel["step"] == 10 and sentinel["payload"]["groups"] == ["backbone"]
+    for step in (9, 14):  # two consecutive checks on taken steps (patience_gradients=2)
+        run0.optimizer_step(step)
+        run1.optimizer_step(step)
+    sentinels = kinds(cb0, "sentinel")
+    assert [r["step"] for r in sentinels] == [10, 15] and sentinels[0]["payload"]["groups"] == ["backbone"]
     assert not run0.control.should_training_stop
-    run0.evaluate(10)
-    run1.evaluate(10)
+    run0.evaluate(15)
+    run1.evaluate(15)
     assert run0.control.should_training_stop and run1.control.should_training_stop
     run0.end()
     run1.end()
@@ -1452,7 +1472,9 @@ def test_real_trainer_advise_run(tmp_path):
     assert [r["step"] for r in evals] == [5, 10, 15, 20]
     assert set(evals[0]["payload"]["metrics"]) >= {"loss", "accuracy", "kl", "brier", "ece", "selection_score"}
     assert callback.ledger.path == tmp_path / "jev_monitor" / "ledger.jsonl"
-    assert states and states[0]["step"] == 5
+    # A request replaced before the worker took it is never sent, so only the order of the steps sent is certain
+    steps = [state["step"] for state in states]
+    assert steps and steps == sorted(set(steps)) and set(steps) <= {5, 10, 15, 20}
     # An evaluation after training is ignored
     trainer.evaluate()
     assert len(kinds(callback, "eval")) == 4
@@ -1485,3 +1507,160 @@ def test_real_trainer_enforced_stop(tmp_path):
     assert (tmp_path / "monitor-stop-10" / "config.json").exists()
     record = json.loads((tmp_path / "jev_monitor" / "intervened.json").read_text())
     assert record["step"] == 10 and record["reason"] == "rule"
+
+
+@requires_decision
+def test_skipped_overflow_step_is_a_note_not_a_sentinel(tmp_path):
+    model = TinyModel()
+    trainer = FakeTrainer()
+    trainer.accelerator.optimizer_step_was_skipped = True  # fp16: the scaler skipped the step
+    callback = monitor(tmp_path, None, mode="enforce", trainer=trainer, grad_norm_every=1, patience_gradients=1)
+    run = Run(callback, tmp_path, model=model, fp16=True).begin()
+    model.set_grads(float("inf"))
+    for step in range(5):
+        run.optimizer_step(step)
+    assert not run.evaluate(5)
+    assert kinds(callback, "sentinel") == [] and len(kinds(callback, "note")) == 5
+    assert trainer.saved == []
+    run.end()
+
+
+@requires_decision
+def test_overflow_without_a_trainer_under_fp16_is_a_note(tmp_path):
+    model = TinyModel()
+    backend = FakeBackend()
+    callback = monitor(tmp_path, backend, grad_norm_every=1)
+    run = Run(callback, tmp_path, model=model, fp16=True).begin()
+    model.set_grads(float("nan"))
+    run.optimizer_step(0)
+    run.evaluate(1)
+    run.end()
+    assert kinds(callback, "sentinel") == [] and kinds(callback, "note")
+    assert backend.calls[0]["sentinels"]["nonfinite_gradients"] is False
+
+
+@requires_decision
+def test_nonfinite_gradients_on_taken_steps_need_consecutive_checks(tmp_path):
+    model = TinyModel()
+    trainer = FakeTrainer()
+    callback = monitor(tmp_path, None, mode="enforce", trainer=trainer, grad_norm_every=1)
+    run = Run(callback, tmp_path, model=model).begin()
+    model.set_grads(float("nan"))
+    run.optimizer_step(0)
+    assert not run.evaluate(1)  # one check is not enough (patience_gradients=2)
+    model.set_grads(0.5)
+    run.optimizer_step(1)  # a clean check clears it
+    model.set_grads(float("nan"))
+    run.optimizer_step(2)
+    assert not run.evaluate(3)
+    run.optimizer_step(3)  # the second consecutive non-finite check
+    assert run.evaluate(4)
+    assert [r["payload"]["consecutive"] for r in kinds(callback, "sentinel")] == [1, 1, 2]
+    assert json.loads((tmp_path / "monitor" / "intervened.json").read_text())["sentinel"]["step"] == 4
+    run.end()
+
+
+@requires_decision
+def test_gradient_flag_clears_after_a_clean_check(tmp_path):
+    model = TinyModel()
+    backend = FakeBackend()
+    callback = monitor(tmp_path, backend, grad_norm_every=1)
+    run = Run(callback, tmp_path, model=model).begin()
+    model.set_grads(float("inf"))
+    run.optimizer_step(0)
+    run.evaluate(1)
+    model.set_grads(0.5)
+    run.optimizer_step(1)
+    run.evaluate(2)
+    run.end()
+    assert [state["sentinels"]["nonfinite_gradients"] for state in backend.calls] == [True, False]
+
+
+@requires_decision
+def test_stop_needs_a_saved_checkpoint(tmp_path):
+    trainer = FakeTrainer(write=False)  # save_model returns without writing (as with a sharded state dict)
+    callback = monitor(tmp_path, FakeBackend(), rules=[rule()], mode="enforce", patience=1, trainer=trainer)
+    run = Run(callback, tmp_path).begin()
+    assert [run.evaluate(10), run.evaluate(20)] == [False, False]
+    assert trainer.saved == [str(tmp_path / "monitor-stop-20")]
+    (error,) = kinds(callback, "error")
+    assert error["payload"]["where"] == "save" and "no weights" in error["payload"]["error"]
+    assert not (tmp_path / "monitor" / "intervened.json").exists()
+    # A directory with only the training arguments holds no weights either
+    os.makedirs(tmp_path / "monitor-stop-30")
+    (tmp_path / "monitor-stop-30" / "training_args.bin").write_bytes(b"args")
+    assert not run.evaluate(30)
+    run.end()
+
+
+@requires_decision
+def test_answer_from_an_earlier_run_is_ignored(tmp_path):
+    gate = threading.Event()
+    backend = FakeBackend(lambda n: stop_answer(0.95 if n == 1 else 0.1), gate=gate)
+    trainer = FakeTrainer()
+    callback = monitor(tmp_path, backend, rules=[rule()], mode="enforce", patience=1, trainer=trainer)
+    callback.finish_timeout = 0.05
+    first = Run(callback, tmp_path).begin()
+    first.evaluate(10, wait=False)
+    assert backend.started.wait(5)
+    first.end()  # the first run's request is still running
+    second = Run(callback, tmp_path).begin()
+    second.evaluate(10, wait=False)  # the second run's own request for 10
+    gate.set()
+    assert callback.wait(5)
+    assert not second.evaluate(20)  # its own verdict (0.1) applies, not the first run's (0.95)
+    records = callback.ledger.read()
+    start = max(i for i, r in enumerate(records) if r["kind"] == "start")
+    answers = [r for r in records[start:] if r["kind"] in ("answer", "late")]
+    assert [r["payload"]["answers"]["stop"]["noul"] for r in answers] == [0.1, 0.1]
+    assert [r["payload"]["rules"][0]["probability"] for r in kinds(callback, "verdict")] == [0.1]
+    assert trainer.saved == []
+    second.end()
+
+
+@requires_decision
+def test_several_evaluations_at_one_step_are_merged(tmp_path):
+    gate = threading.Event()
+    backend = FakeBackend(gate=gate)
+    callback = monitor(tmp_path, backend, rules=[rule()])
+    run = Run(callback, tmp_path).begin()
+    first = {"eval_a_loss": 0.5, "eval_a_accuracy": 0.7, "eval_a_runtime": 1.0}
+    second = {"eval_b_loss": 0.6, "eval_b_accuracy": 0.8}
+    run.state.global_step = 10
+    run.cb.on_evaluate(run.args, run.state, run.control, metrics=first)
+    assert backend.started.wait(5)
+    run.cb.on_evaluate(run.args, run.state, run.control, metrics=second)
+    gate.set()
+    assert callback.wait(5)
+    run.state.global_step = 20
+    run.cb.on_evaluate(run.args, run.state, run.control, metrics={**first, **second})
+    run.end()
+    assert kinds(callback, "missing") == []  # the second evaluation at 10 did not discard the verdict for 10
+    assert [r["payload"]["for_step"] for r in kinds(callback, "verdict")] == [10]
+    assert [state["step"] for state in backend.calls] == [10, 20]  # one request per step
+    assert backend.calls[1]["history"][0] == {
+        "step": 10,
+        "a_loss": 0.5,
+        "a_accuracy": 0.7,
+        "b_loss": 0.6,
+        "b_accuracy": 0.8,
+    }
+    # On resume the two records of step 10 merge again
+    resumed = monitor(tmp_path, FakeBackend())
+    Run(resumed, tmp_path).begin(step=10)
+    assert resumed._history == [backend.calls[1]["history"][0]]
+    resumed.close()
+
+
+@requires_decision
+def test_evaluation_after_a_failed_train_is_ignored(tmp_path):
+    backend = FakeBackend()
+    callback = monitor(tmp_path, backend)
+    run = Run(callback, tmp_path).begin()
+    run.optimizer_step(9)
+    run.evaluate(10)
+    run.cb.on_step_begin(run.args, run.state, run.control)  # the next step raises: no on_step_end, no on_train_end
+    count, calls = len(kinds(callback)), len(backend.calls)
+    run.evaluate(10)  # a standalone trainer.evaluate() afterwards
+    run.evaluate(10)
+    assert len(kinds(callback)) == count and len(backend.calls) == calls
