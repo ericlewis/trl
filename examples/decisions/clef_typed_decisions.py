@@ -784,7 +784,17 @@ def prepare_split(dataset, collator, training_args, desc):
     return tokenized, report
 
 
-def main(script_args, training_args, model_args):
+@dataclass
+class ClefRun:
+    """What `build_trainer` builds: the trainer, the LoRA backbone of `mode: lora` (else `None`), the build reports."""
+
+    trainer: DecisionTrainer
+    lora_backbone: Any
+    reports: dict[str, dict]
+
+
+def build_trainer(script_args, training_args, model_args) -> ClefRun:
+    """Everything the script does before training: the model, the tokenized splits and the trainer."""
     set_seed(training_args.seed)
     if script_args.mode not in {"head", "lora", "full"}:
         raise ValueError("mode must be head, lora, or full")
@@ -844,8 +854,8 @@ def main(script_args, training_args, model_args):
         **collator_kwargs,
     )
     eval_collator = DataCollatorForClef(tokenizer, model.decision_config, **collator_kwargs)
-    train_dataset, _ = prepare_split(train_dataset, collator, training_args, "train")
-    eval_dataset, _ = prepare_split(eval_dataset, eval_collator, training_args, "eval")
+    train_dataset, train_report = prepare_split(train_dataset, collator, training_args, "train")
+    eval_dataset, eval_report = prepare_split(eval_dataset, eval_collator, training_args, "eval")
 
     trainer = DecisionTrainer(
         model=model,
@@ -856,6 +866,12 @@ def main(script_args, training_args, model_args):
         data_collator=collator,
         compute_metrics=compute_calibration_metrics,
     )
+    return ClefRun(trainer, lora_backbone, {"train": train_report, "eval": eval_report})
+
+
+def main(script_args, training_args, model_args):
+    run = build_trainer(script_args, training_args, model_args)
+    trainer, lora_backbone, model = run.trainer, run.lora_backbone, run.trainer.model
     result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     if lora_backbone is not None:
         # The adapter alone, for the original backbone, then merged into the backbone: the output is a native Clef

@@ -66,6 +66,22 @@ torchrun --nproc_per_node=2 \
     examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
 ```
 
+`benchmark_clef.py` times this training path: it builds the model, data and trainer with the example's own
+`build_trainer`, trains `--steps` steps without evaluating or saving, evaluates once, and prints a JSON summary (also
+written to `--output`). Without `--config` it runs a synthetic recipe (a tiny random Qwen2 backbone, 256 generated
+records; CUDA if available, else CPU); with `--config` it takes the example's YAML as it is. The summary reports
+`build_seconds`, `startup_seconds`, `first_step_seconds`, `trainer_wall_seconds`, `eval_seconds`, the steady step time
+percentiles (`steady_step_p50`, `steady_step_p95`) and throughput (`steady_records_per_second` over the steps after the
+20th, `window_records_per_second` over steps 21 to 320), CUDA peak memory, every step's time, and the resolved recipe
+(settings, backbone class and dtype, attention implementation, activation checkpointing, head type and parameter
+counts, KLM's `_use_fla_kernels`).
+
+```bash
+python examples/decisions/benchmark_clef.py --steps 120
+python examples/decisions/benchmark_clef.py --config examples/decisions/clef_typed_decisions.yaml --steps 320 \
+    --output output/clef-benchmark.json
+```
+
 ## JEV: prepared decision requests
 
 Requires [Transformers #50586](https://github.com/huggingface/transformers/pull/50586).

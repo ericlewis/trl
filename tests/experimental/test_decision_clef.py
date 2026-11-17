@@ -14,6 +14,7 @@
 
 import copy
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -1511,3 +1512,88 @@ class TestRecordRows(TrlTestCase):
         np.testing.assert_allclose(packed.predictions[real], rows.predictions, atol=1e-6)
         np.testing.assert_array_equal(packed.label_ids[real], rows.label_ids)
         assert (packed.label_ids[~real] == -100).all()
+
+
+class TestClefBenchmark(TrlTestCase):
+    """The benchmark runs the example's own training path and reports the numbers of the baseline benchmark."""
+
+    def test_synthetic_benchmark_reports_all_numbers(self):
+        from examples.decisions.benchmark_clef import run_benchmark
+
+        r = run_benchmark(steps=30)
+        for key in ("build_seconds", "first_step_seconds", "steady_records_per_second", "eval_seconds"):
+            assert math.isfinite(r[key]) and r[key] > 0
+        assert r["recipe"]["synthetic"] is True
+        # The fields of the baseline's summary.json, under the same names
+        for key in (
+            "startup_seconds",
+            "trainer_wall_seconds",
+            "steady_step_p50",
+            "steady_step_p95",
+            "window_records_per_second",
+        ):
+            assert math.isfinite(r[key]) and r[key] > 0, key
+        assert r["startup_seconds"] >= r["build_seconds"]
+        assert r["global_steps"] == 30 and r["window_steps"] == 10
+        assert r["torch"] == torch.__version__
+        if not torch.cuda.is_available():
+            assert r["gpu"] is None
+            assert r["peak_memory_bytes"] is None
+            assert r["peak_allocated_gib"] is None and r["peak_reserved_gib"] is None
+        # The steps are written out, so the percentiles and rates can be recomputed
+        assert [step["step"] for step in r["steps"]] == list(range(1, 31))
+        assert r["steps"][0]["seconds"] == r["first_step_seconds"]
+        steady = [step["seconds"] for step in r["steps"] if step["step"] > 20]
+        assert r["steady_step_p50"] == pytest.approx(float(np.percentile(steady, 50)))
+        assert r["steady_step_p95"] == pytest.approx(float(np.percentile(steady, 95)))
+        records_per_step = r["recipe"]["records_per_step"]
+        assert records_per_step == 8
+        assert r["window_records_per_second"] == pytest.approx(records_per_step * len(steady) / sum(steady))
+        # Under 320 steps, the window is every steady step
+        assert r["steady_records_per_second"] == pytest.approx(r["window_records_per_second"])
+        recipe = r["recipe"]
+        assert recipe["backbone"] == "Qwen2Model"
+        assert recipe["parameter_dtype"] == "float32"
+        assert isinstance(recipe["attn_implementation"], str)
+        assert recipe["activation_checkpointing"] is False
+        assert recipe["head_type"] == "joint"
+        assert recipe["head_parameters"] == r["head_parameters"] > 0
+        assert recipe["total_parameters"] > recipe["head_parameters"]
+        assert recipe["use_fla_kernels"] is None
+        assert recipe["script"]["truncation"] == "state" and recipe["script"]["permute_fields"] is True
+        assert recipe["training"]["max_steps"] == 30
+        assert recipe["build_report"]["train"]["rows"] + recipe["build_report"]["eval"]["rows"] == 256
+        json.dumps(r)
+
+    def test_config_settings_reach_the_example(self):
+        from examples.decisions.benchmark_clef import run_benchmark, write_synthetic_recipe
+
+        config = write_synthetic_recipe(Path(self.tmp_dir))
+        config |= {
+            "head_type": "cosine",
+            "cosine_width": 8,
+            "gradient_checkpointing": True,
+            "per_device_train_batch_size": 4,
+            "max_train_samples": 32,
+            "max_eval_samples": 8,
+        }
+        r = run_benchmark(config, steps=3)
+        recipe = r["recipe"]
+        assert recipe["synthetic"] is False
+        assert recipe["head_type"] == "cosine" and recipe["activation_checkpointing"] is True
+        assert recipe["records_per_step"] == 4
+        assert recipe["build_report"]["train"]["rows"] == 32 and recipe["build_report"]["eval"]["rows"] == 8
+        assert r["global_steps"] == 3 and len(r["steps"]) == 3
+        # Too few steps for a steady state: no steady numbers rather than made-up ones
+        assert r["window_steps"] == 0
+        for key in ("steady_records_per_second", "window_records_per_second", "steady_step_p50", "steady_step_p95"):
+            assert r[key] is None, key
+
+    def test_cli_writes_the_summary(self, capsys):
+        from examples.decisions.benchmark_clef import main
+
+        output = Path(self.tmp_dir, "summary.json")
+        main(["--steps", "2", "--output", str(output)])
+        written = json.loads(output.read_text())
+        assert written["global_steps"] == 2
+        assert json.loads(capsys.readouterr().out.strip().splitlines()[-1]) == written
