@@ -408,6 +408,53 @@ class TestDataCollatorForClef:
         second = DataCollatorForClef(tokenizer, decision_config, permute_fields=True, seed=1)(features)
         assert torch.equal(first["input_ids"], second["input_ids"])
 
+    def test_unchanged_order_is_not_rendered_again(self, tokenizer, decision_config, monkeypatch):
+        import random
+
+        rows = [
+            make_row(0, names=("team",)),
+            VARIED_ROW,
+            make_row(1),
+            {**VARIED_ROW, "questions": {"team": QUESTIONS["team"]}, "gold": {"team": "zeta"}},
+        ]
+        rows += [make_row(index) for index in range(2, 12)]
+        max_length = (
+            len(DataCollatorForClef(tokenizer, decision_config).tokenize({**VARIED_ROW, "state": ""})["input_ids"])
+            + 30
+        )
+        collator = DataCollatorForClef(
+            tokenizer, decision_config, max_length=max_length, truncation="state", permute_fields=True, seed=7
+        )
+        features = tokenized(collator, rows)
+        rendered = []
+        render = collator._render
+        monkeypatch.setattr(
+            collator, "_render", lambda request: rendered.append(list(request["questions"])) or render(request)
+        )
+        # The orders the collator's generator draws, consumed as before: one shuffle per record, in batch order
+        reference = random.Random("7/0/None")
+        orders = []
+        for feature in features:
+            order = list(range(len(feature["labels"])))
+            reference.shuffle(order)
+            orders.append(order)
+        assert any(len(order) > 1 and order == sorted(order) for order in orders)
+        assert any(order != sorted(order) for order in orders)
+        expected_renders = []
+        for feature, order in zip(features, orders, strict=False):
+            result = collator._permute(feature)
+            names = list(json.loads(feature["request"])["questions"])
+            if order == sorted(order):
+                # The cached record, untouched, and nothing rendered
+                assert result is feature
+                continue
+            # Still permuted in the order the unchanged random stream gives, and rendered (then, for a cut record,
+            # rendered again with an empty state)
+            assert result["labels"] == [feature["labels"][i] for i in order]
+            assert len(result["input_ids"]) <= max_length
+            expected_renders += [[names[i] for i in order]] * (2 if feature["truncated"] else 1)
+        assert rendered == expected_renders
+
     def test_eval_collator_does_not_permute(self, tokenizer, decision_config):
         rows = [make_row(index) for index in range(4)]
         permuting = DataCollatorForClef(tokenizer, decision_config, permute_fields=True)
@@ -971,17 +1018,32 @@ class TestClefTraining(TrlTestCase):
     def test_main_samples_the_limited_splits(self, tokenizer):
         from datasets import load_dataset
 
-        script_kwargs = {"max_train_samples": 5, "max_eval_samples": 2}
+        script_kwargs = {"max_train_samples": 5, "max_eval_samples": 2, "eval_sample_seed": 5}
         trainer, _, _ = self.run_main(tokenizer, "head", {"seed": 11}, script_kwargs=script_kwargs)
-        # The splits main trains and evaluates on are the seeded samples of its splits, tokenized
+        # The splits main trains and evaluates on are the seeded samples of its splits, tokenized: the holdout and
+        # the evaluation sample are drawn with eval_sample_seed, the training sample with the run's seed
         records = load_dataset("json", data_files=f"{self.tmp_dir}/train.jsonl")["train"]
-        split = records.train_test_split(test_size=0.25, seed=11)
+        split = records.train_test_split(test_size=0.25, seed=5)
         collator = DataCollatorForClef(tokenizer, trainer.model.decision_config, max_length=400, truncation="skip")
-        for dataset, name, count in ((trainer.train_dataset, "train", 5), (trainer.eval_dataset, "test", 2)):
-            sampled = sample_rows(split[name], count, 11)
+        for dataset, name, count, seed in (
+            (trainer.train_dataset, "train", 5, 11),
+            (trainer.eval_dataset, "test", 2, 5),
+        ):
+            sampled = sample_rows(split[name], count, seed)
             expected = [collator.tokenize(row) for row in sampled]
             assert dataset["input_ids"] == [row["input_ids"] for row in expected if not row["skip"]]
             assert sampled["state"] != split[name].select(range(count))["state"]
+
+    def test_runs_with_different_seeds_evaluate_on_the_same_records(self, tokenizer):
+        script_kwargs = {"max_train_samples": 5, "max_eval_samples": 2}
+        import shutil
+
+        first, _, _ = self.run_main(tokenizer, "head", {"seed": 11}, script_kwargs=script_kwargs)
+        shutil.rmtree(f"{self.tmp_dir}/out")  # its metrics files would join the dataset of the next run
+        second, _, _ = self.run_main(tokenizer, "head", {"seed": 12}, script_kwargs=script_kwargs)
+        assert len(first.eval_dataset) > 0
+        assert first.eval_dataset["input_ids"] == second.eval_dataset["input_ids"]
+        assert first.train_dataset["input_ids"] != second.train_dataset["input_ids"]
 
     def test_checkpoint_head_settings_cannot_change(self, tokenizer, decision_config):
         tiny_clef(tokenizer, decision_config).save_pretrained(f"{self.tmp_dir}/clef")
@@ -1520,7 +1582,7 @@ class TestClefBenchmark(TrlTestCase):
     def test_synthetic_benchmark_reports_all_numbers(self):
         from examples.decisions.benchmark_clef import run_benchmark
 
-        r = run_benchmark(steps=30)
+        r = run_benchmark(steps=8, warmup_steps_excluded=3, synthetic_records=48)
         for key in ("build_seconds", "first_step_seconds", "steady_records_per_second", "eval_seconds"):
             assert math.isfinite(r[key]) and r[key] > 0
         assert r["recipe"]["synthetic"] is True
@@ -1531,69 +1593,125 @@ class TestClefBenchmark(TrlTestCase):
             "steady_step_p50",
             "steady_step_p95",
             "window_records_per_second",
+            "steady_data_p50",
+            "steady_records_per_second_with_data",
         ):
             assert math.isfinite(r[key]) and r[key] > 0, key
-        assert r["startup_seconds"] >= r["build_seconds"]
-        assert r["global_steps"] == 30 and r["window_steps"] == 10
+        # Called as a function, startup counts from the call: it covers the build, before training
+        assert r["recipe"]["startup_origin"] == "run_benchmark call"
+        assert r["build_seconds"] <= r["startup_seconds"] < r["build_seconds"] + r["trainer_wall_seconds"] + 60
+        assert r["global_steps"] == 8 and r["window_steps"] == 5
+        assert r["recipe"]["warmup_steps_excluded"] == 3
         assert r["torch"] == torch.__version__
         if not torch.cuda.is_available():
             assert r["gpu"] is None
             assert r["peak_memory_bytes"] is None
             assert r["peak_allocated_gib"] is None and r["peak_reserved_gib"] is None
         # The steps are written out, so the percentiles and rates can be recomputed
-        assert [step["step"] for step in r["steps"]] == list(range(1, 31))
-        assert r["steps"][0]["seconds"] == r["first_step_seconds"]
-        steady = [step["seconds"] for step in r["steps"] if step["step"] > 20]
-        assert r["steady_step_p50"] == pytest.approx(float(np.percentile(steady, 50)))
-        assert r["steady_step_p95"] == pytest.approx(float(np.percentile(steady, 95)))
+        steps = r["steps"]
+        assert [step["step"] for step in steps] == list(range(1, 9))
+        assert all(step["seconds"] > 0 and step["data_seconds"] >= 0 for step in steps)
+        assert r["first_step_seconds"] == pytest.approx(steps[0]["seconds"] + steps[0]["data_seconds"])
+        steady = [step for step in steps if step["step"] > 3]
+        seconds = [step["seconds"] for step in steady]
+        assert r["steady_step_p50"] == pytest.approx(float(np.percentile(seconds, 50)))
+        assert r["steady_step_p95"] == pytest.approx(float(np.percentile(seconds, 95)))
+        assert r["steady_data_p50"] == pytest.approx(float(np.percentile([s["data_seconds"] for s in steady], 50)))
         records_per_step = r["recipe"]["records_per_step"]
         assert records_per_step == 8
-        assert r["window_records_per_second"] == pytest.approx(records_per_step * len(steady) / sum(steady))
+        assert r["window_records_per_second"] == pytest.approx(records_per_step * len(seconds) / sum(seconds))
+        with_data = [step["seconds"] + step["data_seconds"] for step in steady]
+        assert r["steady_records_per_second_with_data"] == pytest.approx(
+            records_per_step * len(with_data) / sum(with_data)
+        )
         # Under 320 steps, the window is every steady step
         assert r["steady_records_per_second"] == pytest.approx(r["window_records_per_second"])
         recipe = r["recipe"]
         assert recipe["backbone"] == "Qwen2Model"
-        assert recipe["parameter_dtype"] == "float32"
+        assert recipe["parameter_dtypes"] == ["float32"]
         assert isinstance(recipe["attn_implementation"], str)
         assert recipe["activation_checkpointing"] is False
         assert recipe["head_type"] == "joint"
-        assert recipe["head_parameters"] == r["head_parameters"] > 0
-        assert recipe["total_parameters"] > recipe["head_parameters"]
         assert recipe["use_fla_kernels"] is None
         assert recipe["script"]["truncation"] == "state" and recipe["script"]["permute_fields"] is True
-        assert recipe["training"]["max_steps"] == 30
-        assert recipe["build_report"]["train"]["rows"] + recipe["build_report"]["eval"]["rows"] == 256
+        assert recipe["training"]["max_steps"] == 8
+        assert recipe["build_report"]["train"]["rows"] + recipe["build_report"]["eval"]["rows"] == 48
         json.dumps(r)
+
+    def test_parameter_counts_separate_head_backbone_and_lexical_prior(self, tokenizer, decision_config):
+        from types import SimpleNamespace
+
+        from examples.decisions.benchmark_clef import describe_recipe
+
+        def counts(model):
+            run = SimpleNamespace(trainer=SimpleNamespace(model=model), reports={})
+            args = DecisionConfig(output_dir=self.tmp_dir, use_cpu=True, report_to="none")
+            return describe_recipe(run, ClefScriptArguments(), args, ClefModelArguments(), synthetic=False)
+
+        def size(module):
+            return sum(parameter.numel() for parameter in module.parameters())
+
+        joint = tiny_clef(tokenizer, decision_config)
+        recipe = counts(joint)
+        # The decision head alone: what is neither the backbone nor the lm_head table
+        head = sum(size(getattr(joint, name)) for name in ("embeddings", "encoder", "scorer"))
+        assert recipe["head_parameters"] == head
+        assert recipe["lexical_prior_parameters"] == joint.lm_head.weight.numel()
+        assert recipe["total_parameters"] == size(joint.model) + head + joint.lm_head.weight.numel()
+        # The cosine head has no lm_head; a tied lm_head belongs to the backbone
+        cosine = tiny_clef(tokenizer, decision_config, head_type="cosine")
+        recipe = counts(cosine)
+        assert recipe["lexical_prior_parameters"] is None
+        assert recipe["head_parameters"] == size(cosine.cosine_head) == size(cosine) - size(cosine.model)
+        joint.lm_head.weight = joint.model.get_input_embeddings().weight
+        assert counts(joint)["lexical_prior_parameters"] == 0
+        assert counts(joint)["head_parameters"] == head
+        # Every floating-point dtype of the backbone
+        joint.model.layers[0].to(torch.bfloat16)
+        assert counts(joint)["parameter_dtypes"] == ["bfloat16", "float32"]
 
     def test_config_settings_reach_the_example(self):
         from examples.decisions.benchmark_clef import run_benchmark, write_synthetic_recipe
 
-        config = write_synthetic_recipe(Path(self.tmp_dir))
+        config = write_synthetic_recipe(Path(self.tmp_dir), records=48)
         config |= {
             "head_type": "cosine",
             "cosine_width": 8,
             "gradient_checkpointing": True,
             "per_device_train_batch_size": 4,
-            "max_train_samples": 32,
-            "max_eval_samples": 8,
+            "max_train_samples": 24,
+            "max_eval_samples": 2,
         }
-        r = run_benchmark(config, steps=3)
+        r = run_benchmark(config, steps=3, process_start=(0.0, "test"))
         recipe = r["recipe"]
-        assert recipe["synthetic"] is False
+        assert recipe["synthetic"] is False and recipe["startup_origin"] == "test"
+        assert r["startup_seconds"] > 1e9  # counted from the given start, the epoch
         assert recipe["head_type"] == "cosine" and recipe["activation_checkpointing"] is True
+        assert recipe["lexical_prior_parameters"] is None
         assert recipe["records_per_step"] == 4
-        assert recipe["build_report"]["train"]["rows"] == 32 and recipe["build_report"]["eval"]["rows"] == 8
+        assert recipe["build_report"]["train"]["rows"] == 24 and recipe["build_report"]["eval"]["rows"] == 2
         assert r["global_steps"] == 3 and len(r["steps"]) == 3
-        # Too few steps for a steady state: no steady numbers rather than made-up ones
+        # With the default warm-up, too few steps for a steady state: no steady numbers rather than made-up ones
         assert r["window_steps"] == 0
-        for key in ("steady_records_per_second", "window_records_per_second", "steady_step_p50", "steady_step_p95"):
+        for key in (
+            "steady_records_per_second",
+            "window_records_per_second",
+            "steady_step_p50",
+            "steady_step_p95",
+            "steady_data_p50",
+            "steady_records_per_second_with_data",
+        ):
             assert r[key] is None, key
 
-    def test_cli_writes_the_summary(self, capsys):
-        from examples.decisions.benchmark_clef import main
+    def test_cli_writes_the_summary(self, capsys, monkeypatch):
+        from examples.decisions import benchmark_clef
 
+        # The CLI's own run, with a small recipe
+        run = benchmark_clef.run_benchmark
+        monkeypatch.setattr(benchmark_clef, "run_benchmark", lambda *a, **k: run(*a, **k, synthetic_records=24))
         output = Path(self.tmp_dir, "summary.json")
-        main(["--steps", "2", "--output", str(output)])
+        benchmark_clef.main(["--steps", "2", "--warmup_steps_excluded", "1", "--output", str(output)])
         written = json.loads(output.read_text())
-        assert written["global_steps"] == 2
+        assert written["global_steps"] == 2 and written["window_steps"] == 1
+        assert written["recipe"]["startup_origin"] in {"process creation", "benchmark module import"}
         assert json.loads(capsys.readouterr().out.strip().splitlines()[-1]) == written

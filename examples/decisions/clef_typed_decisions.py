@@ -298,13 +298,19 @@ class DataCollatorForClef(DataCollatorForDecision):
         return self._generator
 
     def _permute(self, feature: dict[str, Any]) -> dict[str, Any]:
-        """Re-render the request of a record with its questions in a new order, each keeping its target."""
+        """
+        Re-render the request of a record with its questions in a new order, each keeping its target. When the drawn
+        order is the original one (always so for a single question), the tokenized record is returned as it is: it is
+        what the re-render would give.
+        """
         request = json.loads(feature["request"])
         names = list(request["questions"])
         if len(names) != len(feature["labels"]):
             raise ValueError("The request and the labels of a record have different numbers of questions")
         order = list(range(len(names)))
         self._shuffler().shuffle(order)
+        if order == sorted(order):
+            return feature
         permuted = {**request, "questions": {names[i]: request["questions"][names[i]] for i in order}}
         try:
             input_ids, marks, questions = self._render(permuted)
@@ -364,13 +370,31 @@ class ClefScriptArguments(ScriptArguments):
         default=None, metadata={"help": "Evaluation split. Defaults to a holdout from the training split."}
     )
     validation_fraction: float = field(
-        default=0.05, metadata={"help": "Fraction of records held out when there is no evaluation split."}
+        default=0.05,
+        metadata={
+            "help": "Fraction of records held out when there is no evaluation split, drawn with eval_sample_seed."
+        },
     )
     max_train_samples: int | None = field(
-        default=None, metadata={"help": "Limit training records to a random sample of this many, drawn with seed."}
+        default=None,
+        metadata={
+            "help": "Limit training records to a random sample of this many rows, drawn with seed before "
+            "tokenization (skipped records make the realised count smaller; the build report shows it)."
+        },
     )
     max_eval_samples: int | None = field(
-        default=None, metadata={"help": "Limit evaluation records to a random sample of this many, drawn with seed."}
+        default=None,
+        metadata={
+            "help": "Limit evaluation records to a random sample of this many rows, drawn with eval_sample_seed "
+            "before tokenization (skipped records make the realised count smaller; the build report shows it)."
+        },
+    )
+    eval_sample_seed: int = field(
+        default=0,
+        metadata={
+            "help": "Seed of the evaluation holdout and of the max_eval_samples sample. It is not the run's seed, so "
+            "runs with different seeds evaluate on the same records."
+        },
     )
 
     mode: str = field(default="full", metadata={"help": "Train head, lora, or full model."})
@@ -837,12 +861,15 @@ def build_trainer(script_args, training_args, model_args) -> ClefRun:
     )
     train_dataset = dataset[script_args.dataset_train_split]
     if script_args.dataset_test_split is None:
-        split = train_dataset.train_test_split(test_size=script_args.validation_fraction, seed=training_args.seed)
+        # The holdout and its sample do not depend on the run's seed: runs with different seeds evaluate alike
+        split = train_dataset.train_test_split(
+            test_size=script_args.validation_fraction, seed=script_args.eval_sample_seed
+        )
         train_dataset, eval_dataset = split["train"], split["test"]
     else:
         eval_dataset = dataset[script_args.dataset_test_split]
     train_dataset = sample_rows(train_dataset, script_args.max_train_samples, training_args.seed)
-    eval_dataset = sample_rows(eval_dataset, script_args.max_eval_samples, training_args.seed)
+    eval_dataset = sample_rows(eval_dataset, script_args.max_eval_samples, script_args.eval_sample_seed)
 
     # Training batches permute the questions; evaluation never does, so it has its own collator
     collator_kwargs = {"max_length": script_args.max_length, "truncation": script_args.truncation}

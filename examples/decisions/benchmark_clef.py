@@ -28,16 +28,37 @@ Without `--config`, a synthetic recipe runs: a tiny random Qwen2 backbone with a
 on CUDA when there is one and on the CPU otherwise. With `--config`, the example's settings (its YAML) are used as they
 are, except that training runs `--steps` steps without evaluating, saving or reporting, and evaluation runs once after.
 
-The JSON summary has the fields of the baseline benchmark's `summary.json` (`startup_seconds`, `trainer_wall_seconds`,
-`global_steps`, `head_parameters`, `peak_allocated_gib`, `peak_reserved_gib`, `steady_step_p50`, `steady_step_p95`,
-`window_records_per_second`, `window_steps`, `gpu`, `torch`), plus `build_seconds`, `first_step_seconds`,
-`steady_records_per_second`, `eval_seconds`, `peak_memory_bytes`, the `steps` (index and seconds, to recompute any
-statistic) and the `recipe` (every resolved setting, and the backbone as it was built). Steps after the first 20 are
-steady; the window is steps 21 to 320. A step's time is the wall-clock time from the end of the previous step (the
-first from the start of training), so it includes loading its batch; the CUDA device is synchronised at each boundary.
-`startup_seconds` runs from the start of the build to the start of training, `build_seconds` covers the build alone,
-`head_parameters` counts every parameter outside the backbone (the `lm_head` of the lexical prior included), and
-`peak_*` are CUDA only (`None` elsewhere).
+The JSON summary has the fields of the baseline benchmark's `summary.json`, with the same meanings, and more. Every
+boundary of a timing synchronises the CUDA device. A step is steady when its index is above `--warmup_steps_excluded`
+(20 by default).
+
+- `startup_seconds`: from the start of the process (its creation time when `psutil` is installed, else the import of
+  this module) to just before `trainer.train()`. Called as a function, `run_benchmark` counts from the given
+  `process_start`, or from its own call; `recipe.startup_origin` says which.
+- `build_seconds`: the example's `build_trainer` alone (model, tokenized splits, trainer).
+- `trainer_wall_seconds`: `trainer.train()`. `eval_seconds`: one `trainer.evaluate()` after it.
+- `global_steps`: the optimizer steps taken.
+- `steps`: per step, `seconds` from `on_step_begin` to `on_step_end` (forward, backward, optimizer update; the trainer
+  fetches and collates the batches of a step before `on_step_begin`), and `data_seconds` from the previous step's end
+  (the first: from `on_train_begin`) to `on_step_begin` (the previous step's logging, saving or evaluation, then
+  fetching and collating this step's batches).
+- `first_step_seconds`: `data_seconds + seconds` of step 1, from `on_train_begin` to the end of the first step.
+- `steady_step_p50`, `steady_step_p95`: percentiles of the steady steps' `seconds`.
+- `steady_records_per_second`: records per step × steady steps / sum of their `seconds`.
+- `window_records_per_second`: the same over the window, the steady steps up to step 320; `window_steps` is its
+  length. With the default warm-up the window is steps 21 to 320, as in the baseline.
+- `steady_data_p50`: median steady `data_seconds`; `steady_records_per_second_with_data`: steady throughput counting
+  `seconds + data_seconds`, so that the cost of collation (permuted prompts are re-rendered) stays visible.
+- `head_parameters`: the decision head alone, without the backbone or the `lm_head` table of the lexical prior (in
+  `recipe.lexical_prior_parameters`, 0 when tied to the backbone's embeddings, `None` when there is none).
+- `peak_allocated_gib`, `peak_reserved_gib`, `peak_memory_bytes` (allocated): CUDA only, `None` elsewhere. The peaks are
+  reset just before `trainer.train()` and read at every step end, so they cover training (with any evaluation during
+  it) but not loading nor the final evaluation.
+- `gpu`, `torch`: the device name and the torch version.
+- `recipe`: every resolved setting, and the backbone as it was built (class, floating-point dtypes, attention
+  implementation, activation checkpointing, head type, parameter counts, KLM's `_use_fla_kernels`).
+
+Under torchrun only the main process prints and writes the summary.
 
 python examples/decisions/benchmark_clef.py --steps 120
 
@@ -45,21 +66,27 @@ python examples/decisions/benchmark_clef.py --config examples/decisions/clef_typ
     --output output/clef-benchmark.json
 """
 
-import argparse
-import json
-import math
-import random
-import sys
-import tempfile
 import time
-from dataclasses import asdict
-from pathlib import Path
-from typing import Any
 
-import numpy as np
-import torch
-import yaml
-from transformers import AutoTokenizer, Qwen2Config, Qwen2ForCausalLM, TrainerCallback, set_seed
+
+# Before the heavy imports: the start of the process when psutil cannot tell it
+MODULE_IMPORT_TIME = time.time()
+
+import argparse  # noqa: E402
+import json  # noqa: E402
+import math  # noqa: E402
+import random  # noqa: E402
+import sys  # noqa: E402
+import tempfile  # noqa: E402
+from dataclasses import asdict  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Any  # noqa: E402
+
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+import yaml  # noqa: E402
+from accelerate import PartialState  # noqa: E402
+from transformers import AutoTokenizer, Qwen2Config, Qwen2ForCausalLM, TrainerCallback, set_seed  # noqa: E402
 
 
 try:
@@ -68,12 +95,11 @@ except ImportError:  # run as a script: `examples` is a folder of the repository
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from examples.decisions import clef_typed_decisions as clef
 
-from trl import TrlParser
-from trl.experimental.decision import DecisionConfig
+from trl import TrlParser  # noqa: E402
+from trl.experimental.decision import DecisionConfig  # noqa: E402
 
 
-STEADY_AFTER = 20  # steps before this one warm up (compilation, allocator, caches)
-WINDOW = (21, 320)  # the steps of `window_records_per_second`, as in the baseline benchmark
+WINDOW_END = 320  # the last step of `window_records_per_second`, as in the baseline benchmark
 SYNTHETIC_RECORDS = 256
 SYNTHETIC_TOKENIZER = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
 GIB = 1024**3
@@ -92,10 +118,10 @@ QUESTION_POOL = {
 WORDS = "order invoice parcel late broken refund charge account password delivery thanks urgent today week".split()
 
 
-def write_synthetic_recipe(folder: Path) -> dict[str, Any]:
+def write_synthetic_recipe(folder: Path, records: int = SYNTHETIC_RECORDS) -> dict[str, Any]:
     """
-    Write a tiny random causal backbone (with the tokenizer of `SYNTHETIC_TOKENIZER`) and `SYNTHETIC_RECORDS`
-    generated records under `folder`, and return the settings of the example that train a new Clef head on them.
+    Write a tiny random causal backbone (with the tokenizer of `SYNTHETIC_TOKENIZER`) and `records` generated records
+    under `folder`, and return the settings of the example that train a new Clef head on them.
     """
     folder = Path(folder)
     tokenizer = AutoTokenizer.from_pretrained(SYNTHETIC_TOKENIZER)
@@ -114,7 +140,7 @@ def write_synthetic_recipe(folder: Path) -> dict[str, Any]:
     generator = random.Random(0)
     (folder / "data").mkdir(parents=True, exist_ok=True)
     with open(folder / "data" / "train.jsonl", "w", encoding="utf-8") as file:
-        for index in range(SYNTHETIC_RECORDS):
+        for index in range(records):
             names = generator.sample(sorted(QUESTION_POOL), generator.randint(1, 3))
             questions = {name: QUESTION_POOL[name] for name in names}
             gold = {}
@@ -158,13 +184,19 @@ def write_synthetic_recipe(folder: Path) -> dict[str, Any]:
 
 class StepTimer(TrainerCallback):
     """
-    Wall-clock seconds of every optimizer step, from the end of the previous one (the first from the start of
-    training), so that each includes loading its batch; the CUDA device is synchronised at each boundary.
+    For every optimizer step: `seconds` from `on_step_begin` to `on_step_end` (forward, backward and optimizer update;
+    the trainer fetches and collates the step's batches before `on_step_begin`), and `data_seconds` from the end of
+    the previous step (the first: from `on_train_begin`) to `on_step_begin` (the previous step's logging, saving or
+    evaluation, then fetching and collating this step's batches). The CUDA device is synchronised at every boundary,
+    and the peak CUDA memory is read at every step end.
     """
 
     def __init__(self):
         self.steps: list[dict[str, float]] = []
         self.train_start: float | None = None
+        self.peak_allocated: int | None = None
+        self.peak_reserved: int | None = None
+        self._begin: float | None = None
         self._last: float | None = None
 
     @staticmethod
@@ -176,10 +208,28 @@ class StepTimer(TrainerCallback):
     def on_train_begin(self, args, state, control, **kwargs):
         self._last = self.train_start = self._now(args)
 
+    def on_step_begin(self, args, state, control, **kwargs):
+        self._begin = self._now(args)
+
     def on_step_end(self, args, state, control, **kwargs):
         now = self._now(args)
-        self.steps.append({"step": state.global_step, "seconds": now - self._last})
+        self.steps.append(
+            {"step": state.global_step, "seconds": now - self._begin, "data_seconds": self._begin - self._last}
+        )
         self._last = now
+        if args.device.type == "cuda":
+            self.peak_allocated = max(self.peak_allocated or 0, torch.cuda.max_memory_allocated(args.device))
+            self.peak_reserved = max(self.peak_reserved or 0, torch.cuda.max_memory_reserved(args.device))
+
+
+def process_start() -> tuple[float, str]:
+    """The `time.time()` the process started at, and how it was found."""
+    try:
+        import psutil
+
+        return psutil.Process().create_time(), "process creation"
+    except Exception:  # psutil missing, or the platform does not tell
+        return MODULE_IMPORT_TIME, "benchmark module import"
 
 
 def parse_settings(settings: dict[str, Any]):
@@ -188,19 +238,28 @@ def parse_settings(settings: dict[str, Any]):
     return parser.parse_dict(settings)
 
 
-def parameter_count(module) -> int:
-    return sum(parameter.numel() for parameter in module.parameters())
-
-
 def describe_recipe(run, script_args, training_args, model_args, synthetic: bool) -> dict[str, Any]:
     """Every resolved setting, and the model as it was built and trained."""
     model = run.trainer.model
     backbone = model.base_model
     if hasattr(backbone, "get_base_model"):  # a PEFT backbone in `mode: lora`
         backbone = backbone.get_base_model()
-    total = parameter_count(model)
-    head = total - parameter_count(model.base_model)
+    # Parameters by identity, so a table tied to the backbone's embeddings is counted once, as the backbone's
+    parameters = {id(parameter): parameter for parameter in model.parameters()}
+    in_backbone = {id(parameter) for parameter in model.base_model.parameters()}
+    lm_head = getattr(model, "lm_head", None)
+    in_lexical_prior = {id(parameter) for parameter in lm_head.parameters()} - in_backbone if lm_head else set()
+    total = sum(parameter.numel() for parameter in parameters.values())
+    lexical_prior = sum(parameters[key].numel() for key in in_lexical_prior) if lm_head is not None else None
+    head = sum(parameter.numel() for key, parameter in parameters.items() if key not in in_backbone | in_lexical_prior)
     use_fla_kernels = getattr(backbone, "_use_fla_kernels", None)
+    dtypes = sorted(
+        {
+            str(parameter.dtype).removeprefix("torch.")
+            for parameter in backbone.parameters()
+            if parameter.is_floating_point()
+        }
+    )
     return {
         "synthetic": synthetic,
         "script": asdict(script_args),
@@ -211,11 +270,12 @@ def describe_recipe(run, script_args, training_args, model_args, synthetic: bool
         * training_args.world_size,
         "device": str(training_args.device),
         "backbone": type(backbone).__name__,
-        "parameter_dtype": str(next(backbone.parameters()).dtype).removeprefix("torch."),
+        "parameter_dtypes": dtypes,
         "attn_implementation": getattr(backbone.config, "_attn_implementation", None),
         "activation_checkpointing": bool(getattr(backbone, "is_gradient_checkpointing", False)),
         "head_type": model.config.head_type,
         "head_parameters": head,
+        "lexical_prior_parameters": lexical_prior,
         "total_parameters": total,
         "use_fla_kernels": None if use_fla_kernels is None else bool(use_fla_kernels),
         "backbone_weights": str(getattr(model, "backbone_weights", None)),
@@ -223,34 +283,53 @@ def describe_recipe(run, script_args, training_args, model_args, synthetic: bool
     }
 
 
-def summarize(steps: list[dict[str, float]], records_per_step: int) -> dict[str, Any]:
+def summarize(steps: list[dict[str, float]], records_per_step: int, warmup_steps_excluded: int) -> dict[str, Any]:
     """The throughput and step-time statistics of `steps`; `None` where there are no steady steps."""
-    steady = [step["seconds"] for step in steps if step["step"] > STEADY_AFTER]
-    window = [step["seconds"] for step in steps if WINDOW[0] <= step["step"] <= WINDOW[1]]
+    steady = [step for step in steps if step["step"] > warmup_steps_excluded]
+    window = [step for step in steps if warmup_steps_excluded < step["step"] <= WINDOW_END]
 
     def rate(seconds):
         return records_per_step * len(seconds) / sum(seconds) if seconds else None
 
+    def percentile(values, q):
+        return float(np.percentile(values, q)) if values else None
+
     return {
-        "first_step_seconds": steps[0]["seconds"] if steps else None,
-        "steady_records_per_second": rate(steady),
-        "steady_step_p50": float(np.percentile(steady, 50)) if steady else None,
-        "steady_step_p95": float(np.percentile(steady, 95)) if steady else None,
-        "window_records_per_second": rate(window),
+        "first_step_seconds": steps[0]["data_seconds"] + steps[0]["seconds"] if steps else None,
+        "steady_records_per_second": rate([step["seconds"] for step in steady]),
+        "steady_step_p50": percentile([step["seconds"] for step in steady], 50),
+        "steady_step_p95": percentile([step["seconds"] for step in steady], 95),
+        "steady_data_p50": percentile([step["data_seconds"] for step in steady], 50),
+        "steady_records_per_second_with_data": rate([step["seconds"] + step["data_seconds"] for step in steady]),
+        "window_records_per_second": rate([step["seconds"] for step in window]),
         "window_steps": len(window),
     }
 
 
-def run_benchmark(config: dict[str, Any] | None = None, *, steps: int = 120) -> dict[str, Any]:
+def run_benchmark(
+    config: dict[str, Any] | None = None,
+    *,
+    steps: int = 120,
+    warmup_steps_excluded: int = 20,
+    process_start: tuple[float, str] | None = None,
+    synthetic_records: int = SYNTHETIC_RECORDS,
+) -> dict[str, Any]:
     """
     Train the Clef example for `steps` steps with the settings of `config` (the example's YAML as a mapping), or the
     synthetic recipe when it is `None`, then evaluate once, and return the summary described in the module docstring.
+
+    `warmup_steps_excluded` steps are left out of the steady statistics. `process_start` is the `time.time()` that
+    `startup_seconds` counts from, and how it was found; by default, the call of this function.
+    `synthetic_records` is the number of records the synthetic recipe generates.
     """
     if steps < 1:
         raise ValueError("steps must be positive")
+    if warmup_steps_excluded < 0:
+        raise ValueError("warmup_steps_excluded must not be negative")
+    origin_time, origin = process_start or (time.time(), "run_benchmark call")
     with tempfile.TemporaryDirectory() as folder:
         synthetic = config is None
-        settings = write_synthetic_recipe(Path(folder)) if synthetic else dict(config)
+        settings = write_synthetic_recipe(Path(folder), synthetic_records) if synthetic else dict(config)
         settings |= {
             "max_steps": steps,
             "output_dir": str(Path(folder) / "output"),
@@ -263,12 +342,13 @@ def run_benchmark(config: dict[str, Any] | None = None, *, steps: int = 120) -> 
         script_args, training_args, model_args = parse_settings(settings)
         timer = StepTimer()
         cuda = training_args.device.type == "cuda"
-        if cuda:
-            torch.cuda.reset_peak_memory_stats(training_args.device)
         start = time.perf_counter()
         run = clef.build_trainer(script_args, training_args, model_args)
         build_seconds = time.perf_counter() - start
         run.trainer.add_callback(timer)
+        if cuda:  # the peaks cover training (and any evaluation during it), not loading nor the final evaluation
+            torch.cuda.reset_peak_memory_stats(training_args.device)
+        startup_seconds = time.time() - origin_time
         train_start = time.perf_counter()
         run.trainer.train()
         trainer_wall_seconds = time.perf_counter() - train_start
@@ -278,20 +358,19 @@ def run_benchmark(config: dict[str, Any] | None = None, *, steps: int = 120) -> 
             torch.cuda.synchronize(training_args.device)
         eval_seconds = time.perf_counter() - eval_start
         recipe = describe_recipe(run, script_args, training_args, model_args, synthetic)
-        peak_allocated = torch.cuda.max_memory_allocated(training_args.device) if cuda else None
-        peak_reserved = torch.cuda.max_memory_reserved(training_args.device) if cuda else None
+        recipe["warmup_steps_excluded"] = warmup_steps_excluded
+        recipe["startup_origin"] = origin
         summary = {
             "build_seconds": build_seconds,
-            # From the start of the build to the start of training: the build, then the trainer's own set-up
-            "startup_seconds": timer.train_start - start,
+            "startup_seconds": startup_seconds,
             "trainer_wall_seconds": trainer_wall_seconds,
             "eval_seconds": eval_seconds,
             "global_steps": run.trainer.state.global_step,
             "head_parameters": recipe["head_parameters"],
-            "peak_memory_bytes": peak_allocated,
-            "peak_allocated_gib": None if peak_allocated is None else peak_allocated / GIB,
-            "peak_reserved_gib": None if peak_reserved is None else peak_reserved / GIB,
-            **summarize(timer.steps, recipe["records_per_step"]),
+            "peak_memory_bytes": timer.peak_allocated,
+            "peak_allocated_gib": None if timer.peak_allocated is None else timer.peak_allocated / GIB,
+            "peak_reserved_gib": None if timer.peak_reserved is None else timer.peak_reserved / GIB,
+            **summarize(timer.steps, recipe["records_per_step"], warmup_steps_excluded),
             "gpu": torch.cuda.get_device_name(training_args.device) if cuda else None,
             "torch": torch.__version__,
             "steps": timer.steps,
@@ -321,16 +400,22 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     parser.add_argument("--config", help="The example's YAML; the synthetic recipe when left out.")
     parser.add_argument("--steps", type=int, default=120, help="Training steps.")
     parser.add_argument("--output", help="Also write the JSON summary to this file.")
+    parser.add_argument(
+        "--warmup_steps_excluded", type=int, default=20, help="Steps left out of the steady statistics."
+    )
     args = parser.parse_args(argv)
     config = None
     if args.config is not None:
         config = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
-    summary = run_benchmark(config, steps=args.steps)
-    text = to_json(summary)
-    if args.output is not None:
-        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.output).write_text(text + "\n", encoding="utf-8")
-    print(text)
+    summary = run_benchmark(
+        config, steps=args.steps, warmup_steps_excluded=args.warmup_steps_excluded, process_start=process_start()
+    )
+    if PartialState().is_main_process:  # one summary under torchrun
+        text = to_json(summary)
+        if args.output is not None:
+            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.output).write_text(text + "\n", encoding="utf-8")
+        print(text)
     return summary
 
 

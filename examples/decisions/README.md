@@ -52,12 +52,15 @@ state so the prompt is exactly `max_length` tokens, never touching its questions
 is too long even without its state; `skip` drops over-length records; `error` stops at the first one. `skip` and
 `state` also skip invalid records. `permute_fields` shuffles the question order of training batches only (a permuted
 prompt is cut the same way). The script prints a build report of rows, questions, skipped records by reason, and
-records whose state was cut (`truncated`). `max_train_samples` and `max_eval_samples` limit a split to a random sample
-drawn with `seed` (the same rows for the same seed), never to its first rows, which are often not representative. A
+records whose state was cut (`truncated`). `max_train_samples` limits the training split to a random sample drawn
+with `seed`; the evaluation holdout and `max_eval_samples` are drawn with `eval_sample_seed` (0 by default), so runs
+with different seeds evaluate on the same records. Never the first rows, which are often not representative. Samples
+are drawn before tokenization, so skipped records can leave fewer than asked for; the build report shows how many. A
 remote-code package whose `config.json` lists `attention_windows` or `rope_theta` per layer must keep one value per
 kind of layer, since Transformers' UltraBERT config reads them that way; other lists raise rather than silently change
 the architecture. The configuration keeps the weights in float32 and trains in bf16 autocast, since KLM's fused CUDA
-kernels only run on float32 parameters; `attn_implementation` selects flash attention. Nullable questions and activation checkpointing are unsupported. The collator returns `rows_per_example`, the
+kernels only run on float32 parameters; `attn_implementation` selects flash attention. Nullable questions are
+unsupported; activation checkpointing (`gradient_checkpointing: true`) covers the backbone and the head. The collator returns `rows_per_example`, the
 number of questions of each record, so `DecisionTrainer` gathers whole records and the example runs on several
 processes:
 
@@ -68,13 +71,24 @@ torchrun --nproc_per_node=2 \
 
 `benchmark_clef.py` times this training path: it builds the model, data and trainer with the example's own
 `build_trainer`, trains `--steps` steps without evaluating or saving, evaluates once, and prints a JSON summary (also
-written to `--output`). Without `--config` it runs a synthetic recipe (a tiny random Qwen2 backbone, 256 generated
-records; CUDA if available, else CPU); with `--config` it takes the example's YAML as it is. The summary reports
-`build_seconds`, `startup_seconds`, `first_step_seconds`, `trainer_wall_seconds`, `eval_seconds`, the steady step time
-percentiles (`steady_step_p50`, `steady_step_p95`) and throughput (`steady_records_per_second` over the steps after the
-20th, `window_records_per_second` over steps 21 to 320), CUDA peak memory, every step's time, and the resolved recipe
-(settings, backbone class and dtype, attention implementation, activation checkpointing, head type and parameter
-counts, KLM's `_use_fla_kernels`).
+written to `--output`; under torchrun by the main process only). Without `--config` it runs a synthetic recipe (a tiny
+random Qwen2 backbone, 256 generated records; CUDA if available, else CPU); with `--config` it takes the example's YAML
+as it is. Its fields match the baseline benchmark's `summary.json`; every timing boundary synchronises the CUDA device:
+
+- `startup_seconds`: process start to just before `trainer.train()`; `build_seconds`: `build_trainer` alone;
+  `trainer_wall_seconds`: `trainer.train()`; `eval_seconds`: one evaluation after training.
+- `steps`: per step, `seconds` from `on_step_begin` to `on_step_end` (the trainer collates a step's batches before
+  `on_step_begin`) and `data_seconds` from the previous step's end to `on_step_begin` (logging, saving or evaluation,
+  then collation). `first_step_seconds` runs from `on_train_begin` to the end of step 1.
+- Steps after the first `--warmup_steps_excluded` (20) are steady: `steady_step_p50` / `steady_step_p95` and
+  `steady_records_per_second` use their `seconds`; `window_records_per_second` the same up to step 320 (steps 21 to
+  320 by default, `window_steps` of them); `steady_data_p50` and `steady_records_per_second_with_data` show the cost
+  of collation, which includes re-rendering permuted prompts.
+- `head_parameters`: the decision head alone (the `lm_head` table of the lexical prior is
+  `recipe.lexical_prior_parameters`). `peak_allocated_gib`, `peak_reserved_gib`: CUDA only, reset just before
+  training and read at every step end, so they cover training but not loading nor the final evaluation.
+- `recipe`: the resolved settings, backbone class and floating-point dtypes, attention implementation, activation
+  checkpointing, head type, parameter counts and KLM's `_use_fla_kernels`.
 
 ```bash
 python examples/decisions/benchmark_clef.py --steps 120
