@@ -87,6 +87,17 @@ supervised loss. Two ways to run it:
    schedule follows the epoch alone, so resuming and several processes agree. The saved config keeps the weight and
    sigma in effect at the last step (weight 0 if training stopped before `rlcd_start_epoch`).
 
+### Jev monitor
+
+`jev_monitor` (off by default) lets a judge behind a System One API watch the run: a client preset (`typesafe`,
+`openrouter`, `local`) or an endpoint URL, with `jev_monitor_model` and `jev_monitor_mode`. At each evaluation it is
+sent a digest of the evaluation metrics, never training data, from a background thread that training never waits for.
+A preset's API key is read from its environment variable (`TYPESAFE_API_KEY`, `OPENROUTER_API_KEY`); a URL is asked
+without a key. `advise` only records the verdicts in `<output_dir>/jev_monitor/ledger.jsonl`; `enforce` may also stop
+training, after saving the model to `<output_dir>/monitor-stop-<step>`, on a NaN or infinite evaluation metric or
+non-finite gradients (the example adds no stop rules on the judge's answers; use `JevMonitorCallback` directly for
+those). The monitor never changes saving or evaluation. The YAML shows the block commented out.
+
 `benchmark_clef.py` times this training path: it builds the model, data and trainer with the example's own
 `build_trainer`, trains `--steps` steps without evaluating or saving, evaluates once, and prints a JSON summary (also
 written to `--output`; under torchrun by the main process only). Without `--config` it runs a synthetic recipe (a tiny

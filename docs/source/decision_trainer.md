@@ -146,6 +146,46 @@ rlcd_start_epoch: 1
 rlcd_sigmas: [0.4, 0.3, 0.2, 0.1]
 ```
 
+### Jev monitor
+
+[`~trl.experimental.decision.JevMonitorCallback`] lets a decision model behind a System One API (the judge) watch a
+training run. At every evaluation during training it sends the judge a digest of the evaluation metrics (current
+values, recent slopes, the best step so far, learned logit scales, gradient norms and sentinel flags), never training
+data, and asks it a few typed questions about the run. The request runs in a background thread: training never waits
+for it. The verdict on one evaluation is applied at the next one; one that has not arrived by then is recorded as
+missing and discarded. Everything is recorded in `<output_dir>/jev_monitor/ledger.jsonl`, by the main process only.
+
+- `advise` (the default) only records the verdicts, and what it would have done.
+- `enforce` may stop training, and does nothing else: when a `StopRule` held for `patience` consecutive verdicts, when
+  an evaluation metric is NaN or infinite, or at the next evaluation after non-finite gradients. It first saves the
+  model to `<output_dir>/monitor-stop-<step>` and writes `jev_monitor/intervened.json`; if the save fails, training
+  goes on. Every process stops at the same step. `enforce` needs `attach(trainer)`.
+
+The monitor never changes saving or evaluation. API keys are read from the environment at request time (a preset's
+variable, such as `TYPESAFE_API_KEY`), never from arguments or files. Evaluations outside `train()` are ignored, and a
+resumed run drops the ledger records after its checkpoint.
+
+```python
+from trl.experimental.decision import JevMonitorCallback, StopRule
+from trl.experimental.decision.jev_monitor import SystemOneClient
+
+monitor = JevMonitorCallback(
+    SystemOneClient("typesafe"),
+    mode="enforce",
+    stop_when=[StopRule("stop", threshold=0.9)],
+    patience=3,
+).attach(trainer)
+trainer.train()
+```
+
+In the Clef example, set `jev_monitor` to a client preset (`typesafe`, `openrouter`, `local`) or an endpoint URL (asked
+without a key), with `jev_monitor_model` and `jev_monitor_mode`; it is off by default and adds no stop rules:
+
+```yaml
+jev_monitor: typesafe
+jev_monitor_mode: advise
+```
+
 ## JEV
 
 JEV uses [Transformers #50586](https://github.com/huggingface/transformers/pull/50586). Use the
@@ -225,3 +265,14 @@ answers = decide(request)
 ## RlcdScheduleCallback
 
 [[autodoc]] experimental.decision.RlcdScheduleCallback
+
+## JevMonitorCallback
+
+[[autodoc]] experimental.decision.JevMonitorCallback
+    - attach
+    - wait
+    - close
+
+## StopRule
+
+[[autodoc]] experimental.decision.StopRule

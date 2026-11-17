@@ -31,7 +31,8 @@ small cosine head instead of the joint one. The resolved setup is printed at sta
 `rlcd_sigma`, `rlcd_samples`, `rlcd_normalize_advantage`) adds Clef's RLCD policy term to the training loss. RLCD is
 meant as a second phase after cross-entropy training: start this script again from the saved checkpoint with
 `rlcd_weight` set, or in one run give `rlcd_start_epoch` and/or `rlcd_sigmas` (one noise scale per epoch of the RLCD
-phase), which keep the weight at 0 until that epoch.
+phase), which keep the weight at 0 until that epoch. `jev_monitor` (off by default) lets a judge behind a System One
+API watch the evaluations from a digest of their metrics, and with `jev_monitor_mode: enforce` stop training.
 
 Backbone weights are never newly initialised and remote code is never run. A checkpoint whose weights sit under a
 prefix (a remote-code package such as an UltraBERT reranker, with `backbone.<name>` keys) has its backbone read from
@@ -76,6 +77,7 @@ from trl.experimental.decision import (
     RlcdScheduleCallback,
     compute_calibration_metrics,
 )
+from trl.experimental.decision.jev_monitor import PRESETS, JevMonitorCallback, SystemOneClient
 
 
 def clef_decision_config():
@@ -465,6 +467,24 @@ class ClefScriptArguments(ScriptArguments):
             "last is held for later epochs, e.g. [0.4, 0.3, 0.2, 0.1]. Needs a positive rlcd_weight."
         },
     )
+    jev_monitor: str | None = field(
+        default=None,
+        metadata={
+            "help": "Let a judge behind a System One API watch the evaluations: a client preset (typesafe, "
+            "openrouter, local) or an endpoint URL. It is sent a digest of the evaluation metrics, never training data. "
+            "None (the default) runs no monitor."
+        },
+    )
+    jev_monitor_model: str | None = field(
+        default=None, metadata={"help": "Model the monitor asks; overrides the preset's, required with a URL."}
+    )
+    jev_monitor_mode: str = field(
+        default="advise",
+        metadata={
+            "help": "advise records the judge's verdicts only; enforce may also stop training (never saving or "
+            "evaluating differently)."
+        },
+    )
     max_length: int = field(default=2048, metadata={"help": "Maximum prompt token length."})
     truncation: str = field(
         default="error",
@@ -702,6 +722,22 @@ def rlcd_schedule(script_args) -> RlcdScheduleCallback | None:
     )
 
 
+def jev_monitor(script_args) -> JevMonitorCallback | None:
+    """
+    The monitor of `jev_monitor` (a client preset or an endpoint URL), or `None` when it is unset. The API key of a
+    preset is read from its environment variable at request time; a URL is asked without a key.
+    """
+    if script_args.jev_monitor is None:
+        return None
+    if script_args.jev_monitor_mode not in {"advise", "enforce"}:
+        raise ValueError("jev_monitor_mode must be advise or enforce")
+    if script_args.jev_monitor in PRESETS:
+        client = SystemOneClient(script_args.jev_monitor, model=script_args.jev_monitor_model)
+    else:
+        client = SystemOneClient(url=script_args.jev_monitor, model=script_args.jev_monitor_model)
+    return JevMonitorCallback(client, mode=script_args.jev_monitor_mode)
+
+
 def build_model(script_args, model_args, model_kwargs):
     """
     A Clef checkpoint is loaded as it is; any other model becomes the backbone of a new head. A causal backbone reads
@@ -857,6 +893,7 @@ def build_trainer(script_args, training_args, model_args) -> ClefRun:
     """Everything the script does before training: the model, the tokenized splits and the trainer."""
     set_seed(training_args.seed)
     schedule = rlcd_schedule(script_args)
+    monitor = jev_monitor(script_args)
     if script_args.mode not in {"head", "lora", "full"}:
         raise ValueError("mode must be head, lora, or full")
     training_args.accelerator_config.dispatch_batches = False
@@ -932,6 +969,8 @@ def build_trainer(script_args, training_args, model_args) -> ClefRun:
     )
     if schedule is not None:
         trainer.add_callback(schedule)
+    if monitor is not None:
+        monitor.attach(trainer)
     return ClefRun(trainer, lora_backbone, {"train": train_report, "eval": eval_report})
 
 
