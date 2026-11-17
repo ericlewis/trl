@@ -51,6 +51,11 @@ from `targets` (`{question_name: {"target_index" | "target_probs" | "p_true" | "
 `answers`, where each entry is a bare label or `{"label", "probabilities", "noul"}`. `target_from_gold` turns the latter
 into `target_probs` in the question's option order. A template that renders one prompt per question is rejected.
 
+Positional targets (`target_index`, `target_probs`) index the options in the order the template gives them, which is not
+always the order of the request: Clef's template sorts choice options by key, so with criteria `{"zeta": ..., "alpha":
+...}`, `target_index: 0` is `alpha`. Prefer `gold` / `answers`, which name the option, so the target follows it
+whatever the order.
+
 Choice questions use a `criteria` mapping and may set `allow_null=True`. Score questions use a `criteria` list and
 may supply numeric `values`. The [Jeva example collator](https://github.com/huggingface/trl/blob/main/examples/decisions/jeva_banking77.py)
 uses Transformers' template to prepare separate state and option spans. It subclasses `DataCollatorForDecision`,
@@ -75,7 +80,9 @@ to each device's batch. Context parallelism is unsupported for this example.
 ## Clef example
 
 Clef answers every question of a record in one prompt: the model reads the state once and scores the options of all
-questions jointly. It requires [Transformers #50058](https://github.com/huggingface/transformers/pull/50058). The
+questions jointly. It requires a Transformers build with Clef training support (Clef's native loss and batched forward, head choice and
+RLCD) on top of [Transformers #50058](https://github.com/huggingface/transformers/pull/50058), which adds Clef without
+them. The
 [Clef example](https://github.com/huggingface/trl/blob/main/examples/decisions/clef_typed_decisions.py) trains it on
 `LocalLLaMA/typed-decisions`, with KLM-1.6 as the backbone by default:
 
@@ -84,7 +91,9 @@ python examples/decisions/clef_typed_decisions.py --config examples/decisions/cl
 ```
 
 The configuration trains the head at `head_learning_rate` (`3e-4`, the backbone at `1e-4`), evaluates with
-`compute_calibration_metrics` and keeps the checkpoint with the best `eval_selection_score`.
+`compute_calibration_metrics` every 12 steps (three times per 36-step epoch of the default dataset, for 3 epochs)
+and keeps the checkpoint with the best `eval_selection_score`: `save_strategy: best` saves a checkpoint at each
+evaluation that improves on it, so the best one is on disk, and `load_best_model_at_end` restores it after training.
 
 `mode` selects head-only, LoRA, or full training. LoRA puts adapters on the backbone and trains the head in full; the output is the merged native checkpoint, with the adapter alone in `adapter/`. A Clef checkpoint is loaded as it is; any other model becomes the
 backbone of a new head. A causal LM reads its last token with Clef's ChatML prompt; a bidirectional encoder (BERT, ModernBERT, or a reranker, unwrapped to its base model) reads its first token with the plain prompt between `[CLS]` and `[SEP]`. `global_pooling` (`last` or `first`) and `prompt_style` (`chatml` or `plain`) override that choice, and `head_type: cosine` (with `cosine_width` and `cosine_initial_scale`) selects the small cosine head; the script prints the resolved setup at start-up. UltraBERT (`model_type: ultrabert`) is such an encoder; its tokenizer has no `[CLS]`, so the plain prompt starts with its `<|endoftext|>` and ends with its `<|sep|>`. The script never newly initialises backbone weights and never runs remote code (`trust_remote_code` is refused): a checkpoint that stores its backbone under a key prefix, such as a remote-code reranker package with `backbone.<name>` weights, has its backbone read from its safetensors under the one prefix that holds every weight with its shape, its other tensors dropped, and the start-up line names the source (`direct` or `prefix "backbone."`) and the dropped tensors. Weights that no single prefix provides, or several prefixes that each do, raise a `ValueError`; so do per-layer `attention_windows` or `rope_theta` lists in such a package's `config.json` that differ within a kind of layer, which Transformers' UltraBERT config would read as one value per kind. `max_train_samples` limits the training split to a random sample drawn with `seed`, not to its first rows; the evaluation holdout and `max_eval_samples` are drawn with `eval_sample_seed` (0 by default), so runs with different seeds evaluate on the same records. Samples are drawn before tokenization, so skipped records can leave fewer than asked for (the build report shows how many). The configuration keeps the weights in float32 with `bf16: true`, since KLM's fused CUDA kernels only run on float32 parameters. Loss settings given for a Clef checkpoint are checked as a new `ClefConfig` checks them. Each row holds `state` (a record, or its JSON string, which is decoded so that the prompt renders the record), `questions` and the targets of all of its questions, either `targets`

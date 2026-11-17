@@ -37,7 +37,13 @@ from transformers import (
     TrainerCallback,
     set_seed,
 )
-from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, is_peft_available, is_sagemaker_mp_enabled
+from transformers.utils import (
+    SAFE_WEIGHTS_INDEX_NAME,
+    SAFE_WEIGHTS_NAME,
+    is_peft_available,
+    is_sagemaker_mp_enabled,
+    logging,
+)
 
 from ...trainer.base_trainer import _BaseTrainer
 from .decision_config import DecisionConfig
@@ -47,6 +53,9 @@ if is_peft_available():
     from peft import PeftModel, get_peft_model
 
 
+logger = logging.get_logger(__name__)
+
+
 def _to_model_layout(model: PreTrainedModel, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """
     Convert a state dict saved by `model.save_pretrained` back to the keys and tensors of `model`.
@@ -54,6 +63,12 @@ def _to_model_layout(model: PreTrainedModel, state_dict: dict[str, torch.Tensor]
     Saving reverts the model's weight conversions (renamings, fused projections, ...) to the layout of its original
     checkpoints; this applies them again, with the same conversions saving used, without loading anything into the
     model. Keys that no conversion matches are kept as they are.
+
+    This mirrors private internals of `transformers.core_model_loading`, read at Transformers commit 02b9cd260c (the
+    Clef training branch on top of #50058): the conversions `revert_weight_conversion` reverts when saving, and the key
+    renaming and tensor conversion of `convert_and_load_state_dict_in_model` (`rename_source_key`, `dot_natural_key`,
+    `WeightRenaming` / `WeightConverter.add_tensor` and `.convert`). Check it against them when Transformers changes;
+    the checkpoint-restore tests fail if it drifts.
     """
     from transformers.conversion_mapping import get_model_conversion_mapping
     from transformers.core_model_loading import (
@@ -462,13 +477,11 @@ class DecisionTrainer(_BaseTrainer):
         super().log(logs, start_time)
         self._metrics[mode].clear()
 
-    def _load_decision_checkpoint(self, model, checkpoint: str) -> bool:
+    def _decision_checkpoint_files(self, model, checkpoint: str) -> list[str] | None:
         """
-        Load the full safetensors checkpoint `checkpoint` into `model` through the model's own weight conversions, then
-        check that every weight was restored. [`~transformers.Trainer`] loads the saved state dict as it is, without
-        strict matching, so the weights of a model saved in another layout (such as the head of Clef) silently keep
-        their current values. Returns `False` for checkpoints left to [`~transformers.Trainer`]: adapters of a PEFT
-        model, DeepSpeed, FSDP, SageMaker, or `.bin` weights.
+        The safetensors files of `checkpoint` that [`_load_decision_checkpoint`] loads into `model`, or `None` for
+        checkpoints left to [`~transformers.Trainer`]: adapters of a PEFT model, DeepSpeed, FSDP, SageMaker, or `.bin`
+        weights.
         """
         if (
             self.is_deepspeed_enabled
@@ -476,15 +489,23 @@ class DecisionTrainer(_BaseTrainer):
             or is_sagemaker_mp_enabled()
             or not isinstance(model, PreTrainedModel)
         ):
-            return False
+            return None
         index_file = os.path.join(checkpoint, SAFE_WEIGHTS_INDEX_NAME)
         if os.path.isfile(os.path.join(checkpoint, SAFE_WEIGHTS_NAME)):
-            files = [os.path.join(checkpoint, SAFE_WEIGHTS_NAME)]
-        elif os.path.isfile(index_file):
+            return [os.path.join(checkpoint, SAFE_WEIGHTS_NAME)]
+        if os.path.isfile(index_file):
             with open(index_file) as file:
-                files = sorted({os.path.join(checkpoint, name) for name in json.load(file)["weight_map"].values()})
-        else:
-            return False
+                return sorted({os.path.join(checkpoint, name) for name in json.load(file)["weight_map"].values()})
+        return None
+
+    def _load_decision_checkpoint(self, model, checkpoint: str, files: list[str]) -> None:
+        """
+        Load the full safetensors checkpoint `checkpoint` (its `files`) into `model` through the model's own weight
+        conversions, then check that every weight was restored. [`~transformers.Trainer`] loads the saved state dict as
+        it is, without strict matching, so the weights of a model saved in another layout (such as the head of Clef)
+        silently keep their current values. As there, tied weights (saved once) and a model's `_keys_to_ignore_on_save`
+        (when they are exactly the missing keys, which are then tied again) are not missing.
+        """
         state_dict = {}
         for file in files:
             state_dict.update(safetensors.torch.load_file(file, device="cpu"))
@@ -492,20 +513,32 @@ class DecisionTrainer(_BaseTrainer):
         # Tied weights are saved once, and loading their source restores them
         tied = set(getattr(model, "all_tied_weights_keys", None) or {})
         missing = [key for key in result.missing_keys if key not in tied]
+        # As `Trainer._issue_warnings_after_load`: the keys a model leaves out when saving are tied again
+        ignored_on_save = set(getattr(model, "_keys_to_ignore_on_save", None) or ())
+        if missing and ignored_on_save and set(result.missing_keys) == ignored_on_save:
+            model.tie_weights()
+            missing = []
         if missing or result.unexpected_keys:
             raise RuntimeError(
                 f"The checkpoint {checkpoint} does not match the model: missing keys {missing}, unexpected keys "
                 f"{result.unexpected_keys}"
             )
-        return True
 
     def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
-        if not self._load_decision_checkpoint(self.model if model is None else model, resume_from_checkpoint):
-            super()._load_from_checkpoint(resume_from_checkpoint, model)
+        model = self.model if model is None else model
+        files = self._decision_checkpoint_files(model, resume_from_checkpoint)
+        if files is None:
+            return super()._load_from_checkpoint(resume_from_checkpoint, model)
+        logger.info(f"Loading model from {resume_from_checkpoint}.")
+        self._load_decision_checkpoint(model, resume_from_checkpoint, files)
 
     def _load_best_model(self):
-        if not self._load_decision_checkpoint(self.model, self.state.best_model_checkpoint):
-            super()._load_best_model()
+        checkpoint = self.state.best_model_checkpoint
+        files = self._decision_checkpoint_files(self.model, checkpoint)
+        if files is None:
+            return super()._load_best_model()
+        logger.info(f"Loading best model from {checkpoint} (score: {self.state.best_metric}).")
+        self._load_decision_checkpoint(self.model, checkpoint, files)
 
     def _save_checkpoint(self, model, trial):
         model_name = (

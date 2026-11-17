@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Needs a Transformers build with Clef training support (Clef's native loss and batched forward, head choice, RLCD) on
+# top of Transformers #50058, which adds Clef without them; replace the transformers line with such a build.
 # /// script
 # dependencies = [
 #     "trl[peft]",
@@ -120,7 +122,9 @@ class DataCollatorForClef(DataCollatorForDecision):
     all questions. A `state` that is the JSON string of an object or an array (as datasets store it) is decoded, so that
     the prompt renders the record; any other string is kept as it is. Targets are `targets` (a mapping of question
     name to `target_index`, `target_probs`, `p_true` or `score`), or `gold` / `answers` (a mapping of question name to
-    a gold label or probabilities). Nullable questions are not supported, since Clef has no coverage output.
+    a gold label or probabilities). Positional targets (`target_index`, `target_probs`) follow the template's option
+    order, which sorts choice options by key (`target_index: 0` of criteria `{"zeta", "alpha"}` is `alpha`); `gold`
+    names the option instead. Nullable questions are not supported, since Clef has no coverage output.
 
     For repeated training or evaluation, preprocess once with `dataset.map(collator.tokenize)`. The collator also
     accepts these prepared examples and only pads them when building batches. A batch holds the questions of all its

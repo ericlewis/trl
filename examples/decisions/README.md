@@ -30,8 +30,9 @@ gradient accumulation does not enlarge the pool.
 
 ## Clef: typed decisions
 
-Requires [Transformers #50058](https://github.com/huggingface/transformers/pull/50058).
-Trains a Clef head, with its KLM-1.6 backbone, on `LocalLLaMA/typed-decisions`. One prompt carries all questions of a
+Requires a Transformers build with Clef training support (Clef's native loss and batched forward, head choice and
+RLCD) on top of [Transformers #50058](https://github.com/huggingface/transformers/pull/50058), which adds Clef without
+them. Trains a Clef head, with its KLM-1.6 backbone, on `LocalLLaMA/typed-decisions`. One prompt carries all questions of a
 record, so each row needs `state`, `questions` and the targets of every question (`targets`, `gold` or `answers`).
 
 ```bash
@@ -39,7 +40,9 @@ python examples/decisions/clef_typed_decisions.py --config examples/decisions/cl
 ```
 
 The configuration trains the head at `head_learning_rate` (`3e-4`, the backbone at `1e-4`), evaluates with
-`compute_calibration_metrics` and keeps the checkpoint with the best `eval_selection_score`.
+`compute_calibration_metrics` every 12 steps (three times per 36-step epoch of the default dataset, for 3 epochs)
+and keeps the checkpoint with the best `eval_selection_score`: `save_strategy: best` saves a checkpoint at each
+evaluation that improves on it, so the best one is on disk, and `load_best_model_at_end` restores it after training.
 
 `mode` selects `head`, `lora` or `full` training (LoRA puts adapters on the backbone and trains the head in full; the output is the merged native checkpoint, with the adapter alone in `adapter/`); a Clef checkpoint is loaded as it is and any other causal LM or encoder (BERT, ModernBERT, UltraBERT, a reranker)
 becomes a new head's backbone. Backbone weights are never newly initialised and remote code is never run: when a

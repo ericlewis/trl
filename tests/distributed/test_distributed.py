@@ -51,6 +51,13 @@ from ..testing_utils import TrlTestCase, require_torch_multi_accelerator
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def has_clef_training() -> bool:
+    """Whether Transformers trains Clef natively: its loss is registered (Clef itself, #50058, has none)."""
+    from transformers.loss.loss_utils import LOSS_MAPPING
+
+    return "ClefForDecision" in LOSS_MAPPING
+
+
 def run_command(command: list[str], env: dict[str, str]) -> None:
     result = subprocess.run(command, env=env, cwd=ROOT)
     assert result.returncode == 0
@@ -541,7 +548,10 @@ class TestDistributed(TrlTestCase):
         # fmt: on
 
 
-@pytest.mark.skipif(find_spec("transformers.models.clef") is None, reason="Requires Transformers #50058")
+@pytest.mark.skipif(
+    find_spec("transformers.models.clef") is None or not has_clef_training(),
+    reason="Requires a Transformers build with Clef training support (native loss and batched forward) on top of #50058",
+)
 class TestDecisionRecordRows(TrlTestCase):
     """Two CPU processes evaluate records with different numbers of questions exactly like one process does."""
 

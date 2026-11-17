@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Needs a Transformers build with Clef training support (Clef's native loss and batched forward, head choice, RLCD) on
+# top of Transformers #50058, which adds Clef without them; replace the transformers line with such a build.
 # /// script
 # dependencies = [
 #     "trl[peft]",

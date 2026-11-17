@@ -26,6 +26,15 @@ from datasets import Dataset
 
 
 pytest.importorskip("transformers.decision")
+from transformers.loss.loss_utils import LOSS_MAPPING  # noqa: E402
+
+
+# Transformers #50058 adds Clef; its training (native loss, batched forward, head choice, RLCD) comes on top of it
+if "ClefForDecision" not in LOSS_MAPPING:
+    pytest.skip(
+        "Requires a Transformers build with Clef training support (native loss and batched forward) on top of #50058",
+        allow_module_level=True,
+    )
 
 from examples.decisions.clef_typed_decisions import (
     ClefModelArguments,
@@ -50,7 +59,6 @@ from transformers import (
     ClefConfig,
     ClefForDecision,
     ModernBertConfig,
-    Qwen2Config,
     TrainerState,
     pipeline,
     set_seed,
@@ -67,27 +75,13 @@ from trl.experimental.decision.decision_trainer import pack_rows, unpack_rows
 from trl.experimental.decision.jev_monitor import PRESETS
 
 from ..testing_utils import TrlTestCase, require_peft
+from .decision_clef_helpers import MODEL_ID, QUESTIONS, lora_clef, make_row, make_trainer, tiny_clef
 
 
-MODEL_ID = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
-QUESTIONS = {
-    "refund": {"type": "noul", "instructions": "Does the customer want a refund?"},
-    "team": {"type": "choice", "instructions": "Which team?", "criteria": {"zeta": None, "alpha": None}},
-    "urgency": {"type": "score", "instructions": "How urgent?", "criteria": ["Can wait", "This week", "Today"]},
-}
 INSTRUCTIONS = {question["instructions"]: name for name, question in QUESTIONS.items()}
 LONG_ROW = {"state": "word " * 200, "questions": QUESTIONS, "gold": {"refund": True, "team": "zeta", "urgency": 0}}
 # A long state of distinct words, so that a cut shows which end of the state was kept
 VARIED_ROW = {**LONG_ROW, "state": " ".join(f"item{index} costs {index * 7}" for index in range(80))}
-
-
-def make_row(index, names=("refund", "team", "urgency")):
-    gold = {"refund": index % 2 == 0, "team": "alpha" if index % 3 == 0 else "zeta", "urgency": index % 3}
-    return {
-        "state": f"ticket {index}: {'refund' if index % 2 == 0 else 'thanks'} {'alpha' if index % 3 == 0 else 'zeta'}",
-        "questions": {name: QUESTIONS[name] for name in names},
-        "gold": {name: gold[name] for name in names},
-    }
 
 
 # Gold answers whose probabilities tie, with a label that is not the first of the tied options
@@ -112,38 +106,6 @@ def tokenizer():
 @pytest.fixture
 def decision_config():
     return clef_decision_config()
-
-
-def tiny_clef(tokenizer, decision_config, backbone="qwen2", head_type="joint"):
-    """
-    A tiny Clef on a tiny causal (`qwen2`) or bidirectional (`bert`, `modernbert`) backbone. Encoders read the first
-    token and keep the plain prompt of their decision config when `decision_config` is `None`.
-    """
-    set_seed(0)
-    sizes = {"vocab_size": len(tokenizer) + 2, "hidden_size": 32, "intermediate_size": 32, "num_hidden_layers": 2}
-    if backbone == "qwen2":
-        text_config = Qwen2Config(**sizes, num_attention_heads=2, num_key_value_heads=1)
-    elif backbone == "bert":
-        text_config = BertConfig(**sizes, num_attention_heads=2)
-    else:
-        text_config = ModernBertConfig(**sizes, num_attention_heads=2, pad_token_id=tokenizer.pad_token_id)
-    encoder = {} if backbone == "qwen2" else {"global_pooling": "first", "prompt_style": "plain"}
-    config = ClefConfig(
-        text_config=text_config,
-        backbone_hidden_size=32,
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=1,
-        num_evidence_layers=1,
-        num_attention_heads=2,
-        head_type=head_type,
-        cosine_width=16,
-        **encoder,
-    )
-    model = ClefForDecision(config)
-    if decision_config is not None:
-        model.decision_config = decision_config
-    return model
 
 
 def tiny_encoder(tokenizer, kind):
@@ -761,39 +723,6 @@ class TestDataCollatorForClef:
             strict([{**features[0], "truncated": False}])
 
 
-def make_trainer(tmp_dir, tokenizer, decision_config, **kwargs):
-    collator = DataCollatorForClef(tokenizer, decision_config)
-    train = Dataset.from_list([collator.tokenize(make_row(index)) for index in range(16)])
-    val = Dataset.from_list([collator.tokenize(make_row(index)) for index in range(16, 24)])
-    args = dict(
-        output_dir=tmp_dir,
-        use_cpu=True,
-        bf16=False,
-        gradient_checkpointing=False,
-        max_steps=20,
-        learning_rate=1e-3,
-        eval_strategy="steps",
-        eval_steps=10,
-        per_device_train_batch_size=4,
-        per_device_eval_batch_size=4,
-        report_to="none",
-    )
-    peft_config = kwargs.pop("peft_config", None)
-    compute_metrics = kwargs.pop("compute_metrics", None)
-    model = kwargs.pop("model", None) or tiny_clef(tokenizer, decision_config)
-    trainer = DecisionTrainer(
-        model=model,
-        args=DecisionConfig(**{**args, **kwargs}),
-        train_dataset=train,
-        eval_dataset=val,
-        processing_class=tokenizer,
-        data_collator=collator,
-        compute_metrics=compute_metrics,
-        peft_config=peft_config,
-    )
-    return trainer, collator, val
-
-
 def max_logit_difference(first, second, batch):
     inputs = {key: value for key, value in batch.items() if key not in {"is_choice", "labels", "rows_per_example"}}
     with torch.no_grad():
@@ -1362,6 +1291,23 @@ class TestClefTraining(TrlTestCase):
         model = build_model(ClefScriptArguments(head_type="joint"), model_args, {"dtype": "float32"})
         assert model.config.head_type == "joint"
 
+    def test_default_configuration_keeps_its_best_checkpoint(self):
+        from trl import TrlParser
+
+        parser = TrlParser((ClefScriptArguments, DecisionConfig, ClefModelArguments))
+        path = Path(__file__).resolve().parents[2] / "examples/decisions/clef_typed_decisions.yaml"
+        script_args, args, _ = parser.parse_args_and_config(["--config", str(path)])
+        # LocalLLaMA/typed-decisions has 1,200 rows
+        train_rows = 1200 - math.ceil(1200 * script_args.validation_fraction)
+        steps_per_epoch = math.ceil(train_rows / args.per_device_train_batch_size / args.gradient_accumulation_steps)
+        total_steps = steps_per_epoch * args.num_train_epochs
+        # Every evaluation that improves on the metric is saved, so the best checkpoint is on disk to restore
+        assert args.load_best_model_at_end and args.save_strategy == "best"
+        assert args.metric_for_best_model == "eval_selection_score" and args.greater_is_better
+        # Evaluations within each epoch, after the warm-up, and several of them
+        assert args.eval_strategy == "steps" and args.eval_steps < steps_per_epoch
+        assert args.warmup_steps < args.eval_steps and total_steps // args.eval_steps >= 6
+
     @pytest.mark.parametrize("attention", ["eager", "sdpa"])
     def test_attention_implementation_reaches_the_model(self, tokenizer, decision_config, attention):
         # A new head on a backbone, and a Clef checkpoint, both get the attention that was asked for
@@ -1716,18 +1662,6 @@ class TestClefTraining(TrlTestCase):
         save_file(tensors, f"{folder}/model.safetensors", metadata={"format": "pt"})
         with pytest.raises(ValueError, match="missing"):
             self.build_from(folder)
-
-
-def lora_clef(tokenizer, decision_config):
-    """The tiny Clef with LoRA adapters on its backbone and the head trained in full, as in the example's lora mode."""
-    from peft import LoraConfig, get_peft_model
-
-    model = tiny_clef(tokenizer, decision_config)
-    model.model.requires_grad_(False)
-    model.lm_head.requires_grad_(False)
-    lora_config = LoraConfig(r=4, target_modules=["q_proj", "v_proj"], task_type="FEATURE_EXTRACTION")
-    model.model = get_peft_model(model.model, lora_config)
-    return model
 
 
 def checkpoint_state_dict(checkpoint, model):

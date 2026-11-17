@@ -21,6 +21,7 @@ head_type: joint
 # Recipe 1, two runs: train with cross-entropy (as above), then start this example again from the saved checkpoint with
 # a fresh optimizer (no resume_from_checkpoint), and RLCD on from the first step:
 # model_name_or_path: output/clef-typed-decisions
+# output_dir: output/clef-typed-decisions-rlcd
 # rlcd_weight: 0.25
 # rlcd_sigma: 0.4
 # rlcd_samples: 32
@@ -50,7 +51,8 @@ validation_fraction: 0.05
 per_device_train_batch_size: 32
 per_device_eval_batch_size: 32
 gradient_accumulation_steps: 1
-num_train_epochs: 1
+# LocalLLaMA/typed-decisions has 1,200 rows: with the 5% holdout and batches of 32, an epoch is 36 steps
+num_train_epochs: 3
 learning_rate: 0.0001
 # The head, new or small next to the backbone, trains faster
 head_learning_rate: 0.0003
@@ -58,13 +60,14 @@ optim: adamw_torch
 weight_decay: 0.0
 max_grad_norm: 1.0
 lr_scheduler_type: cosine
-warmup_steps: 50
+warmup_steps: 10
 gradient_checkpointing: false
 logging_steps: 10
+# Three evaluations per epoch; save_strategy: best saves a checkpoint at every evaluation that improves on
+# metric_for_best_model, so the best one is always on disk, and load_best_model_at_end restores it after training
 eval_strategy: steps
-eval_steps: 25
-save_strategy: steps
-save_steps: 100
+eval_steps: 12
+save_strategy: best
 save_total_limit: 1
 load_best_model_at_end: true
 metric_for_best_model: eval_selection_score

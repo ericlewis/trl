@@ -39,7 +39,6 @@ from transformers import (
 from transformers.decision import DecisionConfig as TransformersDecisionConfig
 from transformers.loss.loss_utils import LOSS_MAPPING
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-from transformers.models.clef.configuration_clef import CLEF_TEMPLATE
 
 from trl.experimental.decision import (
     DataCollatorForDecision,
@@ -50,13 +49,22 @@ from trl.experimental.decision import (
 from trl.experimental.decision.data_collator import target_from_gold
 
 from ..testing_utils import TrlTestCase, require_peft
-from .test_decision_clef import lora_clef, tiny_clef
-from .test_decision_clef import make_trainer as make_clef_trainer
 
 
 HAS_JEVA = "jeva" in CONFIG_MAPPING
 HAS_CLM = "clm" in CONFIG_MAPPING
 HAS_JEV_LOSS = "JevForDecision" in LOSS_MAPPING
+# Transformers #50058 adds Clef; its training (native loss, batched forward, head choice, RLCD) comes on top of it
+HAS_CLEF_TRAINING = "ClefForDecision" in LOSS_MAPPING
+REQUIRES_CLEF_TRAINING = (
+    "Requires a Transformers build with Clef training support (native loss and batched forward) on top of #50058"
+)
+
+if HAS_CLEF_TRAINING:
+    from transformers.models.clef.configuration_clef import CLEF_TEMPLATE
+
+    from .decision_clef_helpers import lora_clef, tiny_clef
+    from .decision_clef_helpers import make_trainer as make_clef_trainer
 
 if HAS_JEVA:
     from transformers import AutoModelForDecision, JevaForDecision
@@ -711,6 +719,7 @@ THREE_TARGETS = {
 }
 
 
+@pytest.mark.skipif(not HAS_CLEF_TRAINING, reason=REQUIRES_CLEF_TRAINING)
 class TestDataCollatorForDecisionRequests(TrlTestCase):
     @staticmethod
     def make_collator(tokenizer, per_question=False):
@@ -830,6 +839,7 @@ def optimizer_settings(optimizer):
     return lr, wd
 
 
+@pytest.mark.skipif(not HAS_CLEF_TRAINING, reason=REQUIRES_CLEF_TRAINING)
 class TestHeadLearningRate(TrlTestCase):
     def clef_trainer(self, tokenizer, model, **kwargs):
         from examples.decisions.clef_typed_decisions import clef_decision_config
@@ -1113,3 +1123,89 @@ class TestCalibrationMetrics:
         assert default["selection_score"] == pytest.approx(
             default["accuracy"] - 0.25 * default["kl"] - 0.25 * default["brier"], abs=1e-12
         )
+
+
+class TestBestCheckpointRestore(TrlTestCase):
+    """The strict checkpoint loader of `DecisionTrainer` also restores models that are not Clef."""
+
+    def train_ranked(self, tokenizer, classification_dataset, model, **kwargs):
+        # The first evaluation ranks best, so the best checkpoint is the first one, not the last
+        evaluations = []
+
+        def compute_metrics(prediction):
+            evaluations.append(None)
+            return {"rank": -len(evaluations)}
+
+        trainer = DecisionTrainer(
+            model=model,
+            args=DecisionConfig(
+                output_dir=self.tmp_dir,
+                use_cpu=True,
+                bf16=False,
+                max_steps=6,
+                learning_rate=1e-2,
+                per_device_train_batch_size=2,
+                per_device_eval_batch_size=2,
+                eval_strategy="steps",
+                eval_steps=2,
+                save_strategy="steps",
+                save_steps=2,
+                load_best_model_at_end=True,
+                metric_for_best_model="eval_rank",
+                greater_is_better=True,
+                report_to="none",
+            ),
+            train_dataset=classification_dataset,
+            eval_dataset=classification_dataset,
+            processing_class=tokenizer,
+            data_collator=DataCollatorWithPadding(tokenizer),
+            compute_metrics=compute_metrics,
+            **kwargs,
+        )
+        trainer.train()
+        assert trainer.state.best_model_checkpoint.endswith("checkpoint-2")
+        return trainer
+
+    @staticmethod
+    def assert_restored(model, checkpoint, weights="model.safetensors"):
+        from safetensors.torch import load_file
+
+        saved = load_file(os.path.join(checkpoint, weights))
+        # PEFT names the adapter `default` in the model, not in its saved file
+        state = {
+            name.replace(".modules_to_save.default", "").replace(".default", ""): value
+            for name, value in model.state_dict().items()
+            if "original_module" not in name
+        }
+        for name, value in saved.items():
+            torch.testing.assert_close(state[name], value, rtol=0, atol=0)
+        assert saved
+
+    def test_plain_model(self, tokenizer, classification_dataset, caplog):
+        import logging
+
+        caplog.set_level(logging.INFO, logger="trl.experimental.decision.decision_trainer")
+        trainer = self.train_ranked(tokenizer, classification_dataset, make_classification_model())
+        # The line the base implementation prints
+        assert f"Loading best model from {trainer.state.best_model_checkpoint} (score: -1" in caplog.text
+        self.assert_restored(trainer.model, trainer.state.best_model_checkpoint)
+
+    def test_model_with_keys_ignored_on_save(self, tokenizer, classification_dataset):
+        model = make_classification_model()
+        model._keys_to_ignore_on_save = {"score.weight"}
+        trainer = self.train_ranked(tokenizer, classification_dataset, model)
+        checkpoint = trainer.state.best_model_checkpoint
+        from safetensors.torch import load_file
+
+        assert "score.weight" not in load_file(os.path.join(checkpoint, "model.safetensors"))
+        self.assert_restored(trainer.model, checkpoint)
+
+    @require_peft
+    def test_peft_model(self, tokenizer, classification_dataset):
+        from peft import LoraConfig
+
+        peft_config = LoraConfig(r=2, target_modules=["q_proj", "v_proj"], task_type="SEQ_CLS")
+        trainer = self.train_ranked(
+            tokenizer, classification_dataset, make_classification_model(), peft_config=peft_config
+        )
+        self.assert_restored(trainer.model, trainer.state.best_model_checkpoint, "adapter_model.safetensors")
