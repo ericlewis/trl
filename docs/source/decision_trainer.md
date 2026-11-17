@@ -72,6 +72,27 @@ candidates. Soft targets supervise a bidirectional contrastive loss. Validation 
 expanding their questions. `eval_accuracy` uses each question's own candidates; contrastive negatives are local
 to each device's batch. Context parallelism is unsupported for this example.
 
+## Clef example
+
+Clef answers every question of a record in one prompt: the model reads the state once and scores the options of all
+questions jointly. It requires [Transformers #50058](https://github.com/huggingface/transformers/pull/50058). The
+[Clef example](https://github.com/huggingface/trl/blob/main/examples/decisions/clef_typed_decisions.py) trains it on
+`LocalLLaMA/typed-decisions`, with KLM-1.6 as the backbone by default:
+
+```bash
+python examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
+```
+
+`mode` selects head-only, LoRA, or full training. A Clef checkpoint is loaded as it is; any other causal LM becomes the
+backbone of a new head. Each row holds `state`, `questions` and the targets of all of its questions, either `targets`
+(per question `target_index`, `target_probs`, `p_true` or `score`) or `gold` / `answers` (per question a label or
+probabilities), through `DataCollatorForDecision.prepare_request`. The example collator `DataCollatorForClef` returns
+one row of `labels` and `option_mask` per question, with the questions of all records of a batch one after the other.
+Nullable questions raise: Clef has no coverage output. A prompt longer than `max_length` raises, or with
+`truncation: skip` is dropped and counted in the build report the script prints (rows, questions, skipped with the
+reasons, truncated). With `permute_fields`, each training batch re-renders its prompts with the questions in a new
+random order, each keeping its target; evaluation never does. The model does not support activation checkpointing.
+
 ## JEV
 
 JEV uses [Transformers #50586](https://github.com/huggingface/transformers/pull/50586). Use the

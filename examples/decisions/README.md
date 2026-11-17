@@ -2,7 +2,7 @@
 
 These examples use Transformers' native decision models and losses with TRL's `DecisionTrainer`.
 Request preparation uses the shared `DataCollatorForDecision` base and `DecisionConfig.prepare_inputs`.
-Jeva and CLM define their model-specific collators inside their training scripts.
+Jeva, CLM and Clef define their model-specific collators inside their training scripts.
 
 ## Jeva: BANKING77
 
@@ -27,6 +27,21 @@ python examples/decisions/clm_typed_decisions.py --config examples/decisions/clm
 The collator deduplicates candidates within each batch and builds soft targets for native bidirectional InfoNCE.
 Validation holds out source-row IDs before expanding their questions. Negatives remain local to each microbatch;
 gradient accumulation does not enlarge the pool.
+
+## Clef: typed decisions
+
+Requires [Transformers #50058](https://github.com/huggingface/transformers/pull/50058).
+Trains a Clef head, with its KLM-1.6 backbone, on `LocalLLaMA/typed-decisions`. One prompt carries all questions of a
+record, so each row needs `state`, `questions` and the targets of every question (`targets`, `gold` or `answers`).
+
+```bash
+python examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
+```
+
+`mode` selects `head`, `lora` or `full` training; a Clef checkpoint is loaded as it is and any other causal LM becomes
+a new head's backbone. `max_length` with `truncation: error|skip` handles over-length prompts, and `permute_fields`
+shuffles the question order of training batches only. The script prints a build report of rows, questions and skipped
+records. Nullable questions and activation checkpointing are unsupported.
 
 ## JEV: prepared decision requests
 
