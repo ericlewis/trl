@@ -75,7 +75,9 @@ torchrun --nproc_per_node=2 \
 Or open [`clef_decision_training.ipynb`](clef_decision_training.ipynb). From one settings cell it builds its own
 virtual environment (a known torch for the machine's GPU, then pinned builds), trains with `accelerate launch` on
 one GPU or several, continues with an RLCD phase, shows the metrics of both runs and asks the trained model
-questions. Its `QUICK` setting runs every stage on a small sample first.
+questions. Its `QUICK` setting runs every stage on a small sample first, and `TRUST_REMOTE_CODE` with
+`MODEL_KWARGS` set it up for a backbone that brings its own code (see below). A run folder can be used again by a
+later version of the notebook: scripts are kept per pinned commit and the environment is checked against the pins.
 
 When it starts, the script prints the setup it resolved and a build report for each split: rows, questions, records
 skipped (by reason) and records whose state was cut. The output folder is a complete model that
