@@ -73,7 +73,10 @@ from trl.experimental.decision import (
     DecisionConfig,
     DecisionTrainer,
     RlcdScheduleCallback,
+    SchemaTooLongError,
     compute_calibration_metrics,
+    cut_state,
+    decode_request,
     is_causal,
     load_decision_backbone,
     loading_problems,
@@ -81,6 +84,7 @@ from trl.experimental.decision import (
     position_limit,
     raw_config,
     remote_code_setting,
+    skipped_record,
 )
 
 
@@ -92,30 +96,6 @@ def clef_decision_config(prompt_style: str = "chatml"):
     from transformers import ClefConfig
 
     return ClefConfig.prompt_decision_config(prompt_style)
-
-
-def common_prefix_length(first: list, second: list) -> int:
-    """The number of leading items `first` and `second` have in common."""
-    return next(
-        (index for index, (a, b) in enumerate(zip(first, second, strict=False)) if a != b),
-        min(len(first), len(second)),
-    )
-
-
-def decoded_state(state: Any) -> Any:
-    """`state` decoded when it is the JSON string of an object or an array, else `state` as it is."""
-    if isinstance(state, str):
-        try:
-            value = json.loads(state)
-        except ValueError:
-            return state
-        if isinstance(value, (dict, list)):
-            return value
-    return state
-
-
-class SchemaTooLongError(ValueError):
-    """A prompt is longer than `max_length` even without its state, so cutting the state cannot make it fit."""
 
 
 @dataclass
@@ -181,19 +161,7 @@ class DataCollatorForClef(DataCollatorForDecision):
         if self.truncation not in {"error", "skip", "state"}:
             raise ValueError("truncation must be error, skip or state")
 
-    @staticmethod
-    def _request(example: dict[str, Any]) -> dict[str, Any]:
-        """
-        The request of `example`, with its `questions` decoded and its `state` decoded when it is the JSON string of an
-        object or an array (as datasets store it), so that the template renders the record, as the CLM example does. A
-        state that is any other string is kept as it is.
-        """
-        request = example["request"] if "request" in example else {k: example[k] for k in ("state", "questions")}
-        request = json.loads(request) if isinstance(request, str) else dict(request)
-        if isinstance(request["questions"], str):
-            request["questions"] = json.loads(request["questions"])
-        request["state"] = decoded_state(request["state"])
-        return request
+    _request = staticmethod(decode_request)
 
     def _features(self, input_ids, marks, questions, labels, hard_labels):
         return {
@@ -211,11 +179,8 @@ class DataCollatorForClef(DataCollatorForDecision):
         Raise `error`, or with `truncation="skip"` or `"state"` return a skipped record with the empty lists and
         `reason`.
         """
-        if self.truncation == "error":
-            raise error
         keys = ("input_ids", "marks", "num_options", "question_type_ids", "labels", "hard_labels", "is_choice")
-        empty = {key: [] for key in keys}
-        skipped = {**empty, "skip": True, "reason": reason, "truncated": False}
+        skipped = skipped_record(error, reason, keys, raise_error=self.truncation == "error")
         return {**skipped, **({"request": ""} if self.permute_fields else {})}
 
     def _render(self, request: dict[str, Any]) -> tuple[list[int], list[int], list]:
@@ -227,44 +192,8 @@ class DataCollatorForClef(DataCollatorForDecision):
         return inputs["input_ids"][0].tolist(), inputs["marks"].tolist(), questions
 
     def _cut_state(self, request, input_ids, marks) -> tuple[list[int], list[int]]:
-        """
-        Cut the end of the state of the over-length prompt `input_ids` of `request` so that it is exactly `max_length`
-        tokens, and move `marks` with it. Raises a `SchemaTooLongError` when the prompt is too long without its state.
-
-        The template renders the state between `<|split|>` sentinels, so the tokens before and after it do not depend
-        on it: the request rendered with an empty state is exactly those tokens, and the prompt must start and end with
-        them (with its marks after the state), or this raises rather than cutting by guess. The state starts at the one
-        split of the prompt into that beginning, the state and that end. When several splits fit (the state begins
-        with the tokens that follow it, or ends with those before it), two renderings whose states differ in their
-        first token tell where it starts.
-        """
-        empty, empty_marks, _ = self._render({**request, "state": ""})
-        if len(empty) > self.max_length:
-            raise SchemaTooLongError(
-                f"A record is longer than max_length even without its state ({len(empty)} > {self.max_length} "
-                "tokens); increase max_length"
-            )
-        state_length = len(input_ids) - len(empty)
-        # The starts of the state for which the prompt is the empty rendering with `state_length` tokens inserted
-        latest = common_prefix_length(input_ids, empty)
-        earliest = len(empty) - common_prefix_length(input_ids[::-1], empty[::-1])
-        start = earliest
-        if earliest < latest:
-            first, _, _ = self._render({**request, "state": "a"})
-            second, _, _ = self._render({**request, "state": "b"})
-            start = common_prefix_length(first, second)
-        if (
-            state_length <= 0
-            or not earliest <= start <= latest
-            or [mark - state_length for mark in marks] != empty_marks
-            or any(mark < start for mark in empty_marks)
-        ):
-            raise ValueError(
-                "The template does not render the state on its own between <|split|> sentinels, so the state of an "
-                "over-length prompt cannot be cut; use truncation='error' or 'skip'"
-            )
-        end, overflow = start + state_length, len(input_ids) - self.max_length
-        return input_ids[: end - overflow] + input_ids[end:], [mark - overflow for mark in marks]
+        """Cut the end of the state of an over-length prompt to `max_length` tokens (see `cut_state`)."""
+        return cut_state(self._render, request, input_ids, marks, self.max_length)
 
     def tokenize(self, example: dict[str, Any]) -> dict[str, Any]:
         """Render and tokenize one record with the native Transformers template.

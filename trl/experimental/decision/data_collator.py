@@ -175,6 +175,96 @@ def _json_value(value: Any) -> Any:
     return json.loads(value) if isinstance(value, str) else value
 
 
+def decoded_state(state: Any) -> Any:
+    """`state` decoded when it is the JSON string of an object or an array, else `state` as it is."""
+    if isinstance(state, str):
+        try:
+            value = json.loads(state)
+        except ValueError:
+            return state
+        if isinstance(value, (dict, list)):
+            return value
+    return state
+
+
+def decode_request(example: dict[str, Any]) -> dict[str, Any]:
+    """
+    The request of `example` (its `request`, or its `state` and `questions`), with the request and its `questions`
+    decoded when they are JSON strings, and its `state` decoded when it is the JSON string of an object or an array (as
+    datasets store it), so that the template renders the record. A state that is any other string is kept as it is.
+    """
+    request = example["request"] if "request" in example else {k: example[k] for k in ("state", "questions")}
+    request = json.loads(request) if isinstance(request, str) else dict(request)
+    if isinstance(request["questions"], str):
+        request["questions"] = json.loads(request["questions"])
+    request["state"] = decoded_state(request["state"])
+    return request
+
+
+def skipped_record(error: Exception, reason: str, keys, raise_error: bool) -> dict[str, Any]:
+    """
+    Raise `error` when `raise_error`, else return a skipped record: the empty list under each of `keys`, `skip=True`,
+    `reason` (which should not depend on the record, so that reasons can be counted) and `truncated=False`.
+    """
+    if raise_error:
+        raise error
+    return {**{key: [] for key in keys}, "skip": True, "reason": reason, "truncated": False}
+
+
+class SchemaTooLongError(ValueError):
+    """A prompt is longer than `max_length` even without its state, so cutting the state cannot make it fit."""
+
+
+def _common_prefix_length(first: list, second: list) -> int:
+    """The number of leading items `first` and `second` have in common."""
+    return next(
+        (index for index, (a, b) in enumerate(zip(first, second, strict=False)) if a != b),
+        min(len(first), len(second)),
+    )
+
+
+def cut_state(render, request, input_ids, marks, max_length) -> tuple[list[int], list[int]]:
+    """
+    Cut the end of the state of the over-length prompt `input_ids` of `request` so that it is exactly `max_length`
+    tokens, and move `marks` with it. `render` maps a request to the `input_ids`, `marks` and questions of its one
+    prompt. Raises a [`SchemaTooLongError`] when the prompt is too long without its state.
+
+    The template must render the state between `<|split|>` sentinels, so that the tokens before and after it do not
+    depend on it: the request rendered with an empty state is exactly those tokens, and the prompt must start and end
+    with them (with its marks after the state), or this raises rather than cutting by guess. The state starts at the one
+    split of the prompt into that beginning, the state and that end. When several splits fit (the state begins with the
+    tokens that follow it, or ends with those before it), two renderings whose states differ in their first token tell
+    where it starts.
+    """
+    empty, empty_marks, _ = render({**request, "state": ""})
+    if len(empty) > max_length:
+        raise SchemaTooLongError(
+            f"A record is longer than max_length even without its state ({len(empty)} > {max_length} tokens); "
+            "increase max_length"
+        )
+    state_length = len(input_ids) - len(empty)
+    # The starts of the state for which the prompt is the empty rendering with `state_length` tokens inserted
+    latest = _common_prefix_length(input_ids, empty)
+    earliest = len(empty) - _common_prefix_length(input_ids[::-1], empty[::-1])
+    start = earliest
+    if earliest < latest:
+        first, _, _ = render({**request, "state": "a"})
+        second, _, _ = render({**request, "state": "b"})
+        start = _common_prefix_length(first, second)
+    if (
+        state_length <= 0
+        or not earliest <= start <= latest
+        or [mark - state_length for mark in marks] != empty_marks
+        or any(mark < start for mark in empty_marks)
+    ):
+        raise ValueError(
+            "The template does not render the state on its own between <|split|> sentinels, so the state of an "
+            "over-length prompt cannot be cut; use truncation='error' or 'skip'"
+        )
+    end, overflow = start + state_length, len(input_ids) - max_length
+    return input_ids[: end - overflow] + input_ids[end:], [mark - overflow for mark in marks]
+
+
 @dataclass
 class DataCollatorForDecision(DataCollatorMixin):
     """Base for example collators that adapt Transformers decision inputs to a model's forward signature.
