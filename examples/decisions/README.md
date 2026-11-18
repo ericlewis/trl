@@ -39,6 +39,11 @@ record, so each row needs `state`, `questions` and the targets of every question
 python examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
 ```
 
+[`clef_decision_training.ipynb`](clef_decision_training.ipynb) runs the whole path from one settings cell: it installs
+pinned builds, trains with `accelerate launch` on one GPU or several, continues with an RLCD phase, shows the metrics
+of both runs and asks the trained model questions through the decision pipeline. Its `QUICK` setting runs every stage
+on a small sample first.
+
 The configuration trains the small cosine head (`head_type: cosine`: two projections that score each option by its
 cosine with its question); `head_type: joint` selects Clef's original joint head, which is the model's own default
 and what the script builds when no `head_type` is given. A Clef checkpoint keeps the head it was saved with. It trains
