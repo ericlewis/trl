@@ -11,6 +11,11 @@ define their model-specific collators inside their training scripts.
 | [`jev.py`](jev.py) | JEV on prepared decision requests | [Transformers #50586](https://github.com/huggingface/transformers/pull/50586) |
 | [`clef_typed_decisions.py`](clef_typed_decisions.py) | A Clef head with its backbone on typed decisions | A Transformers build with Clef training support, see [below](#clef-typed-decisions) |
 
+[`decision_examples.ipynb`](decision_examples.ipynb) runs the four of them briefly, one after the other, on one
+machine and asks each trained model a question: it builds its own virtual environment with the pinned builds, its
+`RUN` setting picks the stages, and its last cell is a table of what ran. [`clef_decision_training.ipynb`](clef_decision_training.ipynb)
+goes through the Clef example in full.
+
 ## Jeva: BANKING77
 
 Requires [Transformers #50614](https://github.com/huggingface/transformers/pull/50614).
