@@ -732,12 +732,6 @@ LOSS_SETTINGS = (
 )
 
 
-# The `from_pretrained` arguments a new head honours: the backbone is loaded with them, then the model is built afresh
-# around it with its dtype and attention implementation. Any other argument would be dropped, so it is refused.
-# `attn_implementation` is the backbone's, on both paths: Clef's own layers keep their default.
-NEW_HEAD_MODEL_KWARGS = frozenset({"revision", "dtype", "attn_implementation", "trust_remote_code"})
-
-
 def rlcd_schedule(script_args) -> RlcdScheduleCallback | None:
     """
     The callback that runs RLCD from `rlcd_start_epoch` with the noise scales `rlcd_sigmas`, or `None` when neither is
@@ -821,13 +815,8 @@ def build_model(script_args, model_args, model_kwargs):
             setattr(model.config, key, value)
         model.backbone_weights = "Clef checkpoint"
     else:
-        unsupported = sorted(set(model_kwargs) - NEW_HEAD_MODEL_KWARGS)
-        if unsupported:
-            raise ValueError(
-                f"model_init_kwargs {unsupported} cannot be honoured for a new head on {name}: its model is built "
-                f"afresh around the loaded backbone, which keeps only {sorted(NEW_HEAD_MODEL_KWARGS)}. Remove them, "
-                "or train from a Clef checkpoint, which is loaded with all of them."
-            )
+        # Every `model_init_kwargs` entry reaches the backbone's `from_pretrained`, `attn_implementation` included:
+        # the model is built around the loaded backbone, which keeps its weights, dtype and attention
         backbone, embeddings, weights = load_backbone(name, config, model_kwargs)
         check_cosine_settings(script_args, head_settings.get("head_type", "joint"))
         if (losses.get("rlcd_weight") or 0) > 0:
@@ -838,9 +827,6 @@ def build_model(script_args, model_args, model_kwargs):
                 stacklevel=2,
             )
         text_config = backbone.config
-        # The attention the backbone was loaded with (the one asked for, or the default it resolved to): building a
-        # config around `text_config` resets it
-        attention = text_config._attn_implementation
         causal = is_causal(text_config)
         defaults = {"global_pooling": "last" if causal else "first", "prompt_style": "chatml" if causal else "plain"}
         config = ClefConfig(
@@ -850,11 +836,9 @@ def build_model(script_args, model_args, model_kwargs):
             **losses,
             **{**defaults, **head_settings},
         )
-        # Set on the backbone only: Clef's own layers keep their default (they do not support every kernel)
-        model = ClefForDecision._from_config(config, attn_implementation={"text_config": attention})
-        model.model.load_state_dict(backbone.state_dict())
-        # The head stays in float32; the backbone keeps the dtype it was loaded in
-        model.model.to(backbone.dtype)
+        # The head is new, in float32; Clef's own layers keep their default attention (they do not support every
+        # kernel)
+        model = ClefForDecision(config, model=backbone)
         if hasattr(model, "lm_head"):  # the cosine head, and encoders without a causal LM class, have none
             with torch.no_grad():
                 model.lm_head.weight.copy_(embeddings)

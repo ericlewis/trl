@@ -1406,11 +1406,90 @@ class TestClefTraining(TrlTestCase):
         assert trainer.model.config._attn_implementation == "sdpa"
 
     @pytest.mark.parametrize("key, value", [("low_cpu_mem_usage", True), ("device_map", "cpu"), ("cache_dir", "x")])
-    def test_model_init_kwargs_a_new_head_cannot_honour_raise(self, key, value):
+    def test_model_init_kwargs_reach_the_backbone_of_a_new_head(self, key, value, monkeypatch):
+        from examples.decisions import clef_typed_decisions
+
         AutoModelForCausalLM.from_pretrained(MODEL_ID).save_pretrained(f"{self.tmp_dir}/backbone")
+        calls = []
+        original = AutoModelForCausalLM.from_pretrained
+
+        def from_pretrained(*args, **kwargs):
+            calls.append(kwargs)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(clef_typed_decisions.AutoModelForCausalLM, "from_pretrained", from_pretrained)
         model_args = ClefModelArguments(model_name_or_path=f"{self.tmp_dir}/backbone", dtype="float32")
-        with pytest.raises(ValueError, match=key):
-            build_model(ClefScriptArguments(), model_args, {"dtype": "float32", "revision": None, key: value})
+        model = build_model(ClefScriptArguments(), model_args, {"dtype": "float32", "revision": None, key: value})
+        assert len(calls) == 1 and calls[0][key] == value
+        assert isinstance(model, ClefForDecision)
+        # A setting of the backbone's config given as a model_init_kwargs entry is kept by the built model
+        calls.clear()
+        model = build_model(
+            ClefScriptArguments(), model_args, {"dtype": "float32", "revision": None, "use_cache": False}
+        )
+        assert calls[0]["use_cache"] is False and model.model.config.use_cache is False
+
+    @pytest.mark.parametrize("head_type", ["joint", "cosine"])
+    @pytest.mark.parametrize("backbone_kind", ["causal", "encoder"])
+    def test_new_head_is_built_around_the_loaded_backbone(self, tokenizer, backbone_kind, head_type, monkeypatch):
+        from examples.decisions import clef_typed_decisions
+
+        folder = f"{self.tmp_dir}/backbone"
+        if backbone_kind == "causal":
+            AutoModelForCausalLM.from_pretrained(MODEL_ID).save_pretrained(folder)
+        else:
+            tokenizer = encoder_tokenizer(tokenizer)
+            tiny_encoder(tokenizer, "bert").save_pretrained(folder)
+        loaded = []
+
+        def spy(*args, **kwargs):
+            loaded.append(load_backbone(*args, **kwargs))
+            return loaded[-1]
+
+        monkeypatch.setattr(clef_typed_decisions, "load_backbone", spy)
+        script_args = ClefScriptArguments(
+            head_type=head_type,
+            head_hidden_size=16,
+            head_intermediate_size=32,
+            head_num_layers=1,
+            head_num_evidence_layers=1,
+            head_num_attention_heads=2,
+        )
+        model_args = ClefModelArguments(model_name_or_path=folder, dtype="bfloat16")
+        kwargs = {"dtype": "bfloat16", "revision": None, "attn_implementation": "eager"}
+        model = build_model(script_args, model_args, kwargs)
+        ((backbone, embeddings, _),) = loaded
+        # The loaded backbone itself, with the weights, dtype and attention it was loaded with
+        assert model.model is backbone
+        assert model.model.config._attn_implementation == "eager" and model.config._attn_implementation == "sdpa"
+        expected = AutoModel.from_pretrained(folder, dtype=torch.bfloat16).state_dict()
+        for name, value in model.model.state_dict().items():
+            assert torch.equal(value, expected[name]), name
+        # The head is float32, but for the joint head's lm_head, which starts from the embeddings, in the backbone's
+        # dtype
+        assert {parameter.dtype for parameter in model.model.parameters()} == {torch.bfloat16}
+        head = {name: p.dtype for name, p in model.named_parameters() if not name.startswith(("model.", "lm_head."))}
+        assert head and set(head.values()) == {torch.float32}
+        assert hasattr(model, "lm_head") == (head_type == "joint")
+        if head_type == "joint":
+            assert model.lm_head.weight.dtype == torch.bfloat16 and torch.equal(model.lm_head.weight, embeddings)
+        # Saved and reloaded, it gives the same logits. The reloaded joint head is in the saved dtype (the cosine head
+        # stays in float32), so up to bfloat16 rounding
+        model.save_pretrained(f"{self.tmp_dir}/clef")
+        reloaded = AutoModelForDecision.from_pretrained(f"{self.tmp_dir}/clef")
+
+        def layout(model):
+            return [
+                (name, p.shape, p.dtype if head_type == "cosine" else None) for name, p in model.named_parameters()
+            ]
+
+        assert layout(reloaded) == layout(model)
+        collator = DataCollatorForClef(tokenizer, model.decision_config)
+        batch = collator([collator.tokenize(make_row(index)) for index in range(2)])
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+            expected_logits = model.eval()(**batch).logits.float()
+            logits = reloaded.eval()(**batch).logits.float()
+        torch.testing.assert_close(logits, expected_logits, atol=2e-2, rtol=2e-2)
 
     def test_main_builds_plain_backbone_and_reports(self, tokenizer, decision_config, capsys):
         # A local causal LM becomes the backbone of a new head; the build report counts skipped records
