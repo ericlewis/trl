@@ -1,8 +1,15 @@
 # Decision models
 
-These examples use Transformers' native decision models and losses with TRL's `DecisionTrainer`.
-Request preparation uses the shared `DataCollatorForDecision` base and `DecisionConfig.prepare_inputs`.
-Jeva, CLM and Clef define their model-specific collators inside their training scripts.
+These examples train Transformers' native decision models with TRL's experimental `DecisionTrainer`. Request
+preparation uses the shared `DataCollatorForDecision` base and `DecisionConfig.prepare_inputs`; Jeva, CLM and Clef
+define their model-specific collators inside their training scripts.
+
+| Example | Trains | Needs |
+|---|---|---|
+| [`jeva_banking77.py`](jeva_banking77.py) | A Jeva head and encoder LoRA on BANKING77 | [Transformers #50614](https://github.com/huggingface/transformers/pull/50614) |
+| [`clm_typed_decisions.py`](clm_typed_decisions.py) | CLM projection heads on a frozen encoder | [Transformers #50649](https://github.com/huggingface/transformers/pull/50649) |
+| [`jev.py`](jev.py) | JEV on prepared decision requests | [Transformers #50586](https://github.com/huggingface/transformers/pull/50586) |
+| [`clef_typed_decisions.py`](clef_typed_decisions.py) | A Clef head with its backbone on typed decisions | A Transformers build with Clef training support, see [below](#clef-typed-decisions) |
 
 ## Jeva: BANKING77
 
@@ -28,126 +35,6 @@ The collator deduplicates candidates within each batch and builds soft targets f
 Validation holds out source-row IDs before expanding their questions. Negatives remain local to each microbatch;
 gradient accumulation does not enlarge the pool.
 
-## Clef: typed decisions
-
-Requires a Transformers build with Clef training support (Clef's native loss and batched forward, head choice and RLCD)
-on top of [Transformers #50058](https://github.com/huggingface/transformers/pull/50058), which adds Clef without them.
-Trains a Clef head, with its KLM-1.6 backbone, on `LocalLLaMA/typed-decisions`. One prompt carries all questions of a
-record, so each row needs `state`, `questions` and the targets of every question (`targets`, `gold` or `answers`).
-
-```bash
-python examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
-```
-
-[`clef_decision_training.ipynb`](clef_decision_training.ipynb) runs the whole path from one settings cell: it installs
-pinned builds, trains with `accelerate launch` on one GPU or several, continues with an RLCD phase, shows the metrics
-of both runs and asks the trained model questions through the decision pipeline. Its `QUICK` setting runs every stage
-on a small sample first.
-
-The configuration trains the small cosine head (`head_type: cosine`: two projections that score each option by its
-cosine with its question); `head_type: joint` selects Clef's original joint head, which is the model's own default
-and what the script builds when no `head_type` is given. A Clef checkpoint keeps the head it was saved with. It trains
-the head at `head_learning_rate` (`3e-4`, the backbone at `1e-4`), evaluates with
-`compute_calibration_metrics` every 12 steps (three times per 36-step epoch of the default dataset, for 3 epochs)
-and keeps the checkpoint with the best `eval_selection_score`: `save_strategy: best` saves a checkpoint at each
-evaluation that improves on it, so the best one is on disk, and `load_best_model_at_end` restores it after training.
-
-`mode` selects `head`, `lora` or `full` training (LoRA puts adapters on the backbone and trains the head in full; the
-output is the merged native checkpoint, with the adapter alone in `adapter/`); a Clef checkpoint is loaded as it is and
-any other causal LM or encoder (BERT, ModernBERT, UltraBERT, a reranker) becomes a new head's backbone. Backbone
-weights are never newly initialised and remote code is never run: when a checkpoint stores its backbone under a prefix
-(the UltraBERT reranker package keeps `backbone.<name>` next to its `pair_head`), the backbone is read from its
-safetensors under the one prefix that holds every weight with its shape, the other tensors are dropped, and the
-start-up line says `backbone weights: prefix "backbone."` (or `direct`) with what was dropped; missing weights or
-several candidate prefixes raise instead. `truncation` decides what happens to a prompt longer than `max_length`:
-`state` (the configuration's choice, as Clef itself does) cuts the end of the record's state so the prompt is exactly
-`max_length` tokens, never touching its questions or options, and skips a record that is too long even without its
-state; `skip` drops over-length records; `error` stops at the first one. `skip` and `state` also skip invalid records.
-`permute_fields` shuffles the question order of training batches only (a permuted prompt is cut the same way). The
-script prints a build report of rows, questions, skipped records by reason, and records whose state was cut
-(`truncated`). `max_train_samples` limits the training split to a random sample drawn with `seed`; the evaluation
-holdout and `max_eval_samples` are drawn with `eval_sample_seed` (0 by default), so runs with different seeds evaluate
-on the same records. Never the first rows, which are often not representative. Samples are drawn before tokenization,
-so skipped records can leave fewer than asked for; the build report shows how many. A remote-code package whose
-`config.json` lists `attention_windows` or `rope_theta` per layer must keep one value per kind of layer, since
-Transformers' UltraBERT config reads them that way; other lists raise rather than silently change the architecture. The
-configuration keeps the weights in float32 and trains in bf16 autocast, since KLM's fused CUDA kernels only run on
-float32 parameters; `attn_implementation` (for example a flash attention kernel) is applied to the backbone only, for a
-new head and for a Clef checkpoint alike, while Clef's own layers keep their default; other `model_init_kwargs` that a
-new head cannot honour (only `dtype`, `revision` and `attn_implementation` carry over to the model built around the
-backbone) raise. Nullable questions are unsupported; activation checkpointing (`gradient_checkpointing: true`) covers
-the backbone and the head. The collator returns `rows_per_example`, the number of questions of each record, so
-`DecisionTrainer` gathers whole records and the example runs on several processes:
-
-```bash
-torchrun --nproc_per_node=2 \
-    examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
-```
-
-### RLCD
-
-`rlcd_weight` adds Laya's RLCD ("Reinforcement Learning for Calibrated Decisions", a community recipe, not an official
-Cloudflare objective): a policy term on noisy samples of the option logits, joined to the supervised loss. It is
-normally run as a second phase after cross-entropy training, and applies in training only, so `eval_loss` is always the
-supervised loss. Two ways to run it:
-
-1. **Two runs (recommended).** Train with cross-entropy, then start the example again with `model_name_or_path` set to
-   the saved Clef checkpoint, another `output_dir`, and `rlcd_weight` set (and `rlcd_sigma`, `rlcd_samples`,
-   `rlcd_normalize_advantage` if wanted). On a new head, `rlcd_weight` without a schedule runs RLCD from the first step
-   and logs a warning. It starts from the checkpoint's weights with a fresh optimizer, so do not pass
-   `resume_from_checkpoint`; its first evaluation reproduces the first run's final `eval_loss`. The paired RLCD
-   experiments used a fresh optimizer for the RLCD phase.
-2. **One run.** `rlcd_weight` with `rlcd_start_epoch` and/or `rlcd_sigmas`: cross-entropy until `rlcd_start_epoch`,
-   then RLCD with `rlcd_weight` (`rlcd_start_epoch` must be before the end of the run, and `rlcd_sigma` cannot be
-   combined with `rlcd_sigmas`), and the noise scale annealed per epoch of the phase (`rlcd_sigmas: [0.4, 0.3, 0.2,
-   0.1]` is Laya's schedule; the last value is held). The weight must be positive; the model is built with weight 0 and
-   the schedule follows the epoch alone, so resuming and several processes agree. The saved config keeps the weight and
-   sigma in effect at the last step (weight 0 if training stopped before `rlcd_start_epoch`).
-
-### Jev monitor
-
-`jev_monitor` (off by default) lets a judge behind a System One API watch the run: a client preset (`typesafe`,
-`openrouter`, `local`) or an endpoint URL, with `jev_monitor_model` and `jev_monitor_mode`. At each evaluation it is
-sent a digest of the evaluation metrics, never training data, from a background thread that training never waits for.
-A preset's API key is read from its environment variable (`TYPESAFE_API_KEY`, `OPENROUTER_API_KEY`); a URL is asked
-without a key. `advise` only records the verdicts in `<output_dir>/jev_monitor/ledger.jsonl`; `enforce` may also stop
-training, after saving the model to `<output_dir>/monitor-stop-<step>`, on a NaN or infinite evaluation metric or
-non-finite gradients (the example adds no stop rules on the judge's answers; use `JevMonitorCallback` directly for
-those). The monitor never changes saving or evaluation. The YAML shows the block commented out.
-
-`benchmark_clef.py` times this training path: it builds the model, data and trainer with the example's own
-`build_trainer`, trains `--steps` steps without evaluating or saving, evaluates once, and prints a JSON summary (also
-written to `--output`; under torchrun by the main process only). Without `--config` it runs a synthetic recipe (a tiny
-random Qwen2 backbone, 256 generated records; CUDA if available, else CPU); with `--config` it takes the example's YAML
-as it is, parsed exactly as the example parses `--config`, with `dataloader_drop_last` forced on so every step holds
-the same number of records. Its fields carry the names of the reference benchmark's `summary.json`; the per-step
-`seconds` and the rates computed from them have the same meanings, `trainer_wall_seconds` and `startup_seconds` do not
-(the summary's `notes` say so). Every timing boundary synchronises the CUDA device:
-
-- `startup_seconds`: process start to just before `trainer.train()` (its origin is not the reference's, so the two
-  are not comparable); `build_seconds`: `build_trainer` alone; `trainer_wall_seconds`: `trainer.train()`, which here
-  never evaluates or saves (the reference's includes its evaluations and saves, so the two are not comparable);
-  `eval_seconds`: one evaluation after training.
-- `steps`: per step, `seconds` from `on_step_begin` to `on_step_end` (the trainer collates a step's batches before
-  `on_step_begin`) and `data_seconds` from the previous step's end to `on_step_begin` (logging, saving or evaluation,
-  then collation). `first_step_seconds` runs from `on_train_begin` to the end of step 1.
-- Steps after the first `--warmup_steps_excluded` (20) are steady: `steady_step_p50` / `steady_step_p95` and
-  `steady_records_per_second` use their `seconds`; `window_records_per_second` the same up to step 320 (steps 21 to
-  320 by default, `window_steps` of them); `steady_data_p50` and `steady_records_per_second_with_data` show the cost
-  of collation, which includes re-rendering permuted prompts.
-- `head_parameters`: the decision head alone (the `lm_head` table of the lexical prior is
-  `recipe.lexical_prior_parameters`). `peak_allocated_gib`, `peak_reserved_gib`: CUDA only, reset just before
-  training and read at every step end, so they cover training but not loading nor the final evaluation.
-- `recipe`: the resolved settings (`model_init_kwargs` other than `dtype`, `revision`, `attn_implementation` and
-  `trust_remote_code` redacted), backbone class and floating-point dtypes, the attention implementation the backbone
-  uses, activation checkpointing, head type, parameter counts and KLM's `_use_fla_kernels`.
-
-```bash
-python examples/decisions/benchmark_clef.py --steps 120
-python examples/decisions/benchmark_clef.py --config examples/decisions/clef_typed_decisions.yaml --steps 320 \
-    --output output/clef-benchmark.json
-```
-
 ## JEV: prepared decision requests
 
 Requires [Transformers #50586](https://github.com/huggingface/transformers/pull/50586).
@@ -163,3 +50,184 @@ python examples/decisions/jev.py --model_name_or_path autotrust/JEV-9B \
 
 Use batch size one and accumulation for more decisions per update. The model computes KL and ordinal RPS;
 nullable decisions and activation checkpointing are unsupported by the current JEV model.
+
+## Clef: typed decisions
+
+Trains a Clef decision model: a head on a backbone (KLM-1.6 by default) that answers every question of a record
+from one prompt. Each row needs a `state`, its `questions`, and the target of every question (`gold`, `answers` or
+`targets`). The default dataset is `LocalLLaMA/typed-decisions`.
+
+> Needs a Transformers build with Clef training support (Clef's native loss, batched forward, head choice and RLCD)
+> on top of [Transformers #50058](https://github.com/huggingface/transformers/pull/50058), which adds Clef without
+> them.
+
+### Run it
+
+```bash
+# one GPU
+python examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
+
+# several GPUs
+torchrun --nproc_per_node=2 \
+    examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
+```
+
+Or open [`clef_decision_training.ipynb`](clef_decision_training.ipynb). From one settings cell it installs pinned
+builds, trains with `accelerate launch` on one GPU or several, continues with an RLCD phase, shows the metrics of
+both runs and asks the trained model questions. Its `QUICK` setting runs every stage on a small sample first.
+
+When it starts, the script prints the setup it resolved and a build report for each split: rows, questions, records
+skipped (by reason) and records whose state was cut. The output folder is a complete model that
+`pipeline("decision")` loads as it is.
+
+### What the supplied configuration does
+
+| Setting | Value | What it means |
+|---|---|---|
+| `head_type` | `cosine` | The small cosine head: two projections score each option by its cosine with its question. `joint` selects Clef's original head, which is also what the script builds when no `head_type` is given. |
+| `mode` | `full` | Trains the backbone and the head. `head` freezes the backbone. `lora` puts adapters on the backbone and trains the head in full; it saves the merged model, with the adapter alone in `adapter/`. |
+| `learning_rate`, `head_learning_rate` | `1e-4`, `3e-4` | The head is new, so it trains faster than the backbone. |
+| `dtype`, `bf16` | `float32`, `true` | float32 weights under bf16 autocast, which KLM's fused CUDA kernels need. |
+| `truncation` | `state` | See [Long prompts](#long-prompts). |
+| `permute_fields` | `true` | Training batches reorder the questions of each record. Evaluation never does. |
+| `eval_steps`, `save_strategy` | `12`, `best` | Evaluates three times per epoch of the default dataset with `compute_calibration_metrics`, saves a checkpoint whenever `eval_selection_score` improves, and restores the best one at the end. |
+
+### Choosing the model
+
+`model_name_or_path` is one of two things:
+
+- **A Clef checkpoint.** It is loaded as it is and keeps the head it was saved with, so `head_type` and the head
+  sizes must match it or be left out.
+- **Any other model.** It becomes the backbone of a new head. A causal LM (KLM-1.6, Qwen) reads its last token with
+  Clef's ChatML prompt; an encoder (BERT, ModernBERT, UltraBERT, a reranker) reads its first token with a plain
+  prompt. `global_pooling` (`last` or `first`) and `prompt_style` (`chatml` or `plain`) override that choice.
+
+Backbones are loaded strictly:
+
+- Backbone weights are never newly initialised, and remote code is never run.
+- A package that keeps its backbone under one prefix (a reranker with `backbone.<name>` weights next to its task
+  head) has the backbone read from that prefix and its other tensors dropped. The start-up line says which
+  (`backbone weights: prefix "backbone."` or `direct`). Missing weights, or several candidate prefixes, raise.
+- A remote-code `config.json` that lists `attention_windows` or `rope_theta` per layer must keep one value per kind
+  of layer; any other list raises rather than change the architecture.
+
+`attn_implementation` (for example a flash-attention kernel) is applied to the backbone only, for a new head and for
+a checkpoint alike. Of the `model_init_kwargs`, `dtype`, `revision` and `attn_implementation` carry over to a new
+model; any other raises.
+
+### Long prompts
+
+`truncation` decides what happens to a record whose prompt is longer than `max_length`:
+
+| `truncation` | A record that is too long |
+|---|---|
+| `state` | Has the end of its state cut, so the prompt is exactly `max_length` tokens. Questions and options are never cut. A record too long even without its state is skipped. |
+| `skip` | Is dropped. |
+| `error` | Stops the run. |
+
+`state` and `skip` also skip invalid records. If no record is left, the run stops and says why. A prompt whose
+questions were reordered by `permute_fields` is cut the same way.
+
+### Sampling
+
+- `max_train_samples` draws a random sample of the training split with `seed`.
+- The evaluation holdout (`validation_fraction`) and `max_eval_samples` are drawn with `eval_sample_seed` (0 by
+  default), so runs with different seeds evaluate on the same records.
+- A sample is never the first rows of a split, which are often not representative.
+- Samples are drawn before tokenization, so skipped records can leave fewer than asked for. The build report shows
+  how many.
+
+### RLCD
+
+`rlcd_weight` adds Laya's RLCD ("Reinforcement Learning for Calibrated Decisions"; a community recipe, not an
+official Cloudflare objective): a policy term on noisy samples of the option logits, added to the supervised loss.
+It is a second phase after cross-entropy training. It applies in training only, so `eval_loss` is always the
+supervised loss.
+
+**Two runs (recommended).** Train with cross-entropy, then start the example again from the saved checkpoint:
+
+```yaml
+model_name_or_path: output/clef-typed-decisions      # the cross-entropy run's output
+output_dir: output/clef-typed-decisions-rlcd
+rlcd_weight: 0.25
+rlcd_sigmas: [0.4, 0.3, 0.2, 0.1]                    # noise of each epoch; the last value is held
+```
+
+The second run starts from the checkpoint's weights with a fresh optimizer, so do not pass
+`resume_from_checkpoint`. Its first evaluation reproduces the first run's final `eval_loss`.
+
+**One run.** Cross-entropy until `rlcd_start_epoch`, then RLCD:
+
+```yaml
+num_train_epochs: 6
+rlcd_weight: 0.25
+rlcd_start_epoch: 2
+rlcd_sigmas: [0.4, 0.3, 0.2, 0.1]
+```
+
+- `rlcd_weight` must be positive, and `rlcd_start_epoch` must fall before the end of the run.
+- `rlcd_sigma` (one fixed noise scale), `rlcd_samples` and `rlcd_normalize_advantage` tune the term; `rlcd_sigma`
+  cannot be combined with `rlcd_sigmas`.
+- The schedule follows the epoch alone, so resuming and several processes agree. The saved config keeps the weight
+  and noise in effect at the last step (weight 0 if training stopped before `rlcd_start_epoch`).
+- On a new head, `rlcd_weight` without `rlcd_start_epoch` or `rlcd_sigmas` runs RLCD from the first step and logs a
+  warning.
+
+### Jev monitor
+
+`jev_monitor` (off by default) lets a judge model behind a System One API watch the run.
+
+```yaml
+jev_monitor: typesafe        # or openrouter, local, or an endpoint URL
+jev_monitor_model: jev-1.13.0
+jev_monitor_mode: advise     # enforce may also stop the run
+```
+
+- At each evaluation the judge is sent a digest of the evaluation metrics, never training data, from a background
+  thread that training never waits for.
+- A preset's API key is read from its environment variable (`TYPESAFE_API_KEY`, `OPENROUTER_API_KEY`). A URL is
+  asked without a key.
+- `advise` only records the verdicts, in `<output_dir>/jev_monitor/ledger.jsonl`.
+- `enforce` may also stop training on a NaN or infinite evaluation metric or on non-finite gradients, after saving
+  the model to `<output_dir>/monitor-stop-<step>`. The example adds no stop rules on the judge's answers; use
+  `JevMonitorCallback` directly for those.
+- The monitor never changes saving or evaluation.
+
+### Timing training steps
+
+[`benchmark_clef.py`](benchmark_clef.py) times this training path. It builds the model, data and trainer with the
+example's own `build_trainer`, trains `--steps` steps without evaluating or saving, evaluates once, and prints a
+JSON summary (also written to `--output`).
+
+```bash
+# a synthetic recipe: a tiny random backbone and 256 generated records
+python examples/decisions/benchmark_clef.py --steps 120
+
+# the example's configuration, parsed exactly as the example parses it
+python examples/decisions/benchmark_clef.py --config examples/decisions/clef_typed_decisions.yaml --steps 320 \
+    --output output/clef-benchmark.json
+```
+
+With `--config`, `dataloader_drop_last` is forced on so that every step holds the same number of records. Every
+timing boundary synchronises the CUDA device.
+
+| Field | Meaning |
+|---|---|
+| `window_records_per_second` | Records per second over steps 21 to 320 (`window_steps` of them). |
+| `steady_step_p50`, `steady_step_p95`, `steady_records_per_second` | Step time, from `on_step_begin` to `on_step_end`, after the first `--warmup_steps_excluded` (20) steps. |
+| `steady_data_p50`, `steady_records_per_second_with_data` | The time between steps: logging and collation, which includes re-rendering reordered prompts. |
+| `first_step_seconds` | From `on_train_begin` to the end of step 1. |
+| `build_seconds`, `startup_seconds` | `build_trainer` alone; process start to just before `trainer.train()`. |
+| `trainer_wall_seconds`, `eval_seconds` | `trainer.train()`, which here never evaluates or saves; one evaluation after training. |
+| `peak_allocated_gib`, `peak_reserved_gib` | CUDA memory during training (not loading, nor the final evaluation). |
+| `head_parameters` | The decision head alone. The `lm_head` table of the joint head's lexical prior is `recipe.lexical_prior_parameters`. |
+| `steps` | Per step: `seconds` and `data_seconds`. |
+| `recipe` | The resolved settings, the backbone and its dtypes, the attention implementation the backbone uses, activation checkpointing, head type and parameter counts. |
+
+`startup_seconds` and `trainer_wall_seconds` are particular to this script; the summary's `notes` say what they
+cover. Under `torchrun` only the main process writes the summary.
+
+### Limits
+
+- Nullable questions are not supported: Clef has no coverage output.
+- `activation_checkpointing: true` covers the backbone and the head.
