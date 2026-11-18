@@ -12,6 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .backbone import (
+    BackboneWeights,
+    DecisionBackbone,
+    check_per_layer_settings,
+    checkpoint_code,
+    checkpoint_shapes,
+    hidden_states_of,
+    is_causal,
+    load_backbone,
+    load_decision_backbone,
+    load_remote_backbone,
+    loading_problems,
+    needs_remote_code,
+    position_limit,
+    raw_config,
+    remote_code_setting,
+    repair_backbone,
+)
 from .data_collator import DataCollatorForDecision, target_from_gold
 from .decision_config import DecisionConfig
 from .decision_trainer import DecisionTrainer
@@ -20,10 +38,26 @@ from .rlcd_schedule import RlcdScheduleCallback
 
 
 __all__ = [
+    "BackboneWeights",
+    "DecisionBackbone",
     "DataCollatorForDecision",
     "DecisionConfig",
     "DecisionTrainer",
     "RlcdScheduleCallback",
+    "check_per_layer_settings",
+    "checkpoint_code",
+    "checkpoint_shapes",
     "compute_calibration_metrics",
+    "hidden_states_of",
+    "is_causal",
+    "load_backbone",
+    "load_decision_backbone",
+    "load_remote_backbone",
+    "loading_problems",
+    "needs_remote_code",
+    "position_limit",
+    "raw_config",
+    "remote_code_setting",
+    "repair_backbone",
     "target_from_gold",
 ]
