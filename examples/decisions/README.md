@@ -72,9 +72,10 @@ torchrun --nproc_per_node=2 \
     examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
 ```
 
-Or open [`clef_decision_training.ipynb`](clef_decision_training.ipynb). From one settings cell it installs pinned
-builds, trains with `accelerate launch` on one GPU or several, continues with an RLCD phase, shows the metrics of
-both runs and asks the trained model questions. Its `QUICK` setting runs every stage on a small sample first.
+Or open [`clef_decision_training.ipynb`](clef_decision_training.ipynb). From one settings cell it builds its own
+virtual environment (a known torch for the machine's GPU, then pinned builds), trains with `accelerate launch` on
+one GPU or several, continues with an RLCD phase, shows the metrics of both runs and asks the trained model
+questions. Its `QUICK` setting runs every stage on a small sample first.
 
 When it starts, the script prints the setup it resolved and a build report for each split: rows, questions, records
 skipped (by reason) and records whose state was cut. The output folder is a complete model that
