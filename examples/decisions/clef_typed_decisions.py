@@ -27,7 +27,8 @@ Train a Clef decision model on typed decisions: one prompt per record, every que
 
 `model_name_or_path` is a Clef checkpoint, loaded as it is, or the backbone of a new head (a causal LM, an encoder or a
 reranker package), loaded with no weight newly initialised and with its own code only with `trust_remote_code`. RLCD
-(`rlcd_weight`) is a second phase after cross-entropy training. The README describes every setting.
+(`rlcd_weight`) is a second phase after cross-entropy training. The README describes the main settings; `--help` lists
+them all.
 
 python examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
 
@@ -56,19 +57,13 @@ from trl.experimental.decision import (
     DecisionConfig,
     DecisionTrainer,
     RlcdScheduleCallback,
-    SchemaTooLongError,
-    check_max_length,
     compute_calibration_metrics,
-    cut_state,
-    decode_request,
     is_causal,
     load_decision_backbone,
-    loading_problems,
     needs_remote_code,
-    raw_config,
-    remote_code_setting,
-    skipped_record,
 )
+from trl.experimental.decision.backbone import check_max_length, loading_problems, raw_config, remote_code_setting
+from trl.experimental.decision.data_collator import SchemaTooLongError, cut_state, decode_request, skipped_record
 
 
 def clef_decision_config(prompt_style: str = "chatml"):

@@ -15,7 +15,9 @@
 """
 Loading the backbone of a new decision head: strictly (no weight newly initialised), from the one key prefix of a
 checkpoint that holds all of it, or with the checkpoint's own code when it has no model of Transformers and the caller
-allows it. [`load_decision_backbone`] does all of it in one call; the other functions are its parts.
+allows it. [`load_decision_backbone`] does all of it in one call; the other functions are its parts. It needs a
+Transformers build with Clef support (it reads `ClefConfig.backbone_code` and `ClefForDecision`). Only the one call,
+its result types, `is_causal` and `needs_remote_code` are exported from `trl.experimental.decision`.
 """
 
 import inspect

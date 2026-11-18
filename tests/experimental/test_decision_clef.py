@@ -2211,6 +2211,27 @@ class TestClefRemoteBackbone(TrlTestCase):
         parser = TrlParser((ClefScriptArguments, DecisionConfig, ClefModelArguments))
         return clef_main(*parser.parse_args_and_config(["--config", path, *argv]))
 
+    def test_without_the_flag_the_script_refuses_the_package(self, tokenizer):
+        # The script's default, and the flag set to false: refused from the package's config.json, before training
+        folder = spark_package(self.tmp_dir, tokenizer)
+        for flag in ({"trust_remote_code": ...}, {"trust_remote_code": False}):
+            with pytest.raises(ValueError, match="trust_remote_code: true") as error:
+                self.run_config(self.write_config(folder, **flag))
+            assert folder in str(error.value) and "modeling_tinyspark.TinySparkForCausalLM" in str(error.value)
+        assert not Path(self.tmp_dir, "out").exists()
+
+    def test_package_with_a_base_model_is_loaded_as_that(self, tokenizer, capsys):
+        folder = spark_package(self.tmp_dir, tokenizer, with_base_model=True)
+        trainer = self.run_config(self.write_config(folder))
+        assert trainer.state.global_step == 2
+        assert type(trainer.model.model).__name__ == "TinySparkModel"
+        out = capsys.readouterr().out
+        # Its output has `last_hidden_state`: no submodule is needed
+        assert "backbone weights: direct, AutoModel of its own code" in out
+        assert "backbone_hidden_module" not in out and trainer.model.config.backbone_hidden_module is None
+        reloaded = AutoModelForDecision.from_pretrained(f"{self.tmp_dir}/out", trust_remote_code=True)
+        assert type(reloaded.model).__name__ == "TinySparkModel"
+
     @pytest.mark.parametrize("value", ["true", "1"])
     def test_flag_parses_from_the_command_line(self, tokenizer, value):
         from trl import TrlParser

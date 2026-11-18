@@ -44,10 +44,10 @@ from transformers import (  # noqa: E402
     set_seed,
 )
 
-from trl.experimental.decision import (  # noqa: E402
+from trl.experimental.decision import load_decision_backbone  # noqa: E402
+from trl.experimental.decision.backbone import (  # noqa: E402
     check_max_length,
     load_backbone,
-    load_decision_backbone,
     position_limit,
     remote_code_setting,
 )

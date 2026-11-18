@@ -196,7 +196,8 @@ rlcd_sigmas: [0.4, 0.3, 0.2, 0.1]
 example does. It takes the model name, `trust_remote_code` and the `from_pretrained` arguments, and returns a
 `DecisionBackbone`: the backbone (`model`), the table a joint head's `lm_head` starts from (`embeddings`, `None` for a
 backbone of its checkpoint's own code), where its weights came from (`weights`, a `BackboneWeights` that prints as
-`direct` or `prefix "backbone."` with the tensors it dropped), whether it attends causally (`causal`), the width of its
+`direct`, `prefix "backbone."`, or `direct, AutoModel of its own code` / `direct, AutoModelForCausalLM of its own code`,
+followed by the tensors it dropped), whether it attends causally (`causal`), the width of its
 hidden states (`hidden_size`) and the submodule they are read from when the backbone does not return them
 (`hidden_module`).
 
@@ -229,8 +230,11 @@ nothing prompts. Models of Transformers never run their checkpoint's code. Such 
 `AutoModel`, or else its `AutoModelForCausalLM` itself, loaded strictly without a prefix repair (`load_remote_backbone`),
 and `hidden_states_of` reads the width of its hidden states, and the submodule they come from, in one forward pass.
 `remote_code_setting` reconciles the setting with a `trust_remote_code` entry of `model_init_kwargs`, and
-`check_max_length` refuses a `max_length` beyond a learned table of absolute positions (`position_limit`) or warns above
-a rotary model's `max_position_embeddings`.
+`check_max_length` raises for a `max_length` beyond a learned table of absolute positions (`position_limit`), and returns
+a `"Warning: …"` string, for the caller to print, when it is above a rotary model's `max_position_embeddings` (else
+`None`). The package exports `load_decision_backbone`, `DecisionBackbone`, `BackboneWeights`, `is_causal` and
+`needs_remote_code`; the other functions named here are in `trl.experimental.decision.backbone`. The loader needs a
+Transformers build with Clef support.
 
 ## JEV
 
