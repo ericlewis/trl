@@ -440,6 +440,13 @@ class ClefScriptArguments(ScriptArguments):
     )
 
     mode: str = field(default="full", metadata={"help": "Train head, lora, or full model."})
+    head_learning_rate: float | None = field(
+        default=None,
+        metadata={
+            "help": "Learning rate of the head (every parameter outside the backbone). The backbone, with any LoRA "
+            "adapters, keeps learning_rate. Defaults to learning_rate."
+        },
+    )
     head_type: str | None = field(
         default=None,
         metadata={
@@ -943,6 +950,45 @@ def prepare_split(dataset, collator, training_args, desc):
     return tokenized, report
 
 
+def set_head_learning_rate(trainer, head_learning_rate):
+    """
+    Give the trainer the parameter groups of its optimizer, as the Jeva example does: the backbone (`base_model`, with
+    any LoRA adapters inside it) trains at `learning_rate` and everything else, the head, at `head_learning_rate`.
+    Zero-dimensional parameters (the cosine head's scale) are never decayed.
+    """
+    model, args = trainer.model, trainer.args
+    backbone_parameters = {id(parameter) for parameter in model.base_model.parameters()}
+    decay_parameters = trainer.get_decay_parameter_names(model)
+    parameter_groups = []
+    for backbone in (True, False):
+        for decay in (True, False):
+            parameters = [
+                parameter
+                for name, parameter in model.named_parameters()
+                if parameter.requires_grad
+                and (id(parameter) in backbone_parameters) == backbone
+                and (name in decay_parameters and parameter.dim() > 0) == decay
+            ]
+            if parameters:
+                parameter_groups.append(
+                    {
+                        "params": parameters,
+                        "lr": args.learning_rate if backbone else head_learning_rate,
+                        "weight_decay": args.weight_decay if decay else 0.0,
+                    }
+                )
+    optimizer_cls, optimizer_kwargs = trainer.get_optimizer_cls_and_kwargs(args, model)
+    try:
+        from transformers.trainer_optimizer import is_optimizer_factory
+    except ImportError:  # Transformers versions without optimizer factories
+        is_optimizer_factory = lambda optimizer_cls: False  # noqa: E731
+    # Optimizers that build their own parameter groups, or take the model, would drop these
+    if is_optimizer_factory(optimizer_cls) or {"params", "model", "optimizer_dict"} & set(optimizer_kwargs):
+        raise ValueError(f"head_learning_rate is not supported with the {args.optim} optimizer")
+    optimizer_kwargs["params"] = parameter_groups
+    trainer.optimizer_cls_and_kwargs = (optimizer_cls, optimizer_kwargs)
+
+
 @dataclass
 class ClefRun:
     """What `build_trainer` builds: the trainer, the LoRA backbone of `mode: lora` (else `None`), the build reports."""
@@ -1053,6 +1099,8 @@ def build_trainer(script_args, training_args, model_args) -> ClefRun:
         eval_data_collator=eval_collator,
         compute_metrics=compute_calibration_metrics,
     )
+    if script_args.head_learning_rate is not None:
+        set_head_learning_rate(trainer, script_args.head_learning_rate)
     if schedule is not None:
         trainer.add_callback(schedule)
     return ClefRun(trainer, lora_backbone, {"train": train_report, "eval": eval_report})

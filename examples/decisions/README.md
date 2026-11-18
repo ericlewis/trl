@@ -87,7 +87,7 @@ skipped (by reason) and records whose state was cut. The output folder is a comp
 |---|---|---|
 | `head_type` | `cosine` | The small cosine head: two projections score each option by its cosine with its question. `joint` selects Clef's original head, which is also what the script builds when no `head_type` is given. |
 | `mode` | `full` | Trains the backbone and the head. `head` freezes the backbone. `lora` puts adapters on the backbone and trains the head in full; it saves the merged model, with the adapter alone in `adapter/`. |
-| `learning_rate`, `head_learning_rate` | `1e-4`, `3e-4` | The head is new, so it trains faster than the backbone. |
+| `learning_rate`, `head_learning_rate` | `1e-4`, `3e-4` | The head is new, so it trains faster than the backbone. `head_learning_rate` is a setting of the script, as in the Jeva example, not of `DecisionConfig`: the script gives the trainer its parameter groups, the backbone (with any LoRA adapters) at `learning_rate` and the head at `head_learning_rate`, with zero-dimensional parameters never decayed. Unset, the trainer's default optimizer is used. |
 | `dtype`, `bf16` | `float32`, `true` | float32 weights under bf16 autocast, which KLM's fused CUDA kernels need. |
 | `truncation` | `state` | See [Long prompts](#long-prompts). |
 | `permute_fields` | `true` | Training batches reorder the questions of each record. Evaluation never does. |

@@ -46,6 +46,7 @@ from examples.decisions.clef_typed_decisions import (
     load_backbone,
     prepare_split,
     sample_rows,
+    set_head_learning_rate,
 )
 from examples.decisions.clef_typed_decisions import main as clef_main
 from transformers import (
@@ -1512,6 +1513,29 @@ class TestClefTraining(TrlTestCase):
         for name, value in reloaded.model.state_dict().items():
             torch.testing.assert_close(value.float(), merged[name].float())
 
+    # The groups of lora mode are checked in TestHeadLearningRate: main merges the adapters away after training
+    @pytest.mark.parametrize("mode", ["full", "head"])
+    def test_main_trains_the_head_at_head_learning_rate(self, tokenizer, mode):
+        trainer, _, _ = self.run_main(tokenizer, mode, script_kwargs={"head_learning_rate": 3e-3})
+        assert trainer.state.global_step == 5
+        # The optimizer the trainer built is the example's: the backbone at learning_rate (1e-3), the head at 3e-3
+        backbone = {id(parameter) for parameter in trainer.model.base_model.parameters()}
+        initial_lr = {
+            id(parameter): group["initial_lr"]
+            for group in trainer.optimizer.param_groups
+            for parameter in group["params"]
+        }
+        trainable = [parameter for parameter in trainer.model.parameters() if parameter.requires_grad]
+        assert len(initial_lr) == len(trainable)
+        assert {initial_lr[id(parameter)] for parameter in trainable if id(parameter) not in backbone} == {3e-3}
+        in_backbone = {initial_lr[id(parameter)] for parameter in trainable if id(parameter) in backbone}
+        assert in_backbone == (set() if mode == "head" else {1e-3})
+
+    def test_main_without_head_learning_rate_keeps_the_default_optimizer(self, tokenizer):
+        trainer, _, _ = self.run_main(tokenizer, "full")
+        assert trainer.optimizer_cls_and_kwargs is None
+        assert {group["initial_lr"] for group in trainer.optimizer.param_groups} == {1e-3}
+
     def build_from(self, folder, **script_kwargs):
         """The model the script builds from `folder`, with a tiny head."""
         script_args = ClefScriptArguments(
@@ -2003,6 +2027,82 @@ class TestEvaluationBatches(TrlTestCase):
                 build_trainer(ClefScriptArguments(), args, ClefModelArguments())
 
 
+def optimizer_settings(optimizer):
+    """The learning rate and weight decay of each parameter of an optimizer, by parameter id."""
+    lr = {id(p): group["lr"] for group in optimizer.param_groups for p in group["params"]}
+    wd = {id(p): group["weight_decay"] for group in optimizer.param_groups for p in group["params"]}
+    return lr, wd
+
+
+class TestHeadLearningRate(TrlTestCase):
+    """The parameter groups the example gives the trainer with `head_learning_rate`."""
+
+    @staticmethod
+    def model_for(mode, tokenizer, decision_config, head_type="joint"):
+        """The tiny Clef with the parameters each `mode` of the example trains."""
+        if mode == "lora":
+            return lora_clef(tokenizer, decision_config)
+        model = tiny_clef(tokenizer, decision_config, head_type=head_type)
+        if mode == "head":
+            model.model.requires_grad_(False)
+            model.lm_head.requires_grad_(False)
+        return model
+
+    def optimizer(self, tokenizer, decision_config, model, **kwargs):
+        trainer, _, _ = make_trainer(self.tmp_dir, tokenizer, decision_config, model=model, **kwargs)
+        set_head_learning_rate(trainer, 1e-3)
+        return trainer, trainer.create_optimizer()
+
+    @pytest.mark.parametrize("mode", ["full", "head", pytest.param("lora", marks=require_peft)])
+    def test_rates_by_mode(self, tokenizer, decision_config, mode):
+        model = self.model_for(mode, tokenizer, decision_config)
+        _, optimizer = self.optimizer(tokenizer, decision_config, model, learning_rate=1e-4, weight_decay=0.05)
+        lr, _ = optimizer_settings(optimizer)
+        trainable = {name: p for name, p in model.named_parameters() if p.requires_grad}
+        # Every trainable parameter once, and only those
+        assert len(lr) == len(trainable) == sum(len(group["params"]) for group in optimizer.param_groups)
+        backbone = {id(p) for p in model.base_model.parameters()}
+        head = [name for name, p in trainable.items() if id(p) not in backbone]
+        assert head and all(lr[id(trainable[name])] == 1e-3 for name in head)
+        in_backbone = [name for name, p in trainable.items() if id(p) in backbone]
+        assert all(lr[id(trainable[name])] == 1e-4 for name in in_backbone)
+        if mode == "full":
+            assert in_backbone
+        elif mode == "head":
+            assert not in_backbone
+        else:
+            # The adapters inside the backbone are its only trainable parameters, at learning_rate
+            assert in_backbone and all("lora_" in name for name in in_backbone)
+            assert {name.split(".")[0] for name in head} == {"embeddings", "encoder", "scorer"}
+
+    @pytest.mark.parametrize("head_type", ["joint", "cosine"])
+    def test_zero_dimensional_parameters_are_not_decayed(self, tokenizer, decision_config, head_type):
+        model = self.model_for("full", tokenizer, decision_config, head_type=head_type)
+        trainer, optimizer = self.optimizer(tokenizer, decision_config, model, learning_rate=1e-4, weight_decay=0.05)
+        _, wd = optimizer_settings(optimizer)
+        scalars = [p for p in model.parameters() if p.requires_grad and p.dim() == 0]
+        assert scalars and all(wd[id(p)] == 0.0 for p in scalars)
+        decayed = set(trainer.get_decay_parameter_names(model))
+        for name, p in model.named_parameters():
+            if p.requires_grad and p.dim() > 0:
+                assert wd[id(p)] == (0.05 if name in decayed else 0.0), name
+        assert any(value == 0.05 for value in wd.values())
+        # Backbone and head, each decayed and not
+        assert len(optimizer.param_groups) == 4
+
+    @pytest.mark.parametrize("kwarg", ["params", "model", "optimizer_dict"])
+    def test_optimizers_that_set_their_own_groups_are_refused(self, tokenizer, decision_config, kwarg, monkeypatch):
+        model = self.model_for("full", tokenizer, decision_config)
+        trainer, _, _ = make_trainer(self.tmp_dir, tokenizer, decision_config, model=model)
+        # As GaLore (params), LOMO (model) and the layer-wise optimizers (optimizer_dict) do
+        monkeypatch.setattr(
+            trainer, "get_optimizer_cls_and_kwargs", lambda args, model=None: (torch.optim.AdamW, {kwarg: None})
+        )
+        with pytest.raises(ValueError, match="head_learning_rate is not supported"):
+            set_head_learning_rate(trainer, 1e-3)
+        assert trainer.optimizer_cls_and_kwargs is None
+
+
 class TestClefBenchmark(TrlTestCase):
     """The benchmark runs the example's own training path and reports the numbers of the reference benchmark."""
 
@@ -2142,7 +2242,7 @@ class TestClefBenchmark(TrlTestCase):
         }
         script_args, training_args, model_args = parse_settings(settings)
         assert training_args.learning_rate == 1e-4 and isinstance(training_args.learning_rate, float)
-        assert training_args.head_learning_rate == 3e-4
+        assert script_args.head_learning_rate == 3e-4
         assert script_args.max_length == 64
         path = Path(self.tmp_dir, "settings.yaml")
         path.write_text("learning_rate: 1e-4\nmax_length: 64\n", encoding="utf-8")

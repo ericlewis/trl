@@ -30,17 +30,9 @@ class DecisionConfig(_BaseConfig):
             Arguments passed to [`~transformers.AutoModelForDecision.from_pretrained`] for a model identifier.
         remove_unused_columns (`bool`, *optional*, defaults to `False`):
             Retain the raw decision fields required by the collator.
-        head_learning_rate (`float`, *optional*):
-            Learning rate of every trainable parameter outside the model's backbone (`base_model`), such as a decision
-            head. The backbone, including any adapters inside it, keeps `learning_rate`. When unset, all parameters use
-            `learning_rate`.
     """
 
     _VALID_DICT_FIELDS = _BaseConfig._VALID_DICT_FIELDS + ["model_init_kwargs"]
 
     model_init_kwargs: dict[str, Any] | None = field(default=None, metadata={"help": "Model loading arguments."})
     remove_unused_columns: bool = field(default=False, metadata={"help": "Keep raw decision fields."})
-    head_learning_rate: float | None = field(
-        default=None,
-        metadata={"help": "Learning rate of the parameters outside the backbone. Defaults to learning_rate."},
-    )

@@ -50,7 +50,7 @@ from .decision_config import DecisionConfig
 
 
 if is_peft_available():
-    from peft import PeftModel, get_peft_model
+    from peft import get_peft_model
 
 
 logger = logging.get_logger(__name__)
@@ -281,49 +281,6 @@ class DecisionTrainer(_BaseTrainer):
             self.data_collator = collator
         self._splits_batches |= splits_batches(dataloader, self.accelerator.num_processes)
         return dataloader
-
-    def create_optimizer(self, model=None):
-        """
-        Set up the optimizer. With `head_learning_rate`, the parameters outside the backbone (`base_model`) train at
-        that rate and the backbone, including any adapters inside it, at `learning_rate`; zero-dimensional parameters
-        (scales, gates) are never decayed. Otherwise this is [`~transformers.Trainer.create_optimizer`].
-        """
-        if self.args.head_learning_rate is None or self.optimizer is not None:
-            return super().create_optimizer(model)
-        opt_model = self.model if model is None else model
-        unwrapped = self.accelerator.unwrap_model(opt_model)
-        if is_peft_available() and isinstance(unwrapped, PeftModel):
-            unwrapped = unwrapped.get_base_model()
-        backbone = {id(parameter) for parameter in unwrapped.base_model.parameters()}
-        if not backbone or len(backbone) == len(list(unwrapped.parameters())):
-            raise ValueError("head_learning_rate needs a model whose base_model is part of it, next to a head")
-        decay = set(self.get_decay_parameter_names(opt_model))
-        groups = {(in_backbone, decayed): [] for in_backbone in (True, False) for decayed in (True, False)}
-        for name, parameter in opt_model.named_parameters():
-            if parameter.requires_grad:
-                decayed = name in decay and parameter.dim() > 0
-                groups[id(parameter) in backbone, decayed].append(parameter)
-        param_groups = [
-            {
-                "params": parameters,
-                "weight_decay": self.args.weight_decay if decayed else 0.0,
-                "lr": self.args.learning_rate if in_backbone else self.args.head_learning_rate,
-            }
-            for (in_backbone, decayed), parameters in groups.items()
-            if parameters
-        ]
-        if self.optimizer_cls_and_kwargs is not None:
-            optimizer_cls, optimizer_kwargs = self.optimizer_cls_and_kwargs
-        else:
-            optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, opt_model)
-        try:
-            from transformers.trainer_optimizer import is_optimizer_factory
-        except ImportError:  # Transformers versions without optimizer factories
-            is_optimizer_factory = lambda optimizer_cls: False  # noqa: E731
-        if is_optimizer_factory(optimizer_cls) or {"params", "model", "optimizer_dict"} & set(optimizer_kwargs):
-            raise ValueError(f"head_learning_rate is not supported with the {self.args.optim} optimizer")
-        self.optimizer = optimizer_cls(param_groups, **optimizer_kwargs)
-        return self.optimizer
 
     def _get_num_items_in_batch(self, batch_samples, device):
         count = torch.tensor(sum(batch["labels"].shape[0] for batch in batch_samples), device=device)

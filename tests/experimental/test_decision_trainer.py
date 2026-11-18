@@ -63,9 +63,6 @@ REQUIRES_CLEF_TRAINING = (
 if HAS_CLEF_TRAINING:
     from transformers.models.clef.configuration_clef import CLEF_TEMPLATE
 
-    from .decision_clef_helpers import lora_clef, tiny_clef
-    from .decision_clef_helpers import make_trainer as make_clef_trainer
-
 if HAS_JEVA:
     from transformers import AutoModelForDecision, JevaForDecision
     from transformers import JevaConfig as JevaModelConfig
@@ -90,6 +87,40 @@ def classification_dataset(tokenizer):
 def make_classification_model():
     set_seed(42)
     return AutoModelForSequenceClassification.from_pretrained(MODEL_ID, num_labels=3, dtype=torch.float32)
+
+
+def jev_docstring_command():
+    """The command line of the docstring of `jev.py`, without `python examples/decisions/jev.py`."""
+    import shlex
+
+    import examples.decisions.jev as jev
+
+    command = " ".join(line.rstrip("\\ ") for line in jev.__doc__.splitlines() if line.strip()).split("jev.py", 1)
+    return shlex.split(command[1])
+
+
+@pytest.mark.parametrize("example", ["jeva_banking77", "clm_typed_decisions", "jev", "clef_typed_decisions"])
+def test_example_parsers_build(example):
+    # The parser each example's `__main__` block builds, on the configuration it is supplied with: no option may be
+    # defined twice (by the example and by `DecisionConfig`)
+    import importlib
+
+    from trl import ModelConfig, ScriptArguments, TrlParser
+
+    module = importlib.import_module(f"examples.decisions.{example}")
+    dataclass_types = {
+        "jeva_banking77": lambda: (module.JevaScriptArguments, DecisionConfig, module.JevaModelArguments),
+        "clm_typed_decisions": lambda: (module.ClmScriptArguments, DecisionConfig, module.ClmModelArguments),
+        "jev": lambda: (ScriptArguments, DecisionConfig, ModelConfig),
+        "clef_typed_decisions": lambda: (module.ClefScriptArguments, DecisionConfig, module.ClefModelArguments),
+    }[example]()
+    parser = TrlParser(dataclass_types)
+    if example == "jev":
+        args = jev_docstring_command()
+    else:
+        args = ["--config", os.path.join(os.path.dirname(module.__file__), f"{example}.yaml")]
+    parsed = parser.parse_args_and_config(args)
+    assert [type(value) for value in parsed] == list(dataclass_types)
 
 
 class TestDecisionTrainer(TrlTestCase):
@@ -872,106 +903,6 @@ class TestDataCollatorForDecisionRequests(TrlTestCase):
         collator = self.make_collator(tokenizer, per_question=True)
         with pytest.raises(ValueError, match="one prompt"):
             collator.prepare_request({"state": "s", "questions": THREE_QUESTIONS, "targets": THREE_TARGETS})
-
-
-def optimizer_settings(optimizer):
-    """The learning rate and weight decay of each parameter of an optimizer, by parameter id."""
-    lr = {id(p): group["lr"] for group in optimizer.param_groups for p in group["params"]}
-    wd = {id(p): group["weight_decay"] for group in optimizer.param_groups for p in group["params"]}
-    return lr, wd
-
-
-@pytest.mark.skipif(not HAS_CLEF_TRAINING, reason=REQUIRES_CLEF_TRAINING)
-class TestHeadLearningRate(TrlTestCase):
-    def clef_trainer(self, tokenizer, model, **kwargs):
-        from examples.decisions.clef_typed_decisions import clef_decision_config
-
-        trainer, _, _ = make_clef_trainer(self.tmp_dir, tokenizer, clef_decision_config(), model=model, **kwargs)
-        return trainer
-
-    def test_head_learning_rate_groups(self, tokenizer):
-        from examples.decisions.clef_typed_decisions import clef_decision_config
-
-        model = tiny_clef(tokenizer, clef_decision_config())
-        trainer = self.clef_trainer(tokenizer, model, head_learning_rate=1e-3, learning_rate=1e-4, weight_decay=0.05)
-        opt = trainer.create_optimizer()
-        lr, wd = optimizer_settings(opt)
-        backbone = {id(p) for p in model.base_model.parameters()}
-        assert backbone and any(i not in backbone for i in lr)
-        assert all(lr[i] == (1e-4 if i in backbone else 1e-3) for i in lr)
-        # Clef's scales and gate are zero-dimensional: never decayed
-        scalars = [p for p in model.parameters() if p.requires_grad and p.dim() == 0]
-        assert scalars
-        assert all(wd[id(p)] == 0.0 for p in scalars)
-        decayed = set(trainer.get_decay_parameter_names(model))
-        for name, p in model.named_parameters():
-            if p.requires_grad and p.dim() > 0:
-                assert wd[id(p)] == (0.05 if name in decayed else 0.0), name
-        assert any(value == 0.05 for value in wd.values())
-        assert len(lr) == sum(p.requires_grad for p in model.parameters())
-        assert len(opt.param_groups) == 4
-
-    def test_optimizer_unchanged_without_head_lr(self, tokenizer):
-        from examples.decisions.clef_typed_decisions import clef_decision_config
-        from transformers import Trainer
-
-        model = tiny_clef(tokenizer, clef_decision_config())
-        trainer = self.clef_trainer(tokenizer, model, learning_rate=1e-4, weight_decay=0.05)
-        assert trainer.args.head_learning_rate is None
-
-        def groups(optimizer):
-            return [
-                (sorted(id(p) for p in group["params"]), group["lr"], group["weight_decay"])
-                for group in optimizer.param_groups
-            ]
-
-        ours = groups(trainer.create_optimizer())
-        trainer.optimizer = None
-        reference = groups(Trainer.create_optimizer(trainer))
-        assert ours == reference
-
-    @require_peft
-    def test_head_lr_with_peft(self, tokenizer):
-        from examples.decisions.clef_typed_decisions import clef_decision_config
-
-        # Adapters inside the backbone of Clef, the head trained in full next to them
-        model = lora_clef(tokenizer, clef_decision_config())
-        trainer = self.clef_trainer(tokenizer, model, head_learning_rate=1e-3, learning_rate=1e-4)
-        lr, _ = optimizer_settings(trainer.create_optimizer())
-        trainable = {name: p for name, p in model.named_parameters() if p.requires_grad}
-        assert len(lr) == len(trainable)
-        lora = [name for name in trainable if "lora_" in name]
-        assert lora and all(lr[id(trainable[name])] == 1e-4 for name in lora)
-        head = [name for name in trainable if name.startswith(("embeddings.", "encoder.", "scorer."))]
-        assert head and all(lr[id(trainable[name])] == 1e-3 for name in head)
-        assert set(lora) | set(head) == set(trainable)
-
-        # The whole model wrapped by PEFT, the head in `modules_to_save`
-        from peft import LoraConfig
-
-        peft_config = LoraConfig(r=2, target_modules=["q_proj", "v_proj"], task_type="SEQ_CLS")
-        encoded = tokenizer(["A refund", "A delivery"])
-        trainer = DecisionTrainer(
-            model=make_classification_model(),
-            args=DecisionConfig(
-                output_dir=self.tmp_dir,
-                use_cpu=True,
-                bf16=False,
-                learning_rate=1e-4,
-                head_learning_rate=1e-3,
-                report_to="none",
-            ),
-            train_dataset=Dataset.from_dict({**encoded, "labels": [0, 1]}),
-            processing_class=tokenizer,
-            data_collator=DataCollatorWithPadding(tokenizer),
-            peft_config=peft_config,
-        )
-        lr, _ = optimizer_settings(trainer.create_optimizer())
-        trainable = {name: p for name, p in trainer.model.named_parameters() if p.requires_grad}
-        assert len(lr) == len(trainable)
-        for name, p in trainable.items():
-            assert lr[id(p)] == (1e-4 if "lora_" in name else 1e-3), name
-        assert any("score" in name for name in trainable)
 
 
 def naive_calibration_metrics(rows, bins=15, kl_weight=0.25, brier_weight=0.25, gold_labels=None):

@@ -233,9 +233,12 @@ default), a single number to select checkpoints with `metric_for_best_model: eva
 
 ## Head learning rate
 
-Set `head_learning_rate` to train the parameters outside the model's backbone (its `base_model`), such as a decision
-head, at their own rate while the backbone keeps `learning_rate`. Adapters inside the backbone train at
-`learning_rate`. Zero-dimensional parameters, such as logit scales and gates, are never decayed.
+`head_learning_rate` is a setting of the Jeva and Clef example scripts, not of `DecisionConfig`. Each script builds
+its optimizer's parameter groups itself after creating the trainer (with `get_decay_parameter_names`, handed over
+through `optimizer_cls_and_kwargs`): the head trains at `head_learning_rate` and the backbone, including any LoRA
+adapters inside it, at `learning_rate`. In the Clef example the backbone is the model's `base_model`, zero-dimensional
+parameters (such as the cosine head's scale) are never decayed, and an unset `head_learning_rate` leaves the trainer's
+default optimizer as it is. Do the same in your own script to train a head at its own rate.
 
 ## Distributed training
 
