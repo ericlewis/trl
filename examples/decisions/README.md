@@ -105,7 +105,8 @@ skipped (by reason) and records whose state was cut. The output folder is a comp
   Clef's ChatML prompt; an encoder (BERT, ModernBERT, UltraBERT, a reranker) reads its first token with a plain
   prompt. `global_pooling` (`last` or `first`) and `prompt_style` (`chatml` or `plain`) override that choice.
 
-Backbones are loaded strictly:
+Backbones are loaded strictly, by the library's `trl.experimental.decision.load_decision_backbone` (see the
+DecisionTrainer documentation):
 
 - Backbone weights are never newly initialised. A checkpoint's own code runs only with `trust_remote_code: true` (see
   [Backbones that need their own code](#backbones-that-need-their-own-code)).

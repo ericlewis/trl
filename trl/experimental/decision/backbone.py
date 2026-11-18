@@ -234,13 +234,13 @@ def check_per_layer_settings(name, config, revision=None):
 def load_backbone(name, config, model_kwargs, remote_code=False):
     """
     The backbone of a new head, the table its `lm_head` starts from, and where its weights came from: the base model of
-    a causal LM with its output embeddings, or a bidirectional encoder with its input embeddings. A checkpoint that only
-    registers a sequence classification class (a reranker) is loaded as that and unwrapped to its `base_model`.
+    a causal LM with its output embeddings, or a bidirectional encoder with its input embeddings. A checkpoint that
+    only registers a sequence classification class (a reranker) is loaded as that and unwrapped to its `base_model`.
 
     No weight of the backbone is newly initialised: when the checkpoint does not provide one under the names of the
-    loaded class, the backbone is read from its safetensors under the one key prefix that holds all of its weights
-    (see [`repair_backbone`]), or a `ValueError` is raised. The checkpoint's own code runs only with `remote_code`, for
-    a model that cannot be loaded without it (see [`load_remote_backbone`]).
+    loaded class, the backbone is read from its safetensors under the one key prefix that holds all of its weights (see
+    [`repair_backbone`]), or a `ValueError` is raised. The checkpoint's own code runs only with `remote_code`, for a
+    model that cannot be loaded without it (see [`load_remote_backbone`]).
     """
     if remote_code:
         return load_remote_backbone(name, config, model_kwargs)
@@ -282,9 +282,9 @@ def load_remote_backbone(name, config, model_kwargs):
     """
     The backbone of a new head on a model of its checkpoint's own code, loaded with that code: the class of its
     `auto_map` that a saved Clef model rebuilds, `AutoModel` when there is one, else `AutoModelForCausalLM`, used
-    itself as the backbone (not unwrapped). No weight is newly initialised: missing or mismatched weights raise, and
-    no other key prefix is looked for. There is no table for an `lm_head` (`None`): the lexical prior of the joint
-    head reads the backbone's own embeddings.
+    itself as the backbone (not unwrapped). No weight is newly initialised: missing or mismatched weights raise, and no
+    other key prefix is looked for. There is no table for an `lm_head` (`None`): the lexical prior of the joint head
+    reads the backbone's own embeddings.
     """
     from transformers import ClefConfig
 
@@ -312,8 +312,8 @@ def load_remote_backbone(name, config, model_kwargs):
 def hidden_states_of(backbone) -> tuple[int, str | None]:
     """
     The width of the final hidden states of a backbone of its checkpoint's own code, read from the model in one forward
-    pass of a few tokens, and the submodule they are the output of (`backbone_hidden_module`) when the backbone
-    returns neither `last_hidden_state` nor `hidden_states`, found with `ClefForDecision.find_backbone_hidden_module`.
+    pass of a few tokens, and the submodule they are the output of (`backbone_hidden_module`) when the backbone returns
+    neither `last_hidden_state` nor `hidden_states`, found with `ClefForDecision.find_backbone_hidden_module`.
     """
     from transformers import ClefForDecision
 
@@ -344,8 +344,8 @@ def hidden_states_of(backbone) -> tuple[int, str | None]:
 
 def position_limit(backbone) -> int | None:
     """
-    The longest sequence a backbone with a learned table of absolute positions (BERT, RoBERTa) can read, or `None`
-    when it has none (rotary or relative positions).
+    The longest sequence a backbone with a learned table of absolute positions (BERT, RoBERTa) can read, or `None` when
+    it has none (rotary or relative positions).
     """
     for name, module in backbone.named_modules():
         if name.split(".")[-1] == "position_embeddings" and isinstance(module, torch.nn.Embedding):
@@ -358,8 +358,9 @@ def position_limit(backbone) -> int | None:
 def check_max_length(backbone, text_config, max_length) -> str | None:
     """
     Refuse a `max_length` beyond the positions a backbone with a learned table of absolute positions can read (see
-    [`position_limit`]). Without such a table, return a warning when `max_length` is above the `max_position_embeddings`
-    of its config `text_config` (rotary models run past it, but a model may enforce it), else `None`.
+    [`position_limit`]). Without such a table, return a warning when `max_length` is above the
+    `max_position_embeddings` of its config `text_config` (rotary models run past it, but a model may enforce it), else
+    `None`.
     """
     model_type = text_config.model_type
     limit = position_limit(backbone)

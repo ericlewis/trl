@@ -144,7 +144,8 @@ def write_synthetic_recipe(folder: Path, records: int = SYNTHETIC_RECORDS) -> di
     under `folder`, and return the settings of the example that train a new Clef head on them.
     """
     folder = Path(folder)
-    tokenizer = AutoTokenizer.from_pretrained(SYNTHETIC_TOKENIZER)
+    # Explicit, so that a tokenizer whose repository ships code is never run nor asked about on stdin
+    tokenizer = AutoTokenizer.from_pretrained(SYNTHETIC_TOKENIZER, trust_remote_code=False)
     set_seed(0)
     config = Qwen2Config(
         vocab_size=len(tokenizer) + 2,

@@ -231,10 +231,10 @@ def cut_state(render, request, input_ids, marks, max_length) -> tuple[list[int],
 
     The template must render the state between `<|split|>` sentinels, so that the tokens before and after it do not
     depend on it: the request rendered with an empty state is exactly those tokens, and the prompt must start and end
-    with them (with its marks after the state), or this raises rather than cutting by guess. The state starts at the one
-    split of the prompt into that beginning, the state and that end. When several splits fit (the state begins with the
-    tokens that follow it, or ends with those before it), two renderings whose states differ in their first token tell
-    where it starts.
+    with them (with its marks after the state), or this raises rather than cutting by guess. The state starts at the
+    one split of the prompt into that beginning, the state and that end. When several splits fit (the state begins with
+    the tokens that follow it, or ends with those before it), two renderings whose states differ in their first token
+    tell where it starts.
     """
     empty, empty_marks, _ = render({**request, "state": ""})
     if len(empty) > max_length:

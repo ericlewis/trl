@@ -190,6 +190,48 @@ rlcd_start_epoch: 1
 rlcd_sigmas: [0.4, 0.3, 0.2, 0.1]
 ```
 
+## Loading a backbone
+
+`trl.experimental.decision.load_decision_backbone` loads the backbone of a new decision head in one call, as the Clef
+example does. It takes the model name, `trust_remote_code` and the `from_pretrained` arguments, and returns a
+`DecisionBackbone`: the backbone (`model`), the table a joint head's `lm_head` starts from (`embeddings`, `None` for a
+backbone of its checkpoint's own code), where its weights came from (`weights`, a `BackboneWeights` that prints as
+`direct` or `prefix "backbone."` with the tensors it dropped), whether it attends causally (`causal`), the width of its
+hidden states (`hidden_size`) and the submodule they are read from when the backbone does not return them
+(`hidden_module`).
+
+```python
+from transformers import ClefConfig, ClefForDecision
+
+from trl.experimental.decision import load_decision_backbone
+
+backbone = load_decision_backbone("MinimaLabs/KLM-1.6", model_kwargs={"dtype": "float32"})
+config = ClefConfig(
+    text_config=backbone.model.config,
+    backbone_hidden_size=backbone.hidden_size,
+    backbone_hidden_module=backbone.hidden_module,
+    head_type="cosine",
+)
+model = ClefForDecision(config, model=backbone.model)
+```
+
+No weight of the backbone is newly initialised. A causal LM gives its base model and its output embeddings; an
+encoder its input embeddings; a checkpoint that only registers a sequence classification class (a reranker) is
+unwrapped to its base model. When the checkpoint does not hold the weights under the names of the loaded class,
+`repair_backbone` reads them from its safetensors under the one key prefix that holds every one of them with its shape
+(a reranker package with `backbone.<name>` weights); none, or several, raise. `check_per_layer_settings` refuses
+per-layer `attention_windows` or `rope_theta` lists that Transformers' config would collapse into another
+architecture.
+
+A model whose type Transformers does not have (an `auto_map` in its `config.json`) is loaded with its own code only
+with `trust_remote_code=True`; otherwise `needs_remote_code` refuses it before any of that code is imported, and
+nothing prompts. Models of Transformers never run their checkpoint's code. Such a backbone is its package's
+`AutoModel`, or else its `AutoModelForCausalLM` itself, loaded strictly without a prefix repair (`load_remote_backbone`),
+and `hidden_states_of` reads the width of its hidden states, and the submodule they come from, in one forward pass.
+`remote_code_setting` reconciles the setting with a `trust_remote_code` entry of `model_init_kwargs`, and
+`check_max_length` refuses a `max_length` beyond a learned table of absolute positions (`position_limit`) or warns above
+a rotary model's `max_position_embeddings`.
+
 ## JEV
 
 JEV uses [Transformers #50586](https://github.com/huggingface/transformers/pull/50586). Use the
@@ -284,6 +326,18 @@ answers = decide(request)
     - prepare_request
     - prepare_targets
     - prepare_labeled_targets
+
+## load_decision_backbone
+
+[[autodoc]] experimental.decision.load_decision_backbone
+
+## DecisionBackbone
+
+[[autodoc]] experimental.decision.DecisionBackbone
+
+## BackboneWeights
+
+[[autodoc]] experimental.decision.BackboneWeights
 
 ## target_from_gold
 
