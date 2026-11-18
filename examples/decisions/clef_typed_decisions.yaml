@@ -35,13 +35,6 @@ head_type: cosine
 # rlcd_weight: 0.25
 # rlcd_start_epoch: 1
 # rlcd_sigmas: [0.4, 0.3, 0.2, 0.1]
-# Jev monitor (off by default): a judge behind a System One API is sent a digest of the evaluation metrics, never
-# training data, and its verdicts are recorded in <output_dir>/jev_monitor/ledger.jsonl. A preset's API key is read
-# from its environment variable (TYPESAFE_API_KEY, OPENROUTER_API_KEY); a URL is asked without a key. advise only
-# records; enforce may also stop training. It never changes saving or evaluation.
-# jev_monitor: typesafe
-# jev_monitor_model: jev-1.13.0
-# jev_monitor_mode: advise
 max_length: 2048
 # state cuts the end of an over-length record's state to fit, as Clef does, and skips records too long without it;
 # skip drops over-length records instead, and error stops at the first one

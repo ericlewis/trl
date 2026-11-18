@@ -173,26 +173,6 @@ rlcd_sigmas: [0.4, 0.3, 0.2, 0.1]
 - On a new head, `rlcd_weight` without `rlcd_start_epoch` or `rlcd_sigmas` runs RLCD from the first step and logs a
   warning.
 
-### Jev monitor
-
-`jev_monitor` (off by default) lets a judge model behind a System One API watch the run.
-
-```yaml
-jev_monitor: typesafe        # or openrouter, local, or an endpoint URL
-jev_monitor_model: jev-1.13.0
-jev_monitor_mode: advise     # enforce may also stop the run
-```
-
-- At each evaluation the judge is sent a digest of the evaluation metrics, never training data, from a background
-  thread that training never waits for.
-- A preset's API key is read from its environment variable (`TYPESAFE_API_KEY`, `OPENROUTER_API_KEY`). A URL is
-  asked without a key.
-- `advise` only records the verdicts, in `<output_dir>/jev_monitor/ledger.jsonl`.
-- `enforce` may also stop training on a NaN or infinite evaluation metric or on non-finite gradients, after saving
-  the model to `<output_dir>/monitor-stop-<step>`. The example adds no stop rules on the judge's answers; use
-  `JevMonitorCallback` directly for those.
-- The monitor never changes saving or evaluation.
-
 ### Timing training steps
 
 [`benchmark_clef.py`](benchmark_clef.py) times this training path. It builds the model, data and trainer with the

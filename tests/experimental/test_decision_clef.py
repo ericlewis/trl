@@ -43,7 +43,6 @@ from examples.decisions.clef_typed_decisions import (
     build_model,
     clef_decision_config,
     describe,
-    jev_monitor,
     load_backbone,
     prepare_split,
     sample_rows,
@@ -67,12 +66,10 @@ from transformers import (
 from trl.experimental.decision import (
     DecisionConfig,
     DecisionTrainer,
-    JevMonitorCallback,
     RlcdScheduleCallback,
     compute_calibration_metrics,
 )
 from trl.experimental.decision.decision_trainer import pack_rows, unpack_rows
-from trl.experimental.decision.jev_monitor import PRESETS
 
 from ..testing_utils import TrlTestCase, require_peft
 from .decision_clef_helpers import MODEL_ID, QUESTIONS, lora_clef, make_row, make_trainer, tiny_clef
@@ -1230,26 +1227,6 @@ class TestClefTraining(TrlTestCase):
             script_kwargs = {key: value, **({} if weight is None else {"rlcd_weight": weight})}
             with pytest.raises(ValueError, match="rlcd_weight"):
                 self.run_main(tokenizer, "full", script_kwargs=script_kwargs)
-
-    def test_jev_monitor_is_off_by_default_and_attached_when_set(self, tokenizer):
-        # No evaluation runs here, so nothing is ever sent to this (unreachable) endpoint
-        url = "http://127.0.0.1:9/v1/systemone"
-        script_kwargs = {"jev_monitor": url, "jev_monitor_model": "m"}
-        with pytest.raises(ValueError, match="jev_monitor_mode"):
-            self.run_main(tokenizer, "full", script_kwargs={**script_kwargs, "jev_monitor_mode": "stop"})
-        trainer, _, _ = self.run_main(tokenizer, "full", script_kwargs=script_kwargs)
-        (monitor,) = [cb for cb in trainer.callback_handler.callbacks if isinstance(cb, JevMonitorCallback)]
-        assert (monitor.mode, monitor.backend.url, monitor.backend.model, monitor.stop_when) == (
-            "advise",
-            url,
-            "m",
-            (),
-        )
-        assert monitor.backend.api_key_env is None
-        monitor = jev_monitor(ClefScriptArguments(jev_monitor="typesafe", jev_monitor_mode="enforce"))
-        assert (monitor.backend.url, monitor.backend.api_key_env) == PRESETS["typesafe"][::2]
-        assert monitor.mode == "enforce" and monitor.stop_when == ()
-        assert jev_monitor(ClefScriptArguments()) is None
 
     def test_sample_rows_draws_a_seeded_random_subset(self):
         dataset = Dataset.from_list([{"index": index} for index in range(100)])

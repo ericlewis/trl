@@ -15,7 +15,6 @@
 from .data_collator import DataCollatorForDecision, target_from_gold
 from .decision_config import DecisionConfig
 from .decision_trainer import DecisionTrainer
-from .jev_monitor import JevMonitorCallback, StopRule
 from .metrics import compute_calibration_metrics
 from .rlcd_schedule import RlcdScheduleCallback
 
@@ -24,9 +23,7 @@ __all__ = [
     "DataCollatorForDecision",
     "DecisionConfig",
     "DecisionTrainer",
-    "JevMonitorCallback",
     "RlcdScheduleCallback",
-    "StopRule",
     "compute_calibration_metrics",
     "target_from_gold",
 ]

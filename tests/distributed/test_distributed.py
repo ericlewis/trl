@@ -632,54 +632,6 @@ class TestDecisionRecordRows(TrlTestCase):
         assert single["train_steps"] == double["train_steps"] == 3
 
 
-@pytest.mark.skipif(find_spec("transformers.decision") is None, reason="Requires transformers.decision")
-class TestJevMonitorTwoProcesses(TrlTestCase):
-    """Two CPU processes under the Jev monitor in enforce mode: the stop is decided on rank 0 and broadcast."""
-
-    def run_processes(self, scenario):
-        # fmt: off
-        command = [
-            "torchrun", "--standalone", "--nproc_per_node", "2",
-            "tests/distributed/data/jev_monitor_enforce.py", self.tmp_dir, scenario,
-        ]
-        # fmt: on
-        # A rank left waiting in a broadcast fails the test instead of blocking it
-        result = subprocess.run(command, env=os.environ.copy(), cwd=ROOT, timeout=300)
-        assert result.returncode == 0
-        ranks = []
-        for rank in (0, 1):
-            with open(os.path.join(self.tmp_dir, f"rank{rank}.json")) as f:
-                ranks.append(json.load(f))
-        assert [r["world_size"] for r in ranks] == [2, 2]
-        records = []
-        with open(os.path.join(self.tmp_dir, "monitor0", "ledger.jsonl")) as f:
-            records = [json.loads(line) for line in f]
-        return ranks, records
-
-    def test_enforced_stop(self):
-        ranks, records = self.run_processes("stop")
-        # Evaluations at 2, 4, 6: the verdicts on 2 and 4 agree (patience 2), so both ranks stop at 6
-        assert [r["global_step"] for r in ranks] == [6, 6]
-        assert ranks[0]["judge_calls"] == [2, 4, 6] and ranks[1]["judge_calls"] == []
-        # Only rank 0 writes the ledger, intervened.json and the checkpoint
-        assert not os.path.exists(os.path.join(self.tmp_dir, "monitor1"))
-        assert [r["writes_checkpoints"] for r in ranks] == [True, False]
-        (intervened,) = [r for r in records if r["kind"] == "intervened"]
-        assert intervened["step"] == 6 and intervened["payload"]["reason"] == "rule"
-        with open(os.path.join(self.tmp_dir, "monitor0", "intervened.json")) as f:
-            assert json.load(f)["step"] == 6
-        checkpoint = Path(self.tmp_dir) / "monitor-stop-6"
-        assert any(p.suffix == ".safetensors" and p.stat().st_size > 0 for p in checkpoint.iterdir())
-
-    def test_checkpoint_check_error_on_rank_0(self):
-        ranks, records = self.run_processes("walk_error")
-        # Rank 0 cannot check the checkpoint: the stop is not enforced, and both ranks train to the end together
-        assert [r["global_step"] for r in ranks] == [12, 12]
-        assert any(r["kind"] == "error" and "PermissionError" in r["payload"]["error"] for r in records)
-        assert not any(r["kind"] == "intervened" for r in records)
-        assert not os.path.exists(os.path.join(self.tmp_dir, "monitor0", "intervened.json"))
-
-
 @require_torch_multi_accelerator
 class TestModelParallel:
     def test_fused_lm_head(self):
