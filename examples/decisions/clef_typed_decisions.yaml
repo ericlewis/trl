@@ -12,6 +12,10 @@ output_dir: output/clef-typed-decisions
 dtype: float32
 # attn_implementation (e.g. flash_attention_2) switches the backbone (only) to flash attention
 # attn_implementation: flash_attention_2
+# A backbone that exists only as code in its repository (an auto_map for a model type Transformers does not have) is
+# refused unless trust_remote_code is true; read its code first. Raise a context it enforces through its config, e.g.:
+# trust_remote_code: true
+# model_init_kwargs: {max_seq_len: 2048, max_position_embeddings: 2048}
 mode: full
 # The head of a new model. cosine: two small projections (cosine_width, cosine_initial_scale) score each option by its
 # cosine with its question; far fewer parameters than the joint head and faster steps. joint: Clef's original head, the

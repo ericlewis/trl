@@ -1806,7 +1806,7 @@ class TestClefTraining(TrlTestCase):
         for name, value in initial.model.state_dict().items():
             assert torch.equal(value, expected[name]), name
 
-    def test_remote_code_is_never_executed(self, tokenizer, capsys):
+    def test_code_of_a_native_model_type_is_never_executed(self, tokenizer, capsys):
         import sys
 
         tokenizer = ultrabert_tokenizer(tokenizer)
@@ -1826,8 +1826,15 @@ class TestClefTraining(TrlTestCase):
         assert 'backbone weights: prefix "backbone."' in capsys.readouterr().out
         assert not sentinel.exists()
         assert not any("modeling_reranker" in name or "configuration_ultrabert." in name for name in sys.modules)
-        # Asking for remote code is refused rather than ignored
-        with pytest.raises(ValueError, match="remote code"):
+        # Its model type is one of Transformers': trust_remote_code still loads it with Transformers' own classes
+        capsys.readouterr()
+        shutil.rmtree(f"{self.tmp_dir}/out")  # its files would be read as rows of the dataset folder
+        trainer, _, _ = self.run_main(tokenizer, "full", checkpoint=folder, trust_remote_code=True)
+        assert trainer.state.global_step == 5
+        assert 'backbone weights: prefix "backbone."' in capsys.readouterr().out
+        assert not sentinel.exists()
+        # The flag in model_init_kwargs must agree with the setting
+        with pytest.raises(ValueError, match="model_init_kwargs sets trust_remote_code"):
             remote = {"model_init_kwargs": {"trust_remote_code": True}}
             self.run_main(tokenizer, "full", checkpoint=folder, training_kwargs=remote)
         assert not sentinel.exists()
@@ -2367,3 +2374,340 @@ class TestClefBenchmark(TrlTestCase):
         assert written["global_steps"] == 2 and written["window_steps"] == 1
         assert written["recipe"]["startup_origin"] in {"process creation", "benchmark module import"}
         assert json.loads(capsys.readouterr().out.strip().splitlines()[-1]) == written
+
+
+# A package like `MinimaLabs/min-spark-1.7`: a causal language model and nothing else in its `auto_map` (no `AutoModel`),
+# whose inner model is a plain `nn.Module`, whose `forward` takes no `**kwargs` nor `position_ids` and never returns
+# hidden states (they are the output of `model.final_norm`), whose config has `dim` and no `hidden_size`, and whose
+# context (`max_seq_len`) is enforced with a `ValueError` and can be raised by a config value at load
+SPARK_PACKAGE = {
+    # docstyle-ignore
+    "configuration_tinyspark.py": """
+        from transformers import PretrainedConfig
+
+
+        class TinySparkConfig(PretrainedConfig):
+            model_type = "tinyspark"
+
+            def __init__(
+                self, vocab_size=32, dim=24, n_layers=2, max_seq_len=256, max_position_embeddings=256, **kwargs
+            ):
+                self.vocab_size = vocab_size
+                self.dim = dim
+                self.n_layers = n_layers
+                self.max_seq_len = max_seq_len
+                self.max_position_embeddings = max_position_embeddings
+                self.tie_word_embeddings = True
+                super().__init__(**kwargs)
+    """,
+    # docstyle-ignore
+    "core.py": """
+        import torch
+        from torch import nn
+
+
+        class Core(nn.Module):
+            def __init__(self, config):
+                super().__init__()
+                self.embed = nn.Embedding(config.vocab_size, config.dim)
+                self.layers = nn.ModuleList(nn.Linear(config.dim, config.dim) for _ in range(config.n_layers))
+                self.final_norm = nn.LayerNorm(config.dim)
+
+            def forward(self, tokens, return_hidden=False):
+                x = self.embed(tokens)
+                length = tokens.shape[1]
+                causal = torch.ones(length, length, device=x.device).tril()
+                causal = causal / causal.sum(-1, keepdim=True)  # the mean of the tokens so far
+                for layer in self.layers:
+                    x = x + torch.tanh(layer(causal @ x))
+                x = self.final_norm(x)
+                return x if return_hidden else nn.functional.linear(x, self.embed.weight)
+    """,
+    # docstyle-ignore
+    "modeling_tinyspark.py": """
+        from torch import nn
+        from transformers import PreTrainedModel
+        from transformers.generation import GenerationMixin
+        from transformers.modeling_outputs import BaseModelOutput, CausalLMOutputWithPast
+
+        from .configuration_tinyspark import TinySparkConfig
+        from .core import Core
+
+
+        class TinySparkPreTrainedModel(PreTrainedModel):
+            config_class = TinySparkConfig
+            base_model_prefix = "model"
+            supports_gradient_checkpointing = False
+            _no_split_modules = []
+
+            def __init__(self, config):
+                super().__init__(config)
+                self.model = Core(config)
+                self.post_init()
+
+            def _init_weights(self, module):
+                pass
+
+            def get_input_embeddings(self):
+                return self.model.embed
+
+            def set_input_embeddings(self, value):
+                self.model.embed = value
+
+            def check(self, input_ids, attention_mask):
+                if input_ids.shape[1] > self.config.max_seq_len:
+                    raise ValueError(f"sequence of {input_ids.shape[1]} tokens exceeds max_seq_len")
+                if attention_mask is not None and (~attention_mask.bool()[:, 0]).any():
+                    raise ValueError("left-padded batches are not supported")
+
+
+        class TinySparkForCausalLM(TinySparkPreTrainedModel, GenerationMixin):
+            def get_output_embeddings(self):
+                return self.model.embed
+
+            def forward(self, input_ids, attention_mask=None, labels=None, use_cache=None, return_dict=True):
+                self.check(input_ids, attention_mask)
+                logits = self.model(input_ids)
+                loss = None
+                if labels is not None:
+                    loss = nn.functional.cross_entropy(logits[:, :-1].flatten(0, 1), labels[:, 1:].flatten())
+                return CausalLMOutputWithPast(loss=loss, logits=logits, hidden_states=None)
+
+
+        class TinySparkModel(TinySparkPreTrainedModel):
+            def forward(self, input_ids, attention_mask=None):
+                self.check(input_ids, attention_mask)
+                return BaseModelOutput(last_hidden_state=self.model(input_ids, return_hidden=True))
+    """,
+}
+SPARK_AUTO_MAP = {
+    "AutoConfig": "configuration_tinyspark.TinySparkConfig",
+    "AutoModelForCausalLM": "modeling_tinyspark.TinySparkForCausalLM",
+}
+# What the package's own limit becomes: above the length of the prompts of `make_row` (about 280 tokens)
+RAISED_CONTEXT = {"max_seq_len": 512, "max_position_embeddings": 512}
+
+
+def spark_package(directory, tokenizer, with_base_model=False) -> str:
+    """
+    The code, `config.json`, random weights and tokenizer of the package in a new folder of `directory`, written
+    without importing its code. Its name is new, and so is the name of its dynamic module.
+    """
+    import textwrap
+
+    from safetensors.torch import save_file
+
+    folder = tempfile.mkdtemp(prefix="tinyspark_", dir=directory)
+    for name, code in SPARK_PACKAGE.items():
+        Path(folder, name).write_text(textwrap.dedent(code).lstrip(), encoding="utf-8")
+    auto_map = {**SPARK_AUTO_MAP, **({"AutoModel": "modeling_tinyspark.TinySparkModel"} if with_base_model else {})}
+    vocab_size, dim = len(tokenizer), 24
+    config = {"model_type": "tinyspark", "auto_map": auto_map, "vocab_size": vocab_size, "dim": dim, "n_layers": 2}
+    config["architectures"] = ["TinySparkForCausalLM"]
+    Path(folder, "config.json").write_text(json.dumps(config), encoding="utf-8")
+    generator = torch.Generator().manual_seed(0)
+    tensors = {"model.embed.weight": torch.randn(vocab_size, dim, generator=generator) * 0.5}
+    for index in range(2):
+        tensors[f"model.layers.{index}.weight"] = torch.randn(dim, dim, generator=generator) * 0.5
+        tensors[f"model.layers.{index}.bias"] = torch.randn(dim, generator=generator) * 0.5
+    tensors["model.final_norm.weight"] = torch.ones(dim)
+    tensors["model.final_norm.bias"] = torch.zeros(dim)
+    save_file(tensors, f"{folder}/model.safetensors", metadata={"format": "pt"})
+    tokenizer.save_pretrained(folder)
+    return folder
+
+
+def package_modules(folder) -> list[str]:
+    """The imported modules of the package in `folder`: its dynamic module, under the name of the folder."""
+    import sys
+
+    return [module for module in sys.modules if Path(folder).name in module]
+
+
+class TestClefRemoteBackbone(TrlTestCase):
+    """A head on a backbone that exists only as code in its repository, which runs only with `trust_remote_code`."""
+
+    def write_config(self, folder, **settings) -> str:
+        """A config file of the example on `folder` and a tiny dataset, as a user would write it."""
+        import yaml
+
+        rows = [make_row(index) for index in range(12)]
+        Path(self.tmp_dir, "data").mkdir(exist_ok=True)
+        with open(f"{self.tmp_dir}/data/train.jsonl", "w") as file:
+            for row in rows:
+                file.write(json.dumps({key: json.dumps(value) for key, value in row.items()}) + "\n")
+        config = {
+            "model_name_or_path": folder,
+            "dataset_name": f"{self.tmp_dir}/data",
+            "dataset_config": None,
+            "validation_fraction": 0.25,
+            "dtype": "float32",
+            "mode": "full",
+            "head_type": "cosine",
+            "max_length": 400,
+            "truncation": "skip",
+            "permute_fields": True,
+            "output_dir": f"{self.tmp_dir}/out",
+            "use_cpu": True,
+            "bf16": False,
+            "gradient_checkpointing": False,
+            "max_steps": 2,
+            "learning_rate": 1e-3,
+            "per_device_train_batch_size": 2,
+            "per_device_eval_batch_size": 2,
+            "eval_strategy": "no",
+            "save_strategy": "no",
+            "report_to": "none",
+            "trust_remote_code": 1,
+            "model_init_kwargs": RAISED_CONTEXT,
+            **settings,
+        }
+        if config["head_type"] == "joint":
+            config.update(
+                head_hidden_size=16,
+                head_intermediate_size=32,
+                head_num_layers=1,
+                head_num_evidence_layers=1,
+                head_num_attention_heads=2,
+            )
+        config = {key: value for key, value in config.items() if value is not ...}
+        path = Path(self.tmp_dir, f"config-{len(list(Path(self.tmp_dir).glob('config-*')))}.yaml")
+        path.write_text(yaml.safe_dump(config), encoding="utf-8")
+        return str(path)
+
+    @staticmethod
+    def run_config(path, *argv):
+        from trl import TrlParser
+
+        parser = TrlParser((ClefScriptArguments, DecisionConfig, ClefModelArguments))
+        return clef_main(*parser.parse_args_and_config(["--config", path, *argv]))
+
+    def test_without_the_flag_nothing_of_the_package_is_imported(self, tokenizer):
+        folder = spark_package(self.tmp_dir, tokenizer)
+        for flag in ({"trust_remote_code": ...}, {"trust_remote_code": False}):
+            with pytest.raises(ValueError, match="trust_remote_code: true") as error:
+                self.run_config(self.write_config(folder, **flag))
+            assert folder in str(error.value) and "modeling_tinyspark.TinySparkForCausalLM" in str(error.value)
+            assert not package_modules(folder)
+        assert not Path(self.tmp_dir, "out").exists()
+
+    def test_flag_in_model_init_kwargs_must_agree(self, tokenizer):
+        folder = spark_package(self.tmp_dir, tokenizer)
+        kwargs = {**RAISED_CONTEXT, "trust_remote_code": False}
+        with pytest.raises(ValueError, match="model_init_kwargs sets trust_remote_code"):
+            self.run_config(self.write_config(folder, model_init_kwargs=kwargs))
+        # The same value, in both places, is accepted: it is taken out of the kwargs
+        model_args = ClefModelArguments(model_name_or_path=folder, trust_remote_code=True)
+        script_args = ClefScriptArguments(head_type="cosine")
+        model = build_model(script_args, model_args, {"dtype": "float32", "trust_remote_code": True})
+        assert type(model.model).__name__ == "TinySparkForCausalLM"
+        assert package_modules(folder)  # what the test without the flag looks for
+
+    @pytest.mark.parametrize("value", ["true", "1"])
+    def test_flag_parses_from_the_command_line(self, tokenizer, value):
+        from trl import TrlParser
+
+        parser = TrlParser((ClefScriptArguments, DecisionConfig, ClefModelArguments))
+        argv = ["--output_dir", self.tmp_dir, "--trust_remote_code", value]
+        *_, model_args = parser.parse_args_and_config(argv)
+        assert model_args.trust_remote_code is True
+        assert ClefModelArguments().trust_remote_code is False
+
+    @pytest.mark.parametrize("head_type", ["cosine", "joint"])
+    def test_trains_saves_answers_and_runs_rlcd_after(self, tokenizer, head_type, capsys):
+        folder = spark_package(self.tmp_dir, tokenizer)
+        trainer = self.run_config(self.write_config(folder, head_type=head_type))
+        assert trainer.state.global_step == 2
+        out = capsys.readouterr().out
+        assert (
+            f"Clef setup: causal backbone (tinyspark), global_pooling=last, prompt_style=chatml, head_type={head_type}, "
+            "backbone_hidden_module=model.final_norm, backbone weights: direct, AutoModelForCausalLM of its own code"
+        ) in out
+        model = trainer.model
+        # The causal language model is the backbone itself, its width read from the model, and no lm_head is added
+        assert type(model.model).__name__ == "TinySparkForCausalLM"
+        assert model.config.backbone_hidden_size == 24 and not hasattr(model, "lm_head")
+        # Saved with its code, and loaded again only with the flag
+        output = f"{self.tmp_dir}/out"
+        for name in SPARK_PACKAGE:
+            assert Path(output, name).is_file(), name
+        with pytest.raises(ValueError, match="trust_remote_code=True"):
+            AutoModelForDecision.from_pretrained(output)
+        reloaded = AutoModelForDecision.from_pretrained(output, trust_remote_code=True)
+        collator = DataCollatorForClef(tokenizer, model.decision_config)
+        assert max_logit_difference(reloaded, model, collator([make_row(index) for index in range(2)])) == 0.0
+        decide = pipeline("decision", model=output, trust_remote_code=True, device="cpu")
+        answers = decide({"state": "ticket 3: refund alpha", "questions": QUESTIONS})
+        assert set(answers) == set(QUESTIONS)
+        # RLCD after cross-entropy: a second run from the saved model, with a schedule of noise scales
+        config = self.write_config(
+            output, head_type=head_type, output_dir=f"{self.tmp_dir}/rlcd", rlcd_weight=0.25, rlcd_sigmas=[0.4, 0.3]
+        )
+        trainer = self.run_config(config)
+        assert trainer.state.global_step == 2
+        assert "backbone weights: Clef checkpoint" in capsys.readouterr().out
+        assert trainer.model.config.rlcd_weight == 0.25
+        assert AutoModelForDecision.from_pretrained(f"{self.tmp_dir}/rlcd", trust_remote_code=True)
+        # The benchmark builds the same run from the saved model
+        if head_type == "cosine":
+            import yaml
+            from examples.decisions.benchmark_clef import run_benchmark
+
+            summary = run_benchmark(yaml.safe_load(Path(config).read_text()), steps=2, warmup_steps_excluded=0)
+            assert summary["global_steps"] == 2 and summary["recipe"]["backbone"] == "TinySparkForCausalLM"
+
+    def test_raised_context_is_saved_and_loads_again(self, tokenizer, capsys):
+        folder = spark_package(self.tmp_dir, tokenizer)
+        # Every prompt is longer than the package's own limit: a warning at start-up, then the model refuses
+        with pytest.raises(ValueError, match="exceeds max_seq_len"):
+            self.run_config(self.write_config(folder, model_init_kwargs={}))
+        assert "above the max_position_embeddings of the tinyspark backbone (256)" in capsys.readouterr().out
+        # Raised through model_init_kwargs: it trains, and the saved model has the same context
+        trainer = self.run_config(self.write_config(folder))
+        assert trainer.state.global_step == 2
+        assert "max_position_embeddings" not in capsys.readouterr().out
+        saved = json.loads(Path(self.tmp_dir, "out", "config.json").read_text(encoding="utf-8"))["text_config"]
+        assert (saved["max_seq_len"], saved["max_position_embeddings"]) == (512, 512)
+        decide = pipeline("decision", model=f"{self.tmp_dir}/out", trust_remote_code=True, device="cpu")
+        assert decide.model.config.text_config.max_seq_len == 512
+        row = make_row(0)
+        prompt = DataCollatorForClef(tokenizer, decide.model.decision_config).tokenize(row)
+        assert len(prompt["input_ids"]) > 256
+        assert set(decide({"state": row["state"], "questions": row["questions"]})) == set(row["questions"])
+
+    def test_activation_checkpointing_stops_at_start_up(self, tokenizer, monkeypatch):
+        from examples.decisions import clef_typed_decisions
+
+        folder = spark_package(self.tmp_dir, tokenizer)
+
+        def trainer(*args, **kwargs):
+            raise AssertionError("the trainer was built")
+
+        monkeypatch.setattr(clef_typed_decisions, "DecisionTrainer", trainer)
+        for settings in (
+            {"activation_checkpointing": True, "gradient_checkpointing": ...},
+            {"gradient_checkpointing": True},
+        ):
+            with pytest.raises(ValueError, match="activation_checkpointing.*TinySparkForCausalLM"):
+                self.run_config(self.write_config(folder, **settings))
+
+    def test_package_with_a_base_model_is_loaded_as_that(self, tokenizer, capsys):
+        folder = spark_package(self.tmp_dir, tokenizer, with_base_model=True)
+        trainer = self.run_config(self.write_config(folder))
+        assert trainer.state.global_step == 2
+        assert type(trainer.model.model).__name__ == "TinySparkModel"
+        out = capsys.readouterr().out
+        # Its output has `last_hidden_state`: no submodule is needed
+        assert "backbone weights: direct, AutoModel of its own code" in out
+        assert "backbone_hidden_module" not in out and trainer.model.config.backbone_hidden_module is None
+        reloaded = AutoModelForDecision.from_pretrained(f"{self.tmp_dir}/out", trust_remote_code=True)
+        assert type(reloaded.model).__name__ == "TinySparkModel"
+
+    def test_missing_weights_raise_without_a_repair(self, tokenizer):
+        from safetensors.torch import load_file, save_file
+
+        folder = spark_package(self.tmp_dir, tokenizer)
+        tensors = load_file(f"{folder}/model.safetensors")
+        save_file({f"backbone.{key}": value for key, value in tensors.items()}, f"{folder}/model.safetensors")
+        with pytest.raises(ValueError, match="not looked for under another key prefix"):
+            self.run_config(self.write_config(folder))

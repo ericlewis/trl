@@ -104,11 +104,16 @@ override that choice. `head_type` picks the head of a new model: `cosine` (with 
 `cosine_initial_scale`), the small cosine head that the example's configuration trains, or `joint`, Clef's original
 head and the model's own default; the script prints the resolved setup at start-up. UltraBERT (`model_type: ultrabert`) is such an encoder; its
 tokenizer has no `[CLS]`, so the plain prompt starts with its `<|endoftext|>` and ends with its `<|sep|>`. The script
-never newly initialises backbone weights and never runs remote code (`trust_remote_code` is refused): a checkpoint that
-stores its backbone under a key prefix, such as a remote-code reranker package with `backbone.<name>` weights, has its
-backbone read from its safetensors under the one prefix that holds every weight with its shape, its other tensors
-dropped, and the start-up line names the source (`direct` or `prefix "backbone."`) and the dropped tensors. Weights
-that no single prefix provides, or several prefixes that each do, raise a `ValueError`; so do per-layer
+never newly initialises backbone weights, and runs a checkpoint's own code only with `trust_remote_code: true`, for a
+model whose type Transformers does not have (otherwise it is refused before any of its code is imported; models of
+Transformers never run their checkpoint's code). Such a backbone is its package's `AutoModel`, or else its
+`AutoModelForCausalLM` used itself as the backbone, loaded strictly (no key prefix is looked for), with the width of
+its hidden states read from the model and its `backbone_hidden_module` found when it returns no hidden states; the saved model
+loads again with `trust_remote_code=True`. A checkpoint that stores its backbone under a key prefix, such as a
+remote-code reranker package with `backbone.<name>` weights, has its backbone read from its safetensors under the one
+prefix that holds every weight with its shape, its other tensors dropped, and the start-up line names the source
+(`direct` or `prefix "backbone."`) and the dropped tensors. Weights that no single prefix provides, or several prefixes
+that each do, raise a `ValueError`; so do per-layer
 `attention_windows` or `rope_theta` lists in such a package's `config.json` that differ within a kind of layer, which
 Transformers' UltraBERT config would read as one value per kind. `max_train_samples` limits the training split to a
 random sample drawn with `seed`, not to its first rows; the evaluation holdout and `max_eval_samples` are drawn with

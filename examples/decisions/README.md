@@ -105,7 +105,8 @@ skipped (by reason) and records whose state was cut. The output folder is a comp
 
 Backbones are loaded strictly:
 
-- Backbone weights are never newly initialised, and remote code is never run.
+- Backbone weights are never newly initialised. A checkpoint's own code runs only with `trust_remote_code: true` (see
+  [Backbones that need their own code](#backbones-that-need-their-own-code)).
 - A package that keeps its backbone under one prefix (a reranker with `backbone.<name>` weights next to its task
   head) has the backbone read from that prefix and its other tensors dropped. The start-up line says which
   (`backbone weights: prefix "backbone."` or `direct`). Missing weights, or several candidate prefixes, raise.
@@ -113,8 +114,35 @@ Backbones are loaded strictly:
   of layer; any other list raises rather than change the architecture.
 
 `attn_implementation` (for example a flash-attention kernel) is applied to the backbone only, for a new head and for
-a checkpoint alike. Of the `model_init_kwargs`, `dtype`, `revision` and `attn_implementation` carry over to a new
-model; any other raises.
+a checkpoint alike. Every `model_init_kwargs` entry reaches the `from_pretrained` of the backbone of a new head, which
+the model is built around as it was loaded. For a Clef checkpoint, an entry that sets a value of its backbone's saved
+config must match it: the saved value is used, and changing it raises.
+
+### Backbones that need their own code
+
+A model that exists only as code in its repository (an `auto_map` in its `config.json` for a model type that
+Transformers does not have) needs `trust_remote_code: true`, in the config file or on the command line
+(`--trust_remote_code true`). It is off by default: such a model is refused with a message that names it, before any of
+its code is imported, and nothing ever prompts. Models of Transformers, reranker packages included, are loaded with
+Transformers' own classes with or without the setting. `trust_remote_code` in `model_init_kwargs` must agree with it.
+
+With the setting, the backbone is the package's `AutoModel` when its `auto_map` has one, else its
+`AutoModelForCausalLM`, used itself as the backbone. A package with a causal LM and no masked LM is causal (`last`
+pooling, ChatML prompt). Its weights load strictly, without the prefix repair above. The width of its hidden states is
+read from the model, and when it returns no hidden states the submodule that gives them is found and shown on the
+start-up line (`backbone_hidden_module=...`). A backbone that does not support activation checkpointing stops at
+start-up when `activation_checkpointing` (or `gradient_checkpointing`) is on.
+
+The saved model, with the package's code next to it when the backbone came from a local folder, loads again only with
+the flag: `AutoModelForDecision.from_pretrained(output_dir, trust_remote_code=True)` or
+`pipeline("decision", model=output_dir, trust_remote_code=True)`, and so does a second run of the example from it (the
+RLCD phase) with `trust_remote_code: true`.
+
+A context the package enforces can be raised where its config allows it, through `model_init_kwargs`, for example
+`model_init_kwargs: {max_seq_len: 2048, max_position_embeddings: 2048}`. The values are saved in the model's
+`text_config`, so the model loaded again has the same context. When `max_length` is above the backbone's
+`max_position_embeddings` and it has no learned position table, the start-up prints a warning rather than an error,
+since rotary models run past that value.
 
 ### Long prompts
 
