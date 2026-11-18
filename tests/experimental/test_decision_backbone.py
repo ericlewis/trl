@@ -45,6 +45,7 @@ from transformers import (  # noqa: E402
 )
 
 from trl.experimental.decision import (  # noqa: E402
+    check_max_length,
     load_backbone,
     load_decision_backbone,
     position_limit,
@@ -118,7 +119,10 @@ class TestStrictLoading(TrlTestCase):
         bases = {kind: parameters["rope_theta"] for kind, parameters in config.rope_parameters.items()}
         assert bases == {"sliding_attention": 1234.0, "full_attention": 98765.0}
         assert (loaded.causal, loaded.hidden_size, loaded.hidden_module) == (False, 32, None)
-        assert str(loaded.weights) == f'prefix "backbone." (dropped 3 non-backbone tensors: {", ".join(sorted(PAIR_HEAD))})'
+        assert (
+            str(loaded.weights)
+            == f'prefix "backbone." (dropped 3 non-backbone tensors: {", ".join(sorted(PAIR_HEAD))})'
+        )
 
     def test_sharded_reranker_package_backbone_is_loaded(self, tokenizer):
         from safetensors.torch import save_file
@@ -264,14 +268,30 @@ class TestStrictLoading(TrlTestCase):
         set_seed(0)
         backbone = BertModel(BertConfig(**sizes, num_attention_heads=2, max_position_embeddings=128))
         assert position_limit(backbone) == 128
-        assert position_limit(AutoModel.from_pretrained(MODEL_ID)) is None  # rotary positions
+        rotary = AutoModel.from_pretrained(MODEL_ID)
+        assert position_limit(rotary) is None  # rotary positions
+        # Beyond the table: refused; beyond a rotary model's max_position_embeddings: a warning
+        assert check_max_length(backbone, backbone.config, 128) is None
+        with pytest.raises(ValueError, match="at most 128 positions; set max_length to 128 or less"):
+            check_max_length(backbone, backbone.config, 129)
+        limit = rotary.config.max_position_embeddings
+        assert check_max_length(rotary, rotary.config, limit) is None
+        warning = check_max_length(rotary, rotary.config, limit + 1)
+        assert warning.startswith(f"Warning: max_length is {limit + 1} tokens, above the max_position_embeddings")
 
 
 class TestRemoteCode(TrlTestCase):
     """A backbone that exists only as code in its repository, which runs only with `trust_remote_code`."""
 
-    def test_without_the_flag_nothing_of_the_package_is_imported(self, tokenizer):
+    def test_without_the_flag_nothing_of_the_package_is_imported(self, tokenizer, monkeypatch):
         folder = spark_package(self.tmp_dir, tokenizer)
+
+        def from_pretrained(*args, **kwargs):
+            raise AssertionError("the config was loaded")
+
+        # Refused from its config.json alone: once a package of the same model type is registered in this process, its
+        # dynamic module is no longer imported, so the modules alone cannot tell
+        monkeypatch.setattr(AutoConfig, "from_pretrained", from_pretrained)
         with pytest.raises(ValueError, match="trust_remote_code: true") as error:
             load_decision_backbone(folder, model_kwargs=RAISED_CONTEXT)
         assert folder in str(error.value) and "modeling_tinyspark.TinySparkForCausalLM" in str(error.value)
@@ -293,8 +313,10 @@ class TestRemoteCode(TrlTestCase):
         assert remote_code_setting(SimpleNamespace(), {}) == (False, {})
         folder = spark_package(self.tmp_dir, tokenizer)
         trust_remote_code, kwargs = remote_code_setting(flag, {"dtype": "float32", "trust_remote_code": True})
-        assert type(load_decision_backbone(folder, trust_remote_code, kwargs).model).__name__ == "TinySparkForCausalLM"
-        assert package_modules(folder)  # what the test without the flag looks for
+        model = load_decision_backbone(folder, trust_remote_code, kwargs).model
+        # A class of the package's code (of this folder, or of the same model type registered by an earlier load)
+        assert type(model).__name__ == "TinySparkForCausalLM"
+        assert type(model).__module__.startswith("transformers_modules.")
 
     def test_causal_lm_of_its_own_code_is_the_backbone(self, tokenizer):
         folder = spark_package(self.tmp_dir, tokenizer)

@@ -15,6 +15,7 @@
 from .backbone import (
     BackboneWeights,
     DecisionBackbone,
+    check_max_length,
     check_per_layer_settings,
     checkpoint_code,
     checkpoint_shapes,
@@ -53,6 +54,7 @@ __all__ = [
     "DecisionTrainer",
     "RlcdScheduleCallback",
     "SchemaTooLongError",
+    "check_max_length",
     "check_per_layer_settings",
     "checkpoint_code",
     "checkpoint_shapes",

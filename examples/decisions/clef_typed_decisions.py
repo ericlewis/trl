@@ -25,26 +25,9 @@
 """
 Train a Clef decision model on typed decisions: one prompt per record, every question answered jointly.
 
-`model_name_or_path` is a Clef checkpoint, loaded as it is, or a backbone for a new head: a causal LM (KLM-1.6, Qwen)
-reads its last token with the ChatML prompt; a bidirectional encoder (BERT, ModernBERT, or a reranker, unwrapped to
-its base model) reads its first token with the plain prompt between [CLS] and [SEP]. `global_pooling` and
-`prompt_style` override that choice; `head_type: cosine` (with `cosine_width`, `cosine_initial_scale`) selects the
-small cosine head instead of the joint one, and is what the example's configuration trains. The resolved setup is
-printed at start-up. `rlcd_weight` (with
-`rlcd_sigma`, `rlcd_samples`, `rlcd_normalize_advantage`) adds Clef's RLCD policy term to the training loss. RLCD is
-meant as a second phase after cross-entropy training: start this script again from the saved checkpoint with
-`rlcd_weight` set, or in one run give `rlcd_start_epoch` and/or `rlcd_sigmas` (one noise scale per epoch of the RLCD
-phase), which keep the weight at 0 until that epoch.
-
-Backbone weights are never newly initialised. A model that exists only as code in its repository (an `auto_map` for a
-model type Transformers does not have) is loaded with that code only when `trust_remote_code` is set, and refused before
-any of it is imported otherwise; it becomes the backbone as its package's `AutoModel`, or else its
-`AutoModelForCausalLM` itself, and the saved model loads again with `trust_remote_code=True`. Models of Transformers
-never run their checkpoint's code. `model_init_kwargs` reach the backbone's `from_pretrained` and, when they change its
-config (a raised context), are saved with it. A checkpoint whose weights sit under a
-prefix (a remote-code package such as an UltraBERT reranker, with `backbone.<name>` keys) has its backbone read from
-its safetensors under the one prefix that holds all of them, and its other tensors dropped; the start-up line names
-where the weights came from. A backbone with weights that no single prefix provides is refused.
+`model_name_or_path` is a Clef checkpoint, loaded as it is, or the backbone of a new head (a causal LM, an encoder or a
+reranker package), loaded with no weight newly initialised and with its own code only with `trust_remote_code`. RLCD
+(`rlcd_weight`) is a second phase after cross-entropy training. The README describes every setting.
 
 python examples/decisions/clef_typed_decisions.py --config examples/decisions/clef_typed_decisions.yaml
 
@@ -74,6 +57,7 @@ from trl.experimental.decision import (
     DecisionTrainer,
     RlcdScheduleCallback,
     SchemaTooLongError,
+    check_max_length,
     compute_calibration_metrics,
     cut_state,
     decode_request,
@@ -81,7 +65,6 @@ from trl.experimental.decision import (
     load_decision_backbone,
     loading_problems,
     needs_remote_code,
-    position_limit,
     raw_config,
     remote_code_setting,
     skipped_record,
@@ -89,10 +72,7 @@ from trl.experimental.decision import (
 
 
 def clef_decision_config(prompt_style: str = "chatml"):
-    """
-    Clef's decision config with its ChatML prompt (or its plain one, `prompt_style="plain"`): any number of options,
-    since the head reads no label token.
-    """
+    """Clef's decision config with its ChatML (or `"plain"`) prompt; it takes any number of options."""
     from transformers import ClefConfig
 
     return ClefConfig.prompt_decision_config(prompt_style)
@@ -103,22 +83,8 @@ class DataCollatorForClef(DataCollatorForDecision):
     """
     Batch records for Clef: one prompt per record, with all of its questions answered jointly.
 
-    Each example contains a `request` (a dictionary or JSON string), or `state` and `questions`, plus the targets of
-    all questions. A `state` that is the JSON string of an object or an array (as datasets store it) is decoded, so that
-    the prompt renders the record; any other string is kept as it is. Targets are `targets` (a mapping of question
-    name to `target_index`, `target_probs`, `p_true` or `score`), or `gold` / `answers` (a mapping of question name to
-    a gold label or probabilities). Positional targets (`target_index`, `target_probs`) follow the template's option
-    order, which sorts choice options by key (`target_index: 0` of criteria `{"zeta", "alpha"}` is `alpha`); `gold`
-    names the option instead. Nullable questions are not supported, since Clef has no coverage output.
-
-    For repeated training or evaluation, preprocess once with `dataset.map(collator.tokenize)`. The collator also
-    accepts these prepared examples and only pads them when building batches. A batch holds the questions of all its
-    records one after the other: `labels` and `option_mask` have one row per question, in record order then question
-    order, `hard_labels` holds the gold label of each question (the option its `label` or `target_index` names, else
-    its target's first most probable option, which accuracy is counted against), and `rows_per_example` holds the
-    number of questions of each record. With it, `DecisionTrainer` gathers
-    whole records across processes, and its evaluation predictions have `max_questions` slots per record (the most
-    questions of a record in the batch, over all processes), with the unused slots at `-100`.
+    Each example has a `request` (or `state` and `questions`) and the targets of all of its questions (`targets`, `gold`
+    or `answers`). A batch holds the questions of its records one after the other, with `rows_per_example`.
 
     Args:
         tokenizer (`PreTrainedTokenizerBase`):
@@ -128,22 +94,10 @@ class DataCollatorForClef(DataCollatorForDecision):
         max_length (`int`, *optional*, defaults to `2048`):
             Maximum number of tokens of a prompt.
         truncation (`str`, *optional*, defaults to `"error"`):
-            What to do with a record whose prompt is longer than `max_length`, or whose request or targets are
-            invalid:
-
-            - `"error"`: raise.
-            - `"skip"`: mark it as skipped under a reason that does not depend on the record.
-            - `"state"`: as Clef does, cut the end of the state of an over-length prompt so that it is exactly
-              `max_length` tokens, keeping everything else of the prompt (its questions and options) and the targets;
-              the record is marked `truncated`. A record whose prompt is too long even without its state is skipped
-              (`"schema longer than max_length (N tokens)"`), as are invalid records.
-
-            Only the state is ever cut, since cutting anything else would remove options or questions.
+            Over-length or invalid records: raise (`"error"`), mark them skipped (`"skip"`), or cut the end of the
+            state of an over-length prompt to `max_length` tokens and skip the rest (`"state"`).
         permute_fields (`bool`, *optional*, defaults to `False`):
-            Keep the request of each record and re-render it with its questions in a new random order every time it
-            is batched. Only records tokenized by a collator with `permute_fields` are permuted, so evaluation uses
-            a separate collator without it. A re-render that fails, or that no longer matches the targets, raises; so
-            does an over-length one, unless `truncation="state"` cuts its state.
+            Re-render each record with its questions in a new random order every time it is batched.
         seed (`int`, *optional*, defaults to `3407`):
             Seed of the permutations, combined with the seed of the dataloader worker and the process rank.
     """
@@ -175,10 +129,7 @@ class DataCollatorForClef(DataCollatorForDecision):
         }
 
     def _skip(self, reason: str, error: Exception) -> dict[str, Any]:
-        """
-        Raise `error`, or with `truncation="skip"` or `"state"` return a skipped record with the empty lists and
-        `reason`.
-        """
+        """Raise `error`, or unless `truncation="error"` return a skipped record with `reason`."""
         keys = ("input_ids", "marks", "num_options", "question_type_ids", "labels", "hard_labels", "is_choice")
         skipped = skipped_record(error, reason, keys, raise_error=self.truncation == "error")
         return {**skipped, **({"request": ""} if self.permute_fields else {})}
@@ -196,17 +147,7 @@ class DataCollatorForClef(DataCollatorForDecision):
         return cut_state(self._render, request, input_ids, marks, self.max_length)
 
     def tokenize(self, example: dict[str, Any]) -> dict[str, Any]:
-        """Render and tokenize one record with the native Transformers template.
-
-        Returns `input_ids`, `marks`, `num_options`, `question_type_ids`, `labels` (the target distribution of each
-        question over its options), `is_choice`, `skip`, `reason` and `truncated` (whether the state was cut), plus the
-        `request` when `permute_fields`. A record that is too long, whose request is invalid, that asks a nullable
-        question or whose targets cannot be used raises, or with `truncation="skip"` returns `skip=True`, the empty
-        lists and one of the reasons `"longer than max_length (N tokens)"`, `"invalid request"`, `"nullable
-        question"` and `"unusable targets"`. With `truncation="state"`, an over-length record has the end of its state
-        cut instead, and one that is too long without its state is skipped with `"schema longer than max_length (N
-        tokens)"`.
-        """
+        """Render and tokenize one record; a record that cannot be used raises or is skipped (see `truncation`)."""
         try:
             request = self._request(example)
         except (ValueError, KeyError, TypeError) as error:  # not JSON, or no state or questions
@@ -265,11 +206,7 @@ class DataCollatorForClef(DataCollatorForDecision):
         return self._generator
 
     def _permute(self, feature: dict[str, Any]) -> dict[str, Any]:
-        """
-        Re-render the request of a record with its questions in a new order, each keeping its target. When the drawn
-        order is the original one (always so for a single question), the tokenized record is returned as it is: it is
-        what the re-render would give.
-        """
+        """Re-render a record with its questions in a new order, each keeping its target (as it is when unchanged)."""
         request = json.loads(feature["request"])
         names = list(request["questions"])
         if len(names) != len(feature["labels"]):
@@ -343,69 +280,22 @@ class ClefScriptArguments(ScriptArguments):
         default=None, metadata={"help": "Evaluation split. Defaults to a holdout from the training split."}
     )
     validation_fraction: float = field(
-        default=0.05,
-        metadata={
-            "help": "Fraction of records held out when there is no evaluation split, drawn with eval_sample_seed."
-        },
+        default=0.05, metadata={"help": "Holdout fraction without an evaluation split."}
     )
-    max_train_samples: int | None = field(
-        default=None,
-        metadata={
-            "help": "Limit training records to a random sample of this many rows, drawn with seed before "
-            "tokenization (skipped records make the realised count smaller; the build report shows it)."
-        },
-    )
-    max_eval_samples: int | None = field(
-        default=None,
-        metadata={
-            "help": "Limit evaluation records to a random sample of this many rows, drawn with eval_sample_seed "
-            "before tokenization (skipped records make the realised count smaller; the build report shows it)."
-        },
-    )
-    eval_sample_seed: int = field(
-        default=0,
-        metadata={
-            "help": "Seed of the evaluation holdout and of the max_eval_samples sample. It is not the run's seed, so "
-            "runs with different seeds evaluate on the same records."
-        },
-    )
+    max_train_samples: int | None = field(default=None, metadata={"help": "Random sample of training rows (seed)."})
+    max_eval_samples: int | None = field(default=None, metadata={"help": "Random sample of evaluation rows."})
+    eval_sample_seed: int = field(default=0, metadata={"help": "Seed of the holdout and of max_eval_samples."})
 
     mode: str = field(default="full", metadata={"help": "Train head, lora, or full model."})
     head_learning_rate: float | None = field(
-        default=None,
-        metadata={
-            "help": "Learning rate of the head (every parameter outside the backbone). The backbone, with any LoRA "
-            "adapters, keeps learning_rate. Defaults to learning_rate."
-        },
+        default=None, metadata={"help": "Learning rate of the head. Defaults to learning_rate."}
     )
-    head_type: str | None = field(
-        default=None,
-        metadata={
-            "help": "Decision head of a new model: joint (the model's default) or cosine (what the example's "
-            "configuration sets). A Clef checkpoint keeps its own head."
-        },
-    )
-    global_pooling: str | None = field(
-        default=None,
-        metadata={
-            "help": "Token of a new model's global state: last or first. Defaults to the backbone's attention: last for "
-            "causal backbones, first for bidirectional ones (encoders)."
-        },
-    )
-    prompt_style: str | None = field(
-        default=None,
-        metadata={
-            "help": "Template of a new model: chatml or plain. Defaults to chatml for causal backbones and plain "
-            "(between [CLS] and [SEP]) for bidirectional ones."
-        },
-    )
+    head_type: str | None = field(default=None, metadata={"help": "Head of a new model: joint or cosine."})
+    global_pooling: str | None = field(default=None, metadata={"help": "last or first. Defaults by attention."})
+    prompt_style: str | None = field(default=None, metadata={"help": "chatml or plain. Defaults by attention."})
     cosine_width: int | None = field(default=None, metadata={"help": "Width of the cosine head's projections."})
-    cosine_initial_scale: float | None = field(
-        default=None, metadata={"help": "Initial temperature of the cosine head."}
-    )
-    head_hidden_size: int | None = field(
-        default=None, metadata={"help": "Width of the head. Defaults to the config's."}
-    )
+    cosine_initial_scale: float | None = field(default=None, metadata={"help": "Initial scale of the cosine head."})
+    head_hidden_size: int | None = field(default=None, metadata={"help": "Width of the head."})
     head_intermediate_size: int | None = field(default=None, metadata={"help": "Feed-forward width of the head."})
     head_num_layers: int | None = field(default=None, metadata={"help": "Number of layers of the head."})
     head_num_evidence_layers: int | None = field(default=None, metadata={"help": "Layers in which options read."})
@@ -413,42 +303,21 @@ class ClefScriptArguments(ScriptArguments):
     label_smoothing: float | None = field(default=None, metadata={"help": "Loss label smoothing. Defaults to 0."})
     brier_weight: float | None = field(default=None, metadata={"help": "Weight of the Brier score. Defaults to 0."})
     ordinal_weight: float | None = field(default=None, metadata={"help": "Weight of the ordinal term. Defaults to 0."})
-    rlcd_weight: float | None = field(
-        default=None, metadata={"help": "Weight of the RLCD policy term, applied in training only. Defaults to 0."}
-    )
-    rlcd_sigma: float | None = field(
-        default=None, metadata={"help": "Standard deviation of the RLCD noise on the logits. Defaults to 0.4."}
-    )
-    rlcd_samples: int | None = field(
-        default=None, metadata={"help": "Noisy samples per question of the RLCD term. Defaults to 32."}
-    )
+    rlcd_weight: float | None = field(default=None, metadata={"help": "Weight of the RLCD term. Defaults to 0."})
+    rlcd_sigma: float | None = field(default=None, metadata={"help": "RLCD noise on the logits. Defaults to 0.4."})
+    rlcd_samples: int | None = field(default=None, metadata={"help": "RLCD samples per question. Defaults to 32."})
     rlcd_normalize_advantage: bool | None = field(
-        default=None,
-        metadata={
-            "help": "Divide the RLCD advantages by their standard deviation (Laya's original). Defaults to False."
-        },
+        default=None, metadata={"help": "Divide RLCD advantages by their standard deviation. Defaults to False."}
     )
     rlcd_start_epoch: float | None = field(
-        default=None,
-        metadata={
-            "help": "Run cross-entropy only until this epoch, then switch RLCD on with rlcd_weight (which must be "
-            "positive). The model is built with rlcd_weight 0."
-        },
+        default=None, metadata={"help": "Epoch at which RLCD starts, after cross-entropy training."}
     )
     rlcd_sigmas: list[float] | None = field(
-        default=None,
-        metadata={
-            "help": "One RLCD noise scale per epoch of the RLCD phase, counted from rlcd_start_epoch (0 if unset); the "
-            "last is held for later epochs, e.g. [0.4, 0.3, 0.2, 0.1]. Needs a positive rlcd_weight."
-        },
+        default=None, metadata={"help": "One RLCD noise scale per epoch of the RLCD phase, e.g. [0.4, 0.3, 0.2, 0.1]."}
     )
     max_length: int = field(default=2048, metadata={"help": "Maximum prompt token length."})
     truncation: str = field(
-        default="error",
-        metadata={
-            "help": "Over-length or invalid records: error; skip and count them; or state, which cuts the end of the "
-            "state of an over-length record to fit (as Clef does) and skips the rest."
-        },
+        default="error", metadata={"help": "Over-length or invalid records: error, skip or state."}
     )
     permute_fields: bool = field(default=False, metadata={"help": "Shuffle the question order of training prompts."})
 
@@ -456,17 +325,11 @@ class ClefScriptArguments(ScriptArguments):
 @dataclass
 class ClefModelArguments(ModelConfig):
     model_name_or_path: str = field(
-        default="MinimaLabs/KLM-1.6",
-        metadata={"help": "Clef checkpoint, or a causal LM or an encoder to use as the backbone of a new head."},
+        default="MinimaLabs/KLM-1.6", metadata={"help": "Clef checkpoint, or the backbone of a new head."}
     )
     lora_task_type: str = field(default="FEATURE_EXTRACTION", metadata={"help": "PEFT task type for the backbone."})
     trust_remote_code: bool = field(
-        default=False,
-        metadata={
-            "help": "Run the code of a model that exists only as code in its repository (an `auto_map` for a model "
-            "type that Transformers does not have). Off by default: such a model is refused before any of its code "
-            "is imported. Models of Transformers never run their checkpoint's code, with or without it."
-        },
+        default=False, metadata={"help": "Run the code of a model that Transformers does not have. Off by default."}
     )
 
     def __post_init__(self):
@@ -478,22 +341,14 @@ class ClefModelArguments(ModelConfig):
             raise ValueError(f"trust_remote_code must be true or false, not {self.trust_remote_code!r}")
 
 
-LOSS_SETTINGS = (
-    "label_smoothing",
-    "brier_weight",
-    "ordinal_weight",
-    "rlcd_weight",
-    "rlcd_sigma",
-    "rlcd_samples",
-    "rlcd_normalize_advantage",
-)
+RLCD_SETTINGS = ("rlcd_weight", "rlcd_sigma", "rlcd_samples", "rlcd_normalize_advantage")
+LOSS_SETTINGS = ("label_smoothing", "brier_weight", "ordinal_weight", *RLCD_SETTINGS)
+# The sizes of the head under the names of `ClefConfig`; the script's are `head_<name>`, `head_num_layers` for layers
+HEAD_SIZES = ("hidden_size", "intermediate_size", "num_hidden_layers", "num_evidence_layers", "num_attention_heads")
 
 
 def rlcd_schedule(script_args) -> RlcdScheduleCallback | None:
-    """
-    The callback that runs RLCD from `rlcd_start_epoch` with the noise scales `rlcd_sigmas`, or `None` when neither is
-    given. `rlcd_weight` is then the weight of the phase and must be positive.
-    """
+    """The callback that runs RLCD after cross-entropy training from `rlcd_start_epoch`, or `None` without one."""
     if script_args.rlcd_start_epoch is None and script_args.rlcd_sigmas is None:
         return None
     if not script_args.rlcd_weight or script_args.rlcd_weight <= 0:
@@ -508,37 +363,19 @@ def rlcd_schedule(script_args) -> RlcdScheduleCallback | None:
 
 
 def build_model(script_args, model_args, model_kwargs):
-    """
-    A Clef checkpoint is loaded as it is; any other model becomes the backbone of a new head. A causal backbone reads
-    its last token with the ChatML prompt, a bidirectional one (an encoder) its first with the plain prompt, unless
-    `global_pooling` or `prompt_style` say otherwise.
-    """
+    """A Clef checkpoint as it is, or a new head on any other model as its backbone."""
     from transformers import ClefConfig, ClefForDecision
 
     name, revision = model_args.model_name_or_path, model_args.model_revision
     losses = {key: getattr(script_args, key) for key in LOSS_SETTINGS if getattr(script_args, key) is not None}
     if rlcd_schedule(script_args) is not None:  # the schedule turns RLCD on: the model starts as plain cross-entropy
         losses["rlcd_weight"] = 0.0
-    head_settings = {
-        key: getattr(script_args, key)
-        for key in ("head_type", "global_pooling", "prompt_style", "cosine_width", "cosine_initial_scale")
-        if getattr(script_args, key) is not None
-    }
-    # The sizes of the head, under the names of `ClefConfig`
-    sizes = {
-        key: getattr(script_args, f"head_{value}")
-        for key, value in {
-            "hidden_size": "hidden_size",
-            "intermediate_size": "intermediate_size",
-            "num_hidden_layers": "num_layers",
-            "num_evidence_layers": "num_evidence_layers",
-            "num_attention_heads": "num_attention_heads",
-        }.items()
-        if getattr(script_args, f"head_{value}") is not None
-    }
+    names = ("head_type", "global_pooling", "prompt_style", "cosine_width", "cosine_initial_scale")
+    head_settings = {key: getattr(script_args, key) for key in names if getattr(script_args, key) is not None}
+    sizes = {key: getattr(script_args, "head_" + key.replace("hidden_layers", "layers")) for key in HEAD_SIZES}
+    sizes = {key: value for key, value in sizes.items() if value is not None}
     trust_remote_code, model_kwargs = remote_code_setting(model_args, model_kwargs)
-    # Clef is a model of Transformers: classes that a Clef checkpoint names for itself are never run, with or without
-    # the setting (the code of its backbone is another matter)
+    # Clef is a model of Transformers: classes a Clef checkpoint names for itself never run (its backbone's may)
     saved = raw_config(name, revision=revision)
     if saved.get("model_type") == ClefConfig.model_type and saved.get("auto_map"):
         raise ValueError(
@@ -555,13 +392,10 @@ def build_model(script_args, model_args, model_kwargs):
         is not None
     )
     if is_checkpoint:
-        if isinstance(model_kwargs.get("attn_implementation"), str):  # the backbone's; Clef's head keeps its own
-            model_kwargs = {
-                **model_kwargs,
-                "attn_implementation": {"text_config": model_kwargs["attn_implementation"]},
-            }
-        # Settings of the backbone's config (a context raised for the new head) are saved in its `text_config`, and
-        # `from_pretrained` would give them to the Clef config: the saved values are kept, and changing one is refused
+        attention = model_kwargs.get("attn_implementation")
+        if isinstance(attention, str):  # the backbone's; Clef's head keeps its own
+            model_kwargs = {**model_kwargs, "attn_implementation": {"text_config": attention}}
+        # Settings of the backbone's config (a raised context) are saved in its `text_config`: changing one is refused
         saved_backbone = saved.get("text_config") or {}
         backbone_settings = {
             key: model_kwargs.pop(key) for key in list(model_kwargs) if key in saved_backbone and key not in saved
@@ -598,8 +432,7 @@ def build_model(script_args, model_args, model_kwargs):
             setattr(model.config, key, value)
         model.backbone_weights = "Clef checkpoint"
     else:
-        # Every `model_init_kwargs` entry reaches the backbone's `from_pretrained`, `attn_implementation` included:
-        # the model is built around the loaded backbone, which keeps its weights, dtype and attention
+        # The model is built around the backbone as loaded, with every `model_init_kwargs` entry
         backbone = load_decision_backbone(name, trust_remote_code, model_kwargs, config=config)
         check_cosine_settings(script_args, head_settings.get("head_type", "joint"))
         if (losses.get("rlcd_weight") or 0) > 0:
@@ -619,8 +452,7 @@ def build_model(script_args, model_args, model_kwargs):
             **losses,
             **{**defaults, **head_settings},
         )
-        # The head is new, in float32; Clef's own layers keep their default attention (they do not support every
-        # kernel)
+        # The head is new, in float32, with Clef's default attention (its layers do not support every kernel)
         model = ClefForDecision(config, model=backbone.model)
         # The cosine head, encoders without a causal LM class and a backbone of its own code have none
         if hasattr(model, "lm_head"):
@@ -642,11 +474,7 @@ def check_cosine_settings(script_args, head_type):
 
 
 def describe(model) -> str:
-    """
-    The resolved setup of a Clef model: the attention of its backbone, its pooling, prompt style and head, the
-    submodule its hidden states are read from when it is set, and where `build_model` read the weights of its backbone
-    from.
-    """
+    """The start-up line: the backbone's attention, pooling, prompt style, head and where its weights came from."""
     config = model.config
     attention = "causal" if is_causal(config.text_config) else "bidirectional"
     weights = getattr(model, "backbone_weights", None)
@@ -660,10 +488,7 @@ def describe(model) -> str:
 
 
 def sample_rows(dataset, count, seed):
-    """
-    `count` rows of `dataset` drawn at random with `seed`, the same for the same seed; the whole dataset when `count`
-    is `None` or not smaller. The first rows of a split are not a fair sample of it: datasets are often sorted.
-    """
+    """`count` rows of `dataset` drawn at random with `seed` (datasets are often sorted), or all of them."""
     if count is None or count >= len(dataset):
         return dataset
     return dataset.shuffle(seed=seed).select(range(count))
@@ -671,18 +496,11 @@ def sample_rows(dataset, count, seed):
 
 def prepare_split(dataset, collator, training_args, desc):
     """Tokenize once, drop the skipped records, and report what was built."""
-    features = {
-        "input_ids": Sequence(Value("int32")),
-        "marks": Sequence(Value("int32")),
-        "num_options": Sequence(Value("int32")),
-        "question_type_ids": Sequence(Value("int32")),
-        "labels": Sequence(Sequence(Value("float32"))),
-        "hard_labels": Sequence(Value("int32")),
-        "is_choice": Sequence(Value("bool")),
-        "skip": Value("bool"),
-        "reason": Value("string"),
-        "truncated": Value("bool"),
-    }
+    integers = Sequence(Value("int32"))
+    features = {"input_ids": integers, "marks": integers, "num_options": integers, "question_type_ids": integers}
+    features |= {"labels": Sequence(Sequence(Value("float32"))), "hard_labels": integers}
+    features |= {"is_choice": Sequence(Value("bool")), "skip": Value("bool"), "reason": Value("string")}
+    features["truncated"] = Value("bool")
     if collator.permute_fields:
         features["request"] = Value("string")
     with training_args.main_process_first(desc=f"Tokenizing {desc} dataset"):
@@ -700,7 +518,7 @@ def prepare_split(dataset, collator, training_args, desc):
         "rows": len(dataset),
         "questions": sum(len(counts) for counts in tokenized["num_options"]),
         "skipped": dict(reasons),
-        # The records whose state was cut to fit (truncation="state"); nothing else of a prompt is ever cut
+        # The records whose state was cut to fit (truncation="state")
         "truncated": truncated,
     }
     if training_args.process_index == 0:
@@ -709,11 +527,7 @@ def prepare_split(dataset, collator, training_args, desc):
 
 
 def set_head_learning_rate(trainer, head_learning_rate):
-    """
-    Give the trainer the parameter groups of its optimizer, as the Jeva example does: the backbone (`base_model`, with
-    any LoRA adapters inside it) trains at `learning_rate` and everything else, the head, at `head_learning_rate`.
-    Zero-dimensional parameters (the cosine head's scale) are never decayed.
-    """
+    """The backbone (with any LoRA adapters) at `learning_rate`, the head at `head_learning_rate`, as in Jeva."""
     model, args = trainer.model, trainer.args
     backbone_parameters = {id(parameter) for parameter in model.base_model.parameters()}
     decay_parameters = trainer.get_decay_parameter_names(model)
@@ -728,13 +542,9 @@ def set_head_learning_rate(trainer, head_learning_rate):
                 and (name in decay_parameters and parameter.dim() > 0) == decay
             ]
             if parameters:
-                parameter_groups.append(
-                    {
-                        "params": parameters,
-                        "lr": args.learning_rate if backbone else head_learning_rate,
-                        "weight_decay": args.weight_decay if decay else 0.0,
-                    }
-                )
+                lr = args.learning_rate if backbone else head_learning_rate
+                weight_decay = args.weight_decay if decay else 0.0
+                parameter_groups.append({"params": parameters, "lr": lr, "weight_decay": weight_decay})
     optimizer_cls, optimizer_kwargs = trainer.get_optimizer_cls_and_kwargs(args, model)
     try:
         from transformers.trainer_optimizer import is_optimizer_factory
@@ -789,30 +599,14 @@ def build_trainer(script_args, training_args, model_args) -> ClefRun:
             f"from an inner layer (backbone_hidden_module={model.config.backbone_hidden_module}); use mode: full or "
             "mode: head"
         )
-    model_type = model.config.text_config.model_type
-    limit = position_limit(model.model)
-    if limit is not None and script_args.max_length > limit:
-        raise ValueError(
-            f"max_length is {script_args.max_length} tokens, but the {model_type} backbone "
-            f"reads at most {limit} positions; set max_length to {limit} or less"
-        )
-    configured = getattr(model.config.text_config, "max_position_embeddings", None)
+    warning = check_max_length(model.model, model.config.text_config, script_args.max_length)
     if training_args.process_index == 0:
-        if limit is None and isinstance(configured, int) and script_args.max_length > configured:
-            # Rotary models run past it, but a model may enforce it: a warning, not an error
-            print(
-                f"Warning: max_length is {script_args.max_length} tokens, above the max_position_embeddings of the "
-                f"{model_type} backbone ({configured}); the model may refuse or degrade on longer prompts. Where its "
-                "architecture allows it, model_init_kwargs can raise its limit."
-            )
+        if warning is not None:
+            print(warning)
         print(describe(model))
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path,
-        revision=model_args.model_revision,
-        trust_remote_code=needs_remote_code(
-            model_args.model_name_or_path, trust_remote_code, revision=model_args.model_revision
-        ),
-    )
+    name, revision = model_args.model_name_or_path, model_args.model_revision
+    remote_code = needs_remote_code(name, trust_remote_code, revision=revision)
+    tokenizer = AutoTokenizer.from_pretrained(name, revision=revision, trust_remote_code=remote_code)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -829,9 +623,7 @@ def build_trainer(script_args, training_args, model_args) -> ClefRun:
             raise ValueError("mode='lora' requires use_peft=True")
         from peft import get_peft_model
 
-        # Adapters go on the backbone only. The head is trained in full next to them as ordinary parameters: PEFT's
-        # `modules_to_save` matches names by suffix, so it cannot cleanly wrap the head's `scorer` (and its
-        # `residual_scorer`) and the resulting adapter does not reload.
+        # Adapters on the backbone only; the head trains in full (`modules_to_save` cannot wrap its `scorer` cleanly)
         model.model = lora_backbone = get_peft_model(model.model, peft_config)
 
     dataset = load_dataset(
@@ -840,25 +632,17 @@ def build_trainer(script_args, training_args, model_args) -> ClefRun:
     train_dataset = dataset[script_args.dataset_train_split]
     if script_args.dataset_test_split is None:
         # The holdout and its sample do not depend on the run's seed: runs with different seeds evaluate alike
-        split = train_dataset.train_test_split(
-            test_size=script_args.validation_fraction, seed=script_args.eval_sample_seed
-        )
+        split = train_dataset.train_test_split(script_args.validation_fraction, seed=script_args.eval_sample_seed)
         train_dataset, eval_dataset = split["train"], split["test"]
     else:
         eval_dataset = dataset[script_args.dataset_test_split]
     train_dataset = sample_rows(train_dataset, script_args.max_train_samples, training_args.seed)
     eval_dataset = sample_rows(eval_dataset, script_args.max_eval_samples, script_args.eval_sample_seed)
 
-    # Training batches permute the questions; evaluation never does: it has its own collator, for tokenizing and for
-    # batching
+    # Training batches permute the questions; evaluation never does: it has its own collator
     collator_kwargs = {"max_length": script_args.max_length, "truncation": script_args.truncation}
-    collator = DataCollatorForClef(
-        tokenizer,
-        model.decision_config,
-        permute_fields=script_args.permute_fields,
-        seed=training_args.seed,
-        **collator_kwargs,
-    )
+    permuting = {"permute_fields": script_args.permute_fields, "seed": training_args.seed}
+    collator = DataCollatorForClef(tokenizer, model.decision_config, **permuting, **collator_kwargs)
     eval_collator = DataCollatorForClef(tokenizer, model.decision_config, **collator_kwargs)
     train_dataset, train_report = prepare_split(train_dataset, collator, training_args, "train")
     eval_dataset, eval_report = prepare_split(eval_dataset, eval_collator, training_args, "eval")
@@ -895,8 +679,7 @@ def main(script_args, training_args, model_args):
     trainer, lora_backbone, model = run.trainer, run.lora_backbone, run.trainer.model
     result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     if lora_backbone is not None:
-        # The adapter alone, for the original backbone, then merged into the backbone: the output is a native Clef
-        # checkpoint that `AutoModelForDecision` and the decision pipeline load as they are
+        # The adapter alone in `adapter/`, then merged: the output is a native Clef checkpoint
         if training_args.should_save:
             lora_backbone.save_pretrained(Path(training_args.output_dir) / "adapter")
         model.model = lora_backbone.merge_and_unload()

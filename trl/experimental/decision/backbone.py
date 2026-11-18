@@ -355,6 +355,29 @@ def position_limit(backbone) -> int | None:
     return None
 
 
+def check_max_length(backbone, text_config, max_length) -> str | None:
+    """
+    Refuse a `max_length` beyond the positions a backbone with a learned table of absolute positions can read (see
+    [`position_limit`]). Without such a table, return a warning when `max_length` is above the `max_position_embeddings`
+    of its config `text_config` (rotary models run past it, but a model may enforce it), else `None`.
+    """
+    model_type = text_config.model_type
+    limit = position_limit(backbone)
+    if limit is not None and max_length > limit:
+        raise ValueError(
+            f"max_length is {max_length} tokens, but the {model_type} backbone "
+            f"reads at most {limit} positions; set max_length to {limit} or less"
+        )
+    configured = getattr(text_config, "max_position_embeddings", None)
+    if limit is None and isinstance(configured, int) and max_length > configured:
+        return (
+            f"Warning: max_length is {max_length} tokens, above the max_position_embeddings of the "
+            f"{model_type} backbone ({configured}); the model may refuse or degrade on longer prompts. Where its "
+            "architecture allows it, model_init_kwargs can raise its limit."
+        )
+    return None
+
+
 @dataclass
 class DecisionBackbone:
     """
