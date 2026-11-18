@@ -131,7 +131,12 @@ With the setting, the backbone is the package's `AutoModel` when its `auto_map` 
 pooling, ChatML prompt). Its weights load strictly, without the prefix repair above. The width of its hidden states is
 read from the model, and when it returns no hidden states the submodule that gives them is found and shown on the
 start-up line (`backbone_hidden_module=...`). A backbone that does not support activation checkpointing stops at
-start-up when `activation_checkpointing` (or `gradient_checkpointing`) is on.
+start-up when `activation_checkpointing` (or `gradient_checkpointing`) is on. `mode: lora` is refused at start-up on a
+backbone whose hidden states are read from an inner layer (`backbone_hidden_module`): adapters cannot be put on it, so
+use `mode: full` or `mode: head`.
+
+A Clef checkpoint is a model of Transformers: one whose `config.json` names classes of its own (a top-level
+`auto_map`) is refused, with or without the setting. Only the code of its backbone runs, with the setting.
 
 The saved model, with the package's code next to it when the backbone came from a local folder, loads again only with
 the flag: `AutoModelForDecision.from_pretrained(output_dir, trust_remote_code=True)` or

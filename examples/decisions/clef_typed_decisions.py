@@ -591,6 +591,8 @@ def remote_code_setting(model_args, model_kwargs) -> tuple[bool, dict]:
     model_kwargs = dict(model_kwargs)
     if "trust_remote_code" in model_kwargs:
         given = model_kwargs.pop("trust_remote_code")
+        if not isinstance(given, bool) and given not in (0, 1):  # bool("false") would be True
+            raise ValueError(f"model_init_kwargs sets trust_remote_code to {given!r}; it must be true or false")
         if bool(given) != trust_remote_code:
             raise ValueError(
                 f"model_init_kwargs sets trust_remote_code to {given!r}, but trust_remote_code is {trust_remote_code}; "
@@ -923,6 +925,15 @@ def build_model(script_args, model_args, model_kwargs):
         if getattr(script_args, f"head_{value}") is not None
     }
     trust_remote_code, model_kwargs = remote_code_setting(model_args, model_kwargs)
+    # Clef is a model of Transformers: classes that a Clef checkpoint names for itself are never run, with or without
+    # the setting (the code of its backbone is another matter)
+    saved = raw_config(name, revision=revision)
+    if saved.get("model_type") == ClefConfig.model_type and saved.get("auto_map"):
+        raise ValueError(
+            f"{name} is a Clef checkpoint whose config.json names classes of its own code ({saved['auto_map']}). "
+            "Clef is a model of Transformers and this example never runs a Clef checkpoint's own classes; remove "
+            "the top-level auto_map from its config.json to load it with Transformers' classes"
+        )
     # Raises before any code of the checkpoint is imported, unless it is needed and allowed
     remote_code = needs_remote_code(name, trust_remote_code, revision=revision)
     config = AutoConfig.from_pretrained(name, revision=revision, trust_remote_code=remote_code)
@@ -939,7 +950,6 @@ def build_model(script_args, model_args, model_kwargs):
             }
         # Settings of the backbone's config (a context raised for the new head) are saved in its `text_config`, and
         # `from_pretrained` would give them to the Clef config: the saved values are kept, and changing one is refused
-        saved = raw_config(name, revision=revision)
         saved_backbone = saved.get("text_config") or {}
         backbone_settings = {
             key: model_kwargs.pop(key) for key in list(model_kwargs) if key in saved_backbone and key not in saved
@@ -1177,6 +1187,13 @@ def build_trainer(script_args, training_args, model_args) -> ClefRun:
         raise ValueError(
             f"activation_checkpointing (or gradient_checkpointing) is on, but the {type(model.model).__name__} "
             "backbone does not support it; set activation_checkpointing: false"
+        )
+    if script_args.mode == "lora" and getattr(model.config, "backbone_hidden_module", None) is not None:
+        # The name is resolved against the backbone, which PEFT would wrap: the first step would fail
+        raise ValueError(
+            f"mode: lora cannot put adapters on the {type(model.model).__name__} backbone, whose hidden states are read "
+            f"from an inner layer (backbone_hidden_module={model.config.backbone_hidden_module}); use mode: full or "
+            "mode: head"
         )
     model_type = model.config.text_config.model_type
     limit = position_limit(model.model)

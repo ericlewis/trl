@@ -2596,6 +2596,12 @@ class TestClefRemoteBackbone(TrlTestCase):
         kwargs = {**RAISED_CONTEXT, "trust_remote_code": False}
         with pytest.raises(ValueError, match="model_init_kwargs sets trust_remote_code"):
             self.run_config(self.write_config(folder, model_init_kwargs=kwargs))
+        # Only a boolean (or 0 and 1): the string "false" is not read as true
+        for value in ("false", "true", 2):
+            kwargs = {**RAISED_CONTEXT, "trust_remote_code": value}
+            with pytest.raises(ValueError, match=f"trust_remote_code to {value!r}; it must be true or false"):
+                self.run_config(self.write_config(folder, model_init_kwargs=kwargs))
+        assert not Path(self.tmp_dir, "out").exists()
         # The same value, in both places, is accepted: it is taken out of the kwargs
         model_args = ClefModelArguments(model_name_or_path=folder, trust_remote_code=True)
         script_args = ClefScriptArguments(head_type="cosine")
@@ -2711,3 +2717,41 @@ class TestClefRemoteBackbone(TrlTestCase):
         save_file({f"backbone.{key}": value for key, value in tensors.items()}, f"{folder}/model.safetensors")
         with pytest.raises(ValueError, match="not looked for under another key prefix"):
             self.run_config(self.write_config(folder))
+
+    @require_peft
+    def test_lora_on_a_backbone_read_from_an_inner_layer_stops_at_start_up(self, tokenizer, monkeypatch):
+        from examples.decisions import clef_typed_decisions
+
+        folder = spark_package(self.tmp_dir, tokenizer)
+
+        def trainer(*args, **kwargs):
+            raise AssertionError("the trainer was built")
+
+        monkeypatch.setattr(clef_typed_decisions, "DecisionTrainer", trainer)
+        lora = {"mode": "lora", "use_peft": True, "lora_r": 4, "lora_target_modules": ["layers.0", "layers.1"]}
+        with pytest.raises(ValueError, match=r"mode: lora cannot put adapters.*model\.final_norm.*mode: full"):
+            self.run_config(self.write_config(folder, **lora))
+        assert not Path(self.tmp_dir, "out").exists()
+
+    def test_clef_checkpoint_with_its_own_classes_is_refused(self, tokenizer):
+        import sys
+
+        folder = spark_package(self.tmp_dir, tokenizer)
+        self.run_config(self.write_config(folder))
+        # A model saved by the example names no classes of its own; give it some, which record being imported
+        output = Path(self.tmp_dir, "out")
+        config = json.loads(Path(output, "config.json").read_text(encoding="utf-8"))
+        assert "auto_map" not in config
+        config["auto_map"] = {"AutoConfig": "evil_cfg.EvilConfig", "AutoModelForDecision": "evil_cfg.EvilModel"}
+        Path(output, "config.json").write_text(json.dumps(config), encoding="utf-8")
+        sentinel = Path(self.tmp_dir, "imported")
+        Path(output, "evil_cfg.py").write_text(
+            f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('evil')\nraise RuntimeError('evil imported')\n",
+            encoding="utf-8",
+        )
+        for flag in (1, False):
+            settings = {"trust_remote_code": flag, "output_dir": f"{self.tmp_dir}/again"}
+            with pytest.raises(ValueError, match="Clef checkpoint whose config.json names classes of its own code"):
+                self.run_config(self.write_config(str(output), **settings))
+            assert not sentinel.exists()
+            assert not any("evil_cfg" in module for module in sys.modules)
